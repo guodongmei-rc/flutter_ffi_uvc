@@ -1,3 +1,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
   package="com.cornpip.flutter_ffi_uvc">
+  <!-- Gallery writes go through MediaStore, which is permission-free from
+       Android 10 (API 29); earlier releases still need this permission. -->
+  <uses-permission
+    android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+    android:maxSdkVersion="28" />
 </manifest>

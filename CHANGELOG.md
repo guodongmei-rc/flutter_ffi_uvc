@@ -1,3 +1,18 @@
+## 0.7.0
+
+### Added
+
+* `takePicture()` — captures the latest preview frame as a JPEG and saves it to the device gallery (MediaStore, DCIM). MJPEG streams are stored losslessly from the raw camera frame; other formats are encoded with libjpeg-turbo at a configurable `quality`. Android only.
+* `startVideoRecording()` / `stopVideoRecording()` / `isVideoRecording` — records the preview stream (with the current `previewTransform` applied) as hardware-encoded H.264/MP4 published to the gallery. The native layer renders each frame into a MediaCodec input surface alongside the preview texture; no extra preview pipeline is added.
+* `ensureGalleryPermission()` — mirrors `ensureCameraPermission()`. Always granted on Android 10+ (MediaStore needs no runtime permission); requests `WRITE_EXTERNAL_STORAGE` on Android 9 and below. `takePicture()` and `startVideoRecording()` re-check it on every call and throw `UvcException(UvcErrorCode.access)` when denied.
+* `UvcGalleryMedia` — saved gallery entry (`uri` on Android 10+, `path` on Android 9 and below).
+* `UvcStreamStats.recordingSurfaceFailureCount` — recording surface blit failures.
+
+### Fixed
+
+* Reworked native locking so Dart-side FFI calls can no longer stall the Flutter UI thread. The frame callback previously held the global state mutex across MJPEG decode, RGBA conversion, and surface rendering (`ANativeWindow_lock` can block indefinitely behind a slow consumer), so periodic polls like stall detection or `latestFrameSequence()` blocked the UI thread — visible as app-wide jank whenever the preview stuttered. Decode/convert now runs outside the mutex into staging buffers published by O(1) pointer swaps, surface blits run outside the mutex against acquired window references, and `latestFrameSequence()` / `isPreviewing` / `uvc_frame_width/height` are lock-free atomic reads.
+* `UvcCameraMode` now implements value equality (`==`/`hashCode`). Modes are re-parsed from the native descriptor on every `supportedModes()` call, so instances from different calls previously never compared equal — e.g. matching a `startPreviewAuto()` result against an earlier mode list (the example's mode dropdown crashed on this).
+
 ## 0.6.0
 
 ### Added

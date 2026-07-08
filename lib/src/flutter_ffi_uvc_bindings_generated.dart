@@ -221,6 +221,59 @@ class FlutterFfiUvcBindings {
             )
           >();
 
+  /// Captures the latest decodable frame as JPEG bytes.
+  ///
+  /// For MJPEG streams the raw camera frame is returned unmodified (lossless,
+  /// no re-encode) and [quality] is ignored. For other formats the latest
+  /// decoded frame is encoded with libjpeg at [quality] (1-100; out-of-range
+  /// values are clamped, <=0 uses 90).
+  ///
+  /// A buffer of uvc_frame_width()*uvc_frame_height()*4 bytes is always large
+  /// enough. Returns the number of JPEG bytes written to [buffer], or 0 on
+  /// failure (see uvc_last_error).
+  int uvc_capture_jpeg(
+    ffi.Pointer<ffi.Uint8> buffer,
+    int buffer_length,
+    int quality,
+    ffi.Pointer<ffi.Int> out_width,
+    ffi.Pointer<ffi.Int> out_height,
+    ffi.Pointer<ffi.Int64> out_sequence,
+  ) {
+    return _uvc_capture_jpeg(
+      buffer,
+      buffer_length,
+      quality,
+      out_width,
+      out_height,
+      out_sequence,
+    );
+  }
+
+  late final _uvc_capture_jpegPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Int Function(
+            ffi.Pointer<ffi.Uint8>,
+            ffi.Int,
+            ffi.Int,
+            ffi.Pointer<ffi.Int>,
+            ffi.Pointer<ffi.Int>,
+            ffi.Pointer<ffi.Int64>,
+          )
+        >
+      >('uvc_capture_jpeg');
+  late final _uvc_capture_jpeg = _uvc_capture_jpegPtr
+      .asFunction<
+        int Function(
+          ffi.Pointer<ffi.Uint8>,
+          int,
+          int,
+          ffi.Pointer<ffi.Int>,
+          ffi.Pointer<ffi.Int>,
+          ffi.Pointer<ffi.Int64>,
+        )
+      >();
+
   int uvc_latest_frame_sequence() {
     return _uvc_latest_frame_sequence();
   }

@@ -281,6 +281,120 @@ class _FlutterFfiUvcCamera implements UvcCamera {
   }
 
   @override
+  Future<bool> ensureGalleryPermission() async {
+    _ensureAndroid();
+    return await _usbChannel.invokeMethod<bool>('ensureGalleryPermission') ??
+        false;
+  }
+
+  Future<void> _requireGalleryPermission() async {
+    if (!await ensureGalleryPermission()) {
+      throw const UvcException(
+        code: UvcErrorCode.access,
+        message: 'Gallery permission denied',
+      );
+    }
+  }
+
+  Uint8List _captureJpegBytes(int quality) {
+    final int width = _bindings.uvc_frame_width();
+    final int height = _bindings.uvc_frame_height();
+    if (width <= 0 || height <= 0) {
+      throw const UvcException(
+        code: UvcErrorCode.io,
+        message: 'No preview frame available for capture',
+      );
+    }
+
+    // An RGBA-sized buffer is always large enough for a JPEG of the frame.
+    final int bufferLength = width * height * 4;
+    final Pointer<Uint8> nativeBuffer = calloc<Uint8>(bufferLength);
+    try {
+      final int copiedBytes = _bindings.uvc_capture_jpeg(
+        nativeBuffer,
+        bufferLength,
+        quality,
+        nullptr,
+        nullptr,
+        nullptr,
+      );
+      if (copiedBytes <= 0) {
+        final String error = lastError;
+        throw UvcException(
+          code: UvcErrorCode.io,
+          message: error.isNotEmpty ? error : 'JPEG capture failed',
+        );
+      }
+      return Uint8List.fromList(nativeBuffer.asTypedList(copiedBytes));
+    } finally {
+      calloc.free(nativeBuffer);
+    }
+  }
+
+  @override
+  Future<UvcGalleryMedia> takePicture({int quality = 90}) async {
+    _ensureAndroid();
+    await _requireGalleryPermission();
+    final Uint8List jpegBytes = _captureJpegBytes(quality);
+    final Map<Object?, Object?>? saved = await _textureChannel
+        .invokeMapMethod<Object?, Object?>(
+      'saveImageToGallery',
+      <String, Object?>{'bytes': jpegBytes},
+    );
+    return UvcGalleryMedia.fromMap(saved ?? <Object?, Object?>{});
+  }
+
+  @override
+  Future<void> startVideoRecording({int? bitRate, int frameRate = 30}) async {
+    _ensureAndroid();
+    await _requireGalleryPermission();
+
+    final int frameWidth = _bindings.uvc_frame_width();
+    final int frameHeight = _bindings.uvc_frame_height();
+    if (!isPreviewing || frameWidth <= 0 || frameHeight <= 0) {
+      throw const UvcException(
+        code: UvcErrorCode.io,
+        message: 'Cannot record: preview is not delivering frames',
+      );
+    }
+
+    // The recording surface receives the same transformed blit as the preview
+    // texture, so the encoder size must use post-transform dimensions.
+    final bool swapped =
+        _previewTransform.rotation == 90 || _previewTransform.rotation == 270;
+    final int width = swapped ? frameHeight : frameWidth;
+    final int height = swapped ? frameWidth : frameHeight;
+
+    await _textureChannel.invokeMethod<void>(
+      'startVideoRecording',
+      <String, Object?>{
+        'width': width,
+        'height': height,
+        'bitRate': ?bitRate,
+        'frameRate': frameRate,
+      },
+    );
+    _videoRecording = true;
+  }
+
+  @override
+  Future<UvcGalleryMedia> stopVideoRecording() async {
+    _ensureAndroid();
+    try {
+      final Map<Object?, Object?>? saved = await _textureChannel
+          .invokeMapMethod<Object?, Object?>('stopVideoRecording');
+      return UvcGalleryMedia.fromMap(saved ?? <Object?, Object?>{});
+    } finally {
+      _videoRecording = false;
+    }
+  }
+
+  @override
+  bool get isVideoRecording => _videoRecording;
+
+  bool _videoRecording = false;
+
+  @override
   Future<List<UvcUsbDevice>> listUsbDevices() async {
     _ensureAndroid();
     final List<Object?>? raw =
@@ -330,11 +444,7 @@ class _FlutterFfiUvcCamera implements UvcCamera {
     // Requests recorded by startPreview for the same mode are kept so their
     // policy/timeout parameters survive.
     final _PreviewRequest? existing = _lastPreviewRequest;
-    final bool sameMode = existing != null &&
-        existing.mode.frameFormat == mode.frameFormat &&
-        existing.mode.width == mode.width &&
-        existing.mode.height == mode.height &&
-        existing.mode.fps == mode.fps;
+    final bool sameMode = existing != null && existing.mode == mode;
     if (!sameMode) {
       _lastPreviewRequest = _PreviewRequest(
         mode: mode,

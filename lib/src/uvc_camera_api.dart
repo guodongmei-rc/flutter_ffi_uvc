@@ -359,6 +359,25 @@ class UvcCameraMode {
       'fps': fps,
     };
   }
+
+  // Value equality: modes are re-parsed from the native descriptor on every
+  // supportedModes() call, so equal modes must compare equal across instances
+  // (e.g. matching a startPreviewAuto result against a previously fetched
+  // mode list).
+  @override
+  bool operator ==(Object other) =>
+      other is UvcCameraMode &&
+      other.frameFormat == frameFormat &&
+      other.formatName == formatName &&
+      other.width == width &&
+      other.height == height &&
+      other.fps == fps;
+
+  @override
+  int get hashCode => Object.hash(frameFormat, formatName, width, height, fps);
+
+  @override
+  String toString() => 'UvcCameraMode($label)';
 }
 
 /// Metadata and current value for a UVC control exposed by the device.
@@ -630,6 +649,7 @@ class UvcStreamStats {
     required this.invalidMjpegCount,
     required this.bufferAllocationFailureCount,
     required this.previewSurfaceFailureCount,
+    this.recordingSurfaceFailureCount = 0,
     required this.conversionFailureCount,
     required this.inputFps,
     required this.deliveredFps,
@@ -652,6 +672,7 @@ class UvcStreamStats {
       invalidMjpegCount = 0,
       bufferAllocationFailureCount = 0,
       previewSurfaceFailureCount = 0,
+      recordingSurfaceFailureCount = 0,
       conversionFailureCount = 0,
       inputFps = 0,
       deliveredFps = 0,
@@ -675,6 +696,8 @@ class UvcStreamStats {
       bufferAllocationFailureCount:
           json['bufferAllocationFailureCount'] as int,
       previewSurfaceFailureCount: json['previewSurfaceFailureCount'] as int,
+      recordingSurfaceFailureCount:
+          json['recordingSurfaceFailureCount'] as int? ?? 0,
       conversionFailureCount: json['conversionFailureCount'] as int,
       inputFps: (json['inputFps'] as num).toDouble(),
       deliveredFps: (json['deliveredFps'] as num).toDouble(),
@@ -721,6 +744,9 @@ class UvcStreamStats {
   /// Number of preview surface update failures on the native preview path.
   final int previewSurfaceFailureCount;
 
+  /// Number of recording surface update failures while a recording is active.
+  final int recordingSurfaceFailureCount;
+
   /// Number of failures reported by native pixel format conversion.
   final int conversionFailureCount;
 
@@ -757,6 +783,7 @@ class UvcStreamStats {
     'invalidMjpegCount': invalidMjpegCount,
     'bufferAllocationFailureCount': bufferAllocationFailureCount,
     'previewSurfaceFailureCount': previewSurfaceFailureCount,
+    'recordingSurfaceFailureCount': recordingSurfaceFailureCount,
     'conversionFailureCount': conversionFailureCount,
     'inputFps': inputFps,
     'deliveredFps': deliveredFps,
@@ -1066,6 +1093,31 @@ class UvcAutoPreviewResult {
   UvcCameraMode? get mode => selected?.mode;
 }
 
+/// A photo or video that was saved to the device gallery.
+///
+/// On Android 10+ media is inserted through MediaStore and identified by a
+/// `content://` [uri]; on Android 9 and below it is written as a file and
+/// identified by [path]. At least one of the two is always non-null.
+class UvcGalleryMedia {
+  const UvcGalleryMedia({this.uri, this.path});
+
+  factory UvcGalleryMedia.fromMap(Map<Object?, Object?> map) {
+    return UvcGalleryMedia(
+      uri: map['uri'] as String?,
+      path: map['path'] as String?,
+    );
+  }
+
+  /// MediaStore content URI of the saved media (Android 10+).
+  final String? uri;
+
+  /// Absolute file path of the saved media (Android 9 and below).
+  final String? path;
+
+  @override
+  String toString() => 'UvcGalleryMedia(uri: $uri, path: $path)';
+}
+
 /// High-level camera API for the shared native UVC session.
 ///
 /// This package exposes a single shared camera service through [uvcCamera].
@@ -1082,6 +1134,15 @@ abstract interface class UvcCamera {
   ///
   /// Returns true if the permission is already granted or the user grants it.
   Future<bool> ensureCameraPermission();
+
+  /// Requests permission to save captured media to the device gallery.
+  /// Android only.
+  ///
+  /// Returns true if the permission is already granted or the user grants it.
+  /// On Android 10+ gallery writes go through MediaStore and need no runtime
+  /// permission, so this always returns true; on Android 9 and below it
+  /// requests WRITE_EXTERNAL_STORAGE.
+  Future<bool> ensureGalleryPermission();
 
   /// Lists USB devices that expose a UVC video interface. Android only.
   Future<List<UvcUsbDevice>> listUsbDevices();
@@ -1251,6 +1312,49 @@ abstract interface class UvcCamera {
   ///
   /// A subsequent [startPreview] call renders into the attached texture.
   Future<void> attachPreviewTexture(int textureId, {int? width, int? height});
+
+  // ---------------------------------------------------------------------------
+  // Gallery capture
+  // ---------------------------------------------------------------------------
+
+  /// Captures the latest preview frame as a JPEG photo and saves it to the
+  /// device gallery. Android only.
+  ///
+  /// Gallery permission is re-checked (and requested if needed) on every call;
+  /// if it is not granted the photo is not taken and a [UvcException] with
+  /// [UvcErrorCode.access] is thrown.
+  ///
+  /// For MJPEG streams the raw camera frame is stored losslessly and [quality]
+  /// is ignored; for other formats the frame is encoded at [quality] (1-100).
+  /// Throws [UvcException] if no decodable frame is available, or
+  /// [PlatformException] if saving to the gallery fails.
+  Future<UvcGalleryMedia> takePicture({int quality = 90});
+
+  /// Starts recording the preview stream as an H.264/MP4 video destined for
+  /// the device gallery. Android only.
+  ///
+  /// Gallery permission is re-checked (and requested if needed) on every call;
+  /// if it is not granted the recording does not start and a [UvcException]
+  /// with [UvcErrorCode.access] is thrown. Requires a running preview with at
+  /// least one delivered frame.
+  ///
+  /// Recording follows the current [previewTransform] (what the preview
+  /// texture shows is what is recorded). [bitRate] defaults to a heuristic
+  /// based on the frame size and [frameRate].
+  ///
+  /// Throws [UvcException] if no preview is running, or [PlatformException]
+  /// if the encoder/muxer fails to start.
+  Future<void> startVideoRecording({int? bitRate, int frameRate = 30});
+
+  /// Stops the active video recording and publishes it to the gallery.
+  ///
+  /// Returns the saved gallery entry. Throws [PlatformException] if no
+  /// recording is in progress or finalizing the file fails (e.g. no frames
+  /// were delivered while recording).
+  Future<UvcGalleryMedia> stopVideoRecording();
+
+  /// Whether a video recording is currently in progress.
+  bool get isVideoRecording;
 
   /// Returns all controls supported by the currently opened device.
   List<UvcCameraControl> supportedControls();

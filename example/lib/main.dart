@@ -4,7 +4,6 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_ffi_uvc/flutter_ffi_uvc.dart';
-import 'package:flutter_ffi_uvc_example/android_bridge.dart';
 
 import 'app_theme.dart';
 import 'widgets/controls_panel.dart';
@@ -39,7 +38,6 @@ class UvcPreviewPage extends StatefulWidget {
 
 class _UvcPreviewPageState extends State<UvcPreviewPage>
     with WidgetsBindingObserver {
-  static const AndroidBridge _androidBridge = AndroidBridge();
   static const String _logPrefix = '@@@@UVC_EXAMPLE';
   static const Duration _startupProbeTimeout = Duration(seconds: 2);
   static const Duration _fpsSampleInterval = Duration(milliseconds: 1000);
@@ -59,7 +57,8 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
   bool _afTriggering = false;
   bool _previewFrozen = false;
   bool _savingPhoto = false;
-  bool _saveToGallery = false;
+  bool _saveToGallery = true;
+  bool _recordingVideo = false;
   bool _transformControlsExpanded = false;
   bool _manualFocusControlsVisible = false;
   StreamSubscription<UvcStreamError>? _streamErrorSub;
@@ -75,6 +74,9 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
   double _previewFps = 0;
   int _lastPreviewSequence = 0;
   Duration? _lastPreviewSequenceSampleAt;
+  Duration _recordingElapsed = Duration.zero;
+  Duration? _recordingStartedAt;
+  Timer? _recordingTimer;
 
   // Monotonic clock for FPS sampling and snackbar cooldowns; unlike
   // DateTime.now() it is immune to wall-clock adjustments.
@@ -116,6 +118,7 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
     _stallEventSub?.cancel();
     _camera.disableStallDetection();
     _previewStatsTimer?.cancel();
+    _recordingTimer?.cancel();
     _focusRepeatTimer?.cancel();
     _focusValueHideTimer?.cancel();
     _previewImage?.dispose();
@@ -195,7 +198,10 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
         throw Exception('uvc_open_fd failed: ${_camera.lastError}');
       }
 
-      final List<UvcCameraMode> libuvcModes = _camera.supportedModes();
+      // Deduplicate: descriptors can repeat a mode, and the dropdown requires
+      // exactly one item equal to its selected value.
+      final List<UvcCameraMode> libuvcModes =
+          <UvcCameraMode>{..._camera.supportedModes()}.toList();
       final List<UvcCameraControl> controls = _camera.supportedControls();
       _log(
         'Controls: ${controls.map((UvcCameraControl c) => '${c.name}(id=${c.id.nativeValue},cur=${c.cur})').join(', ')}',
@@ -462,6 +468,37 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
     _lastPreviewSequenceSampleAt = null;
   }
 
+  void _startRecordingTimer() {
+    _recordingStartedAt = _monotonicClock.elapsed;
+    _recordingElapsed = Duration.zero;
+    _recordingTimer?.cancel();
+    _recordingTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      final Duration? startedAt = _recordingStartedAt;
+      if (startedAt == null) return;
+      final Duration elapsed = _monotonicClock.elapsed - startedAt;
+      if (mounted) {
+        setState(() => _recordingElapsed = elapsed);
+      } else {
+        _recordingElapsed = elapsed;
+      }
+    });
+  }
+
+  void _stopRecordingTimer() {
+    _recordingTimer?.cancel();
+    _recordingTimer = null;
+    _recordingStartedAt = null;
+    _recordingElapsed = Duration.zero;
+  }
+
+  String _formatRecordingTime(Duration elapsed) {
+    final String minutes = (elapsed.inMinutes % 60).toString().padLeft(2, '0');
+    final String seconds = (elapsed.inSeconds % 60).toString().padLeft(2, '0');
+    return elapsed.inHours > 0
+        ? '${elapsed.inHours}:$minutes:$seconds'
+        : '$minutes:$seconds';
+  }
+
   void _resetStreamStats() {
     _streamStats = const UvcStreamStats.zero();
   }
@@ -605,6 +642,19 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
   }
 
   Future<void> _stopCurrentPreview({bool clearPreviewImage = false}) async {
+    // Finish an active recording before tearing down its frame source so the
+    // MP4 is finalized instead of abandoned.
+    if (_camera.isVideoRecording) {
+      try {
+        final UvcGalleryMedia saved = await _camera.stopVideoRecording();
+        _log('Recording saved to gallery: ${saved.uri ?? saved.path ?? ''}');
+      } catch (error) {
+        _log('Failed to finish recording during preview stop', error: error);
+      }
+      _stopRecordingTimer();
+      _recordingVideo = false;
+    }
+
     _previewStatsTimer?.cancel();
     _previewStatsTimer = null;
     _resetPreviewFps();
@@ -733,14 +783,47 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
     }
   }
 
+  /// Re-checks (and requests) gallery permission at the moment of use.
+  /// Returns false — after surfacing a status message — when denied, so the
+  /// caller must not capture or record.
+  Future<bool> _checkGalleryPermission(String action) async {
+    try {
+      final bool granted = await _camera.ensureGalleryPermission();
+      if (!granted) {
+        _setStatus('Gallery permission is required to $action.');
+      }
+      return granted;
+    } on PlatformException catch (error) {
+      _setStatus(
+        'Failed to request gallery permission: ${error.message ?? error.code}',
+        error: error,
+      );
+      return false;
+    }
+  }
+
   Future<void> _capturePhoto() async {
     if (_savingPhoto || _previewFrozen) {
+      return;
+    }
+    if (_saveToGallery && !await _checkGalleryPermission('take a photo')) {
       return;
     }
 
     setState(() => _savingPhoto = true);
     ui.Image? capturedImage;
     try {
+      if (_saveToGallery) {
+        final UvcGalleryMedia saved = await _camera.takePicture();
+        _setStatus('Saved photo to gallery: ${saved.uri ?? saved.path ?? ''}');
+        // The photo is in the gallery; keep the preview running. The
+        // freeze-frame flow below only serves the no-gallery capture mode.
+        return;
+      }
+      if (_recordingVideo) {
+        // Keep the preview running: it feeds the active recording.
+        return;
+      }
       final UvcPreviewFrame? frame = _camera.copyLatestFrameTransformed(
         _camera.previewTransform,
       );
@@ -748,29 +831,6 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
         throw Exception('No preview frame available to capture.');
       }
       capturedImage = await _decodeRgbaFrame(frame);
-      final ByteData? pngData = await capturedImage.toByteData(
-        format: ui.ImageByteFormat.png,
-      );
-      if (pngData == null) {
-        throw Exception('Failed to encode PNG from the current preview frame.');
-      }
-
-      final Uint8List pngBytes = pngData.buffer.asUint8List();
-      if (_saveToGallery) {
-        final String timestamp = DateTime.now()
-            .toIso8601String()
-            .replaceAll(':', '-')
-            .replaceAll('.', '-');
-        final String? savedUri = await _androidBridge.saveImageToGallery(
-          pngBytes,
-          displayName: 'uvc_capture_$timestamp.png',
-        );
-        _setStatus(
-          savedUri == null || savedUri.isEmpty
-              ? 'Saved capture to gallery.'
-              : 'Saved capture to gallery: $savedUri',
-        );
-      }
       await _stopCurrentPreview();
       final ui.Image? previousImage = _previewImage;
       if (mounted) {
@@ -785,6 +845,8 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
       previousImage?.dispose();
       capturedImage = null;
       _setStatus('Preview paused on captured frame.');
+    } on UvcException catch (error) {
+      _setStatus('Failed to capture photo: ${error.message}', error: error);
     } on PlatformException catch (error) {
       _setStatus(
         'Failed to save capture: ${error.message ?? error.code}',
@@ -799,6 +861,47 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
       } else {
         _savingPhoto = false;
       }
+    }
+  }
+
+  Future<void> _toggleVideoRecording() async {
+    if (_recordingVideo) {
+      try {
+        final UvcGalleryMedia saved = await _camera.stopVideoRecording();
+        _setStatus(
+          'Recording saved to gallery: ${saved.uri ?? saved.path ?? ''}',
+        );
+      } on PlatformException catch (error) {
+        _setStatus(
+          'Failed to stop recording: ${error.message ?? error.code}',
+          error: error,
+        );
+      } finally {
+        _stopRecordingTimer();
+        if (mounted) {
+          setState(() => _recordingVideo = false);
+        } else {
+          _recordingVideo = false;
+        }
+      }
+      return;
+    }
+
+    if (!await _checkGalleryPermission('record video')) {
+      return;
+    }
+    try {
+      await _camera.startVideoRecording();
+      _startRecordingTimer();
+      setState(() => _recordingVideo = true);
+      _setStatus('Recording video...');
+    } on UvcException catch (error) {
+      _setStatus('Failed to start recording: ${error.message}', error: error);
+    } on PlatformException catch (error) {
+      _setStatus(
+        'Failed to start recording: ${error.message ?? error.code}',
+        error: error,
+      );
     }
   }
 
@@ -1069,50 +1172,113 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
                           ),
                         ),
                       ),
+                    if (_recordingVideo)
+                      Positioned(
+                        top: 16,
+                        left: 16,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 6,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.black54,
+                            borderRadius: BorderRadius.circular(20),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: <Widget>[
+                              const Icon(
+                                Icons.fiber_manual_record,
+                                color: Colors.red,
+                                size: 14,
+                              ),
+                              const SizedBox(width: 6),
+                              Text(
+                                _formatRecordingTime(_recordingElapsed),
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
                     Positioned(
                       left: 0,
                       right: 0,
                       bottom: 16,
-                      child: Center(
-                        child: FilledButton(
-                          onPressed: _savingPhoto
-                              ? null
-                              : _previewFrozen
-                              ? () => unawaited(_resumePreview())
-                              : !_hasLivePreview
-                              ? null
-                              : () => unawaited(_capturePhoto()),
-                          style: FilledButton.styleFrom(
-                            backgroundColor: Colors.white.withValues(
-                              alpha: 0.85,
-                            ),
-                            foregroundColor: Colors.black87,
-                            minimumSize: const Size(44, 44),
-                            padding: const EdgeInsets.all(10),
-                            shape: const CircleBorder(),
-                          ),
-                          child: Tooltip(
-                            message: _savingPhoto
-                                ? 'Saving'
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: <Widget>[
+                          FilledButton(
+                            onPressed: _savingPhoto
+                                ? null
                                 : _previewFrozen
-                                ? 'Resume preview'
-                                : 'Capture',
-                            child: _savingPhoto
-                                ? const SizedBox(
-                                    width: 20,
-                                    height: 20,
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2,
+                                ? () => unawaited(_resumePreview())
+                                : !_hasLivePreview
+                                ? null
+                                : () => unawaited(_capturePhoto()),
+                            style: FilledButton.styleFrom(
+                              backgroundColor: Colors.white.withValues(
+                                alpha: 0.85,
+                              ),
+                              foregroundColor: Colors.black87,
+                              minimumSize: const Size(44, 44),
+                              padding: const EdgeInsets.all(10),
+                              shape: const CircleBorder(),
+                            ),
+                            child: Tooltip(
+                              message: _savingPhoto
+                                  ? 'Saving'
+                                  : _previewFrozen
+                                  ? 'Resume preview'
+                                  : 'Capture',
+                              child: _savingPhoto
+                                  ? const SizedBox(
+                                      width: 20,
+                                      height: 20,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                      ),
+                                    )
+                                  : Icon(
+                                      _previewFrozen
+                                          ? Icons.play_arrow
+                                          : Icons.camera_alt,
+                                      size: 24,
                                     ),
-                                  )
-                                : Icon(
-                                    _previewFrozen
-                                        ? Icons.play_arrow
-                                        : Icons.camera_alt,
-                                    size: 24,
-                                  ),
+                            ),
                           ),
-                        ),
+                          const SizedBox(width: 16),
+                          FilledButton(
+                            onPressed: _recordingVideo || _hasLivePreview
+                                ? () => unawaited(_toggleVideoRecording())
+                                : null,
+                            style: FilledButton.styleFrom(
+                              backgroundColor: _recordingVideo
+                                  ? Colors.red
+                                  : Colors.white.withValues(alpha: 0.85),
+                              foregroundColor: _recordingVideo
+                                  ? Colors.white
+                                  : Colors.black87,
+                              minimumSize: const Size(44, 44),
+                              padding: const EdgeInsets.all(10),
+                              shape: const CircleBorder(),
+                            ),
+                            child: Tooltip(
+                              message: _recordingVideo
+                                  ? 'Stop recording'
+                                  : 'Record video',
+                              child: Icon(
+                                _recordingVideo ? Icons.stop : Icons.videocam,
+                                size: 24,
+                              ),
+                            ),
+                          ),
+                        ],
                       ),
                     ),
                     if (_hasLivePreview)
@@ -1289,7 +1455,11 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
                                 contentPadding: const EdgeInsets.symmetric(
                                   horizontal: 12,
                                 ),
-                                title: const Text('Save capture to gallery'),
+                                title: const Text('Save photo to gallery'),
+                                subtitle: const Text(
+                                  'Shutter saves a JPEG to DCIM; gallery '
+                                  'permission is checked on every tap',
+                                ),
                                 value: _saveToGallery,
                                 onChanged: (bool value) =>
                                     setState(() => _saveToGallery = value),

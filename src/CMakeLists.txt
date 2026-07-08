@@ -92,3 +92,10 @@ if (ANDROID)
   target_link_options(flutter_ffi_uvc PRIVATE "-Wl,-z,max-page-size=16384")
   target_link_libraries(flutter_ffi_uvc PRIVATE android log)
 endif()
+
+# JPEG capture support (uvc_capture_jpeg) for non-MJPEG streams. Without
+# JPEG::JPEG only the lossless MJPEG passthrough path is available.
+if(TARGET JPEG::JPEG)
+  target_link_libraries(flutter_ffi_uvc PRIVATE JPEG::JPEG)
+  target_compile_definitions(flutter_ffi_uvc PRIVATE FLUTTER_FFI_UVC_HAVE_JPEG=1)
+endif()

@@ -3,6 +3,7 @@ package com.cornpip.flutter_ffi_uvc
 import android.app.Activity
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -11,9 +12,18 @@ import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
+import android.media.MediaScannerConnection
 import android.os.Build
+import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import android.provider.MediaStore
 import android.util.Log
 import android.view.Surface
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.engine.plugins.FlutterPlugin
@@ -33,6 +43,7 @@ class FlutterFfiUvcPlugin :
 
     companion object {
         private const val CAMERA_PERMISSION_REQUEST_CODE = 9001
+        private const val GALLERY_PERMISSION_REQUEST_CODE = 9002
         private const val TAG = "flutter_ffi_uvc"
 
         init {
@@ -58,6 +69,11 @@ class FlutterFfiUvcPlugin :
     private var currentDevice: UsbDevice? = null
     private var usbPermissionResult: MethodChannel.Result? = null
     private var cameraPermissionResult: MethodChannel.Result? = null
+    private var galleryPermissionResult: MethodChannel.Result? = null
+
+    // Recording
+    private var videoRecorder: VideoRecorder? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     private val usbPermissionAction: String
         get() = "${appContext?.packageName}.flutter_ffi_uvc.USB_PERMISSION"
@@ -157,6 +173,9 @@ class FlutterFfiUvcPlugin :
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        nativeDetachRecordingSurface()
+        videoRecorder?.abort()
+        videoRecorder = null
         nativeDetachSurface()
         attachedTextureId = null
         textures.values.forEach { it.release() }
@@ -207,9 +226,19 @@ class FlutterFfiUvcPlugin :
         permissions: Array<out String>,
         grantResults: IntArray,
     ): Boolean {
-        if (requestCode != CAMERA_PERMISSION_REQUEST_CODE) return false
-        val result = cameraPermissionResult ?: return false
-        cameraPermissionResult = null
+        val result = when (requestCode) {
+            CAMERA_PERMISSION_REQUEST_CODE -> {
+                val pending = cameraPermissionResult ?: return false
+                cameraPermissionResult = null
+                pending
+            }
+            GALLERY_PERMISSION_REQUEST_CODE -> {
+                val pending = galleryPermissionResult ?: return false
+                galleryPermissionResult = null
+                pending
+            }
+            else -> return false
+        }
         val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
         result.success(granted)
         return true
@@ -350,11 +379,170 @@ class FlutterFfiUvcPlugin :
                 }
             }
 
+            "ensureGalleryPermission" -> {
+                if (hasGalleryPermission()) {
+                    result.success(true)
+                    return
+                }
+                val act = activity ?: run {
+                    result.error("no_activity", "Activity not available", null)
+                    return
+                }
+                if (galleryPermissionResult != null) {
+                    result.error("busy", "Another gallery permission request is in progress", null)
+                    return
+                }
+                galleryPermissionResult = result
+                ActivityCompat.requestPermissions(
+                    act,
+                    arrayOf(android.Manifest.permission.WRITE_EXTERNAL_STORAGE),
+                    GALLERY_PERMISSION_REQUEST_CODE,
+                )
+            }
+
+            // Gallery capture ─────────────────────────────────────────────────
+
+            "saveImageToGallery" -> {
+                val bytes = call.argument<ByteArray>("bytes")
+                if (bytes == null || bytes.isEmpty()) {
+                    result.error("invalid_args", "bytes is required.", null)
+                    return
+                }
+                if (!hasGalleryPermission()) {
+                    result.error("gallery_permission_denied", "Gallery permission not granted", null)
+                    return
+                }
+                Thread({
+                    try {
+                        val saved = saveJpegToGallery(bytes)
+                        mainHandler.post { result.success(saved) }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "saveImageToGallery failed", e)
+                        mainHandler.post {
+                            result.error("save_failed", e.message ?: "Failed to save image", null)
+                        }
+                    }
+                }, "uvc-save-image").start()
+            }
+
+            "startVideoRecording" -> {
+                val width = call.argument<Number>("width")?.toInt()
+                val height = call.argument<Number>("height")?.toInt()
+                if (width == null || height == null || width <= 0 || height <= 0) {
+                    result.error("invalid_args", "width and height are required.", null)
+                    return
+                }
+                if (!hasGalleryPermission()) {
+                    result.error("gallery_permission_denied", "Gallery permission not granted", null)
+                    return
+                }
+                if (videoRecorder != null) {
+                    result.error("already_recording", "A recording is already in progress", null)
+                    return
+                }
+                val context = appContext ?: run {
+                    result.error("unavailable", "Context not available", null)
+                    return
+                }
+                val bitRate = call.argument<Number>("bitRate")?.toInt()
+                val frameRate = call.argument<Number>("frameRate")?.toInt() ?: 30
+                try {
+                    val recorder = VideoRecorder(context, width, height, bitRate, frameRate)
+                    val surface = recorder.start()
+                    val attachResult = nativeAttachRecordingSurface(surface)
+                    if (attachResult != 0) {
+                        recorder.abort()
+                        result.error(
+                            "attach_failed",
+                            "nativeAttachRecordingSurface failed with code $attachResult",
+                            attachResult,
+                        )
+                        return
+                    }
+                    videoRecorder = recorder
+                    result.success(null)
+                } catch (e: Exception) {
+                    Log.e(TAG, "startVideoRecording failed", e)
+                    result.error("start_failed", e.message ?: "Failed to start recording", null)
+                }
+            }
+
+            "stopVideoRecording" -> {
+                val recorder = videoRecorder ?: run {
+                    result.error("not_recording", "No recording in progress", null)
+                    return
+                }
+                videoRecorder = null
+                // Detach first so no frame is rendered after end-of-stream.
+                nativeDetachRecordingSurface()
+                recorder.stop(object : VideoRecorder.StopCallback {
+                    override fun onComplete(uri: String?, path: String?) {
+                        mainHandler.post {
+                            result.success(mapOf("uri" to uri, "path" to path))
+                        }
+                    }
+
+                    override fun onError(message: String) {
+                        mainHandler.post { result.error("stop_failed", message, null) }
+                    }
+                })
+            }
+
             else -> result.notImplemented()
         }
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
+
+    // Saving media through MediaStore needs no runtime permission on
+    // Android 10+ (scoped storage); earlier releases need WRITE_EXTERNAL_STORAGE.
+    private fun hasGalleryPermission(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) return true
+        val context = appContext ?: return false
+        return ContextCompat.checkSelfPermission(
+            context,
+            android.Manifest.permission.WRITE_EXTERNAL_STORAGE,
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    /** Writes JPEG bytes into the device gallery. Returns uri/path of the entry. */
+    private fun saveJpegToGallery(bytes: ByteArray): Map<String, String?> {
+        val context = appContext ?: throw IllegalStateException("Context not available")
+        val name = "UVC_" +
+            SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date()) + ".jpg"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val resolver = context.contentResolver
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, name)
+                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_DCIM)
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+            val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                ?: throw IllegalStateException("Failed to create MediaStore image entry")
+            try {
+                resolver.openOutputStream(uri)?.use { it.write(bytes) }
+                    ?: throw IllegalStateException("Failed to open MediaStore image for writing")
+                values.clear()
+                values.put(MediaStore.Images.Media.IS_PENDING, 0)
+                resolver.update(uri, values, null, null)
+            } catch (e: Exception) {
+                resolver.delete(uri, null, null)
+                throw e
+            }
+            return mapOf("uri" to uri.toString(), "path" to null)
+        }
+
+        @Suppress("DEPRECATION")
+        val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
+        if (!dir.exists() && !dir.mkdirs()) {
+            throw IllegalStateException("Cannot create output directory ${dir.absolutePath}")
+        }
+        val file = File(dir, name)
+        file.writeBytes(bytes)
+        MediaScannerConnection.scanFile(context, arrayOf(file.absolutePath), null, null)
+        return mapOf("uri" to null, "path" to file.absolutePath)
+    }
 
     private fun openDevice(device: UsbDevice, result: MethodChannel.Result) {
         closeCurrentConnection()
@@ -455,4 +643,6 @@ class FlutterFfiUvcPlugin :
 
     private external fun nativeAttachSurface(surface: Surface): Int
     private external fun nativeDetachSurface()
+    private external fun nativeAttachRecordingSurface(surface: Surface): Int
+    private external fun nativeDetachRecordingSurface()
 }

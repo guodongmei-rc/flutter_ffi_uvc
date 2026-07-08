@@ -59,6 +59,23 @@ FFI_PLUGIN_EXPORT int uvc_copy_latest_frame_rgba_transformed(
     int *out_width,
     int *out_height,
     int64_t *out_sequence);
+// Captures the latest decodable frame as JPEG bytes.
+//
+// For MJPEG streams the raw camera frame is returned unmodified (lossless,
+// no re-encode) and [quality] is ignored. For other formats the latest
+// decoded frame is encoded with libjpeg at [quality] (1-100; out-of-range
+// values are clamped, <=0 uses 90).
+//
+// A buffer of uvc_frame_width()*uvc_frame_height()*4 bytes is always large
+// enough. Returns the number of JPEG bytes written to [buffer], or 0 on
+// failure (see uvc_last_error).
+FFI_PLUGIN_EXPORT int uvc_capture_jpeg(
+    uint8_t *buffer,
+    int buffer_length,
+    int quality,
+    int *out_width,
+    int *out_height,
+    int64_t *out_sequence);
 FFI_PLUGIN_EXPORT int64_t uvc_latest_frame_sequence(void);
 FFI_PLUGIN_EXPORT void uvc_set_frame_listener(uvc_frame_listener_t listener);
 typedef void (*uvc_error_listener_t)(const char *message);

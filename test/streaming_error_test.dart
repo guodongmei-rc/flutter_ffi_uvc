@@ -25,6 +25,18 @@ class _FakeCamera implements UvcCamera {
   @override
   Future<bool> ensureCameraPermission() async => false;
   @override
+  Future<bool> ensureGalleryPermission() async => false;
+  @override
+  Future<UvcGalleryMedia> takePicture({int quality = 90}) async =>
+      const UvcGalleryMedia();
+  @override
+  Future<void> startVideoRecording({int? bitRate, int frameRate = 30}) async {}
+  @override
+  Future<UvcGalleryMedia> stopVideoRecording() async =>
+      const UvcGalleryMedia();
+  @override
+  bool get isVideoRecording => false;
+  @override
   Future<List<UvcUsbDevice>> listUsbDevices() async => const [];
   @override
   Future<int> openUsbDevice(int deviceId) async => -1;

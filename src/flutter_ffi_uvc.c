@@ -1,10 +1,16 @@
 #include "flutter_ffi_uvc.h"
 
 #include <inttypes.h>
+#include <setjmp.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+
+#if defined(FLUTTER_FFI_UVC_HAVE_JPEG)
+#include <jpeglib.h>
+#endif
 
 #if defined(__ANDROID__)
 #include <android/native_window.h>
@@ -40,6 +46,7 @@ typedef struct {
   uint64_t invalid_mjpeg_count;
   uint64_t buffer_allocation_failure_count;
   uint64_t preview_surface_failure_count;
+  uint64_t recording_surface_failure_count;
   uint64_t conversion_failure_count;
   uint64_t gap_ring[256];
   uint32_t gap_ring_count;
@@ -54,12 +61,30 @@ typedef struct {
   uvc_frame_t *rgb_frame;
   uint8_t *latest_rgba;
   size_t latest_rgba_bytes;
-  int frame_width;
-  int frame_height;
-  int previewing;
+  size_t latest_rgba_capacity;
+  // Raw JPEG copy of the most recent MJPEG frame that decoded successfully,
+  // kept so uvc_capture_jpeg can return it losslessly without a re-encode.
+  uint8_t *latest_jpeg;
+  size_t latest_jpeg_bytes;
+  size_t latest_jpeg_capacity;
+  int latest_jpeg_width;
+  int latest_jpeg_height;
+  int64_t latest_jpeg_sequence;
+  // Staging buffers owned by the libuvc callback thread. Decode/convert runs
+  // into these outside the mutex; results are published with an O(1) pointer
+  // swap under the mutex, so the lock is never held across frame processing
+  // and Dart-side FFI calls cannot stall the UI thread behind it.
+  uint8_t *staging_rgba;
+  size_t staging_rgba_capacity;
+  uint8_t *staging_jpeg;
+  size_t staging_jpeg_capacity;
+  // Atomic so hot polling reads (sequence/size/previewing) skip the mutex.
+  _Atomic int frame_width;
+  _Atomic int frame_height;
+  _Atomic int previewing;
   int stopping_preview;
   uint32_t callbacks_inflight;
-  int64_t latest_sequence;
+  _Atomic int64_t latest_sequence;
   uvc_frame_listener_t frame_listener;
   uvc_error_listener_t error_listener;
   uint32_t callback_count;
@@ -70,6 +95,7 @@ typedef struct {
   uint32_t error_ring_next;
 #if defined(__ANDROID__)
   ANativeWindow *preview_window;
+  ANativeWindow *recording_window;
 #endif
   int preview_rotation;  // 0, 90, 180, 270 (clockwise)
   int preview_flip_h;    // mirror left-right
@@ -218,10 +244,105 @@ static void reset_frame_buffer_locked(void) {
   free(g_uvc_state.latest_rgba);
   g_uvc_state.latest_rgba = NULL;
   g_uvc_state.latest_rgba_bytes = 0;
+  g_uvc_state.latest_rgba_capacity = 0;
+  free(g_uvc_state.staging_rgba);
+  g_uvc_state.staging_rgba = NULL;
+  g_uvc_state.staging_rgba_capacity = 0;
+  free(g_uvc_state.latest_jpeg);
+  g_uvc_state.latest_jpeg = NULL;
+  g_uvc_state.latest_jpeg_bytes = 0;
+  g_uvc_state.latest_jpeg_capacity = 0;
+  g_uvc_state.latest_jpeg_width = 0;
+  g_uvc_state.latest_jpeg_height = 0;
+  g_uvc_state.latest_jpeg_sequence = 0;
+  free(g_uvc_state.staging_jpeg);
+  g_uvc_state.staging_jpeg = NULL;
+  g_uvc_state.staging_jpeg_capacity = 0;
   g_uvc_state.frame_width = 0;
   g_uvc_state.frame_height = 0;
   g_uvc_state.latest_sequence = 0;
   g_uvc_state.callback_count = 0;
+}
+
+// The staging helpers below run on the libuvc callback thread only, outside
+// the mutex. The callbacks_inflight bracket keeps stop/close from freeing the
+// staging buffers while a callback is between its lock sections.
+
+static int ensure_staging_rgba(size_t required_bytes) {
+  if (g_uvc_state.staging_rgba_capacity < required_bytes) {
+    uint8_t *new_buffer = realloc(g_uvc_state.staging_rgba, required_bytes);
+    if (new_buffer == NULL) {
+      return 0;
+    }
+    g_uvc_state.staging_rgba = new_buffer;
+    g_uvc_state.staging_rgba_capacity = required_bytes;
+  }
+  return 1;
+}
+
+static int convert_rgb_frame_to_staging(void) {
+  const size_t pixel_count =
+      (size_t)g_uvc_state.rgb_frame->width * (size_t)g_uvc_state.rgb_frame->height;
+  if (!ensure_staging_rgba(pixel_count * 4)) {
+    return 0;
+  }
+
+  const uint8_t *src = (const uint8_t *)g_uvc_state.rgb_frame->data;
+  uint8_t *dst = g_uvc_state.staging_rgba;
+  for (size_t i = 0; i < pixel_count; ++i) {
+    dst[i * 4 + 0] = src[i * 3 + 0];
+    dst[i * 4 + 1] = src[i * 3 + 1];
+    dst[i * 4 + 2] = src[i * 3 + 2];
+    dst[i * 4 + 3] = 0xFF;
+  }
+  return 1;
+}
+
+static int copy_mjpeg_to_staging(const uvc_frame_t *frame) {
+  if (frame->data_bytes == 0) {
+    return 0;
+  }
+
+  if (g_uvc_state.staging_jpeg_capacity < frame->data_bytes) {
+    uint8_t *new_buffer = realloc(g_uvc_state.staging_jpeg, frame->data_bytes);
+    if (new_buffer == NULL) {
+      return 0;
+    }
+    g_uvc_state.staging_jpeg = new_buffer;
+    g_uvc_state.staging_jpeg_capacity = frame->data_bytes;
+  }
+
+  memcpy(g_uvc_state.staging_jpeg, frame->data, frame->data_bytes);
+  return 1;
+}
+
+// Publishes the staged frame to the shared buffers with O(1) pointer swaps.
+static void publish_staging_frame_locked(
+    int width, int height, int jpeg_staged, size_t jpeg_bytes) {
+  uint8_t *old_rgba = g_uvc_state.latest_rgba;
+  size_t old_rgba_capacity = g_uvc_state.latest_rgba_capacity;
+  g_uvc_state.latest_rgba = g_uvc_state.staging_rgba;
+  g_uvc_state.latest_rgba_capacity = g_uvc_state.staging_rgba_capacity;
+  g_uvc_state.latest_rgba_bytes = (size_t)width * (size_t)height * 4;
+  g_uvc_state.staging_rgba = old_rgba;
+  g_uvc_state.staging_rgba_capacity = old_rgba_capacity;
+
+  g_uvc_state.frame_width = width;
+  g_uvc_state.frame_height = height;
+  g_uvc_state.latest_sequence += 1;
+
+  if (jpeg_staged) {
+    uint8_t *old_jpeg = g_uvc_state.latest_jpeg;
+    size_t old_jpeg_capacity = g_uvc_state.latest_jpeg_capacity;
+    g_uvc_state.latest_jpeg = g_uvc_state.staging_jpeg;
+    g_uvc_state.latest_jpeg_capacity = g_uvc_state.staging_jpeg_capacity;
+    g_uvc_state.latest_jpeg_bytes = jpeg_bytes;
+    g_uvc_state.staging_jpeg = old_jpeg;
+    g_uvc_state.staging_jpeg_capacity = old_jpeg_capacity;
+    g_uvc_state.latest_jpeg_width = width;
+    g_uvc_state.latest_jpeg_height = height;
+    g_uvc_state.latest_jpeg_sequence = g_uvc_state.latest_sequence;
+  }
 }
 
 static void blit_rgba_transform(
@@ -267,47 +388,54 @@ static void release_preview_window_locked(void) {
   g_uvc_state.preview_window = NULL;
 }
 
-static int render_latest_rgba_to_preview_surface_locked(void) {
-  if (g_uvc_state.preview_window == NULL ||
-      g_uvc_state.latest_rgba == NULL ||
-      g_uvc_state.frame_width <= 0 ||
-      g_uvc_state.frame_height <= 0) {
-    return 1;
+static void release_recording_window_locked(void) {
+  if (g_uvc_state.recording_window == NULL) {
+    return;
   }
 
-  const int src_w = g_uvc_state.frame_width;
-  const int src_h = g_uvc_state.frame_height;
-  const int rot   = g_uvc_state.preview_rotation;
-  const int fh    = g_uvc_state.preview_flip_h;
-  const int fv    = g_uvc_state.preview_flip_v;
+  ANativeWindow_release(g_uvc_state.recording_window);
+  g_uvc_state.recording_window = NULL;
+}
+
+// Pure blit: no shared-state access, safe to run outside the mutex. The
+// caller must hold an ANativeWindow reference (ANativeWindow_acquire) so a
+// concurrent detach cannot free the window mid-render. ANativeWindow_lock can
+// block for as long as the consumer (Flutter raster thread, video encoder)
+// stalls, which is exactly why this must not run under the state mutex.
+static int render_rgba_to_window(
+    ANativeWindow *window,
+    const uint8_t *rgba,
+    int src_w,
+    int src_h,
+    int rot,
+    int fh,
+    int fv) {
+  if (window == NULL || rgba == NULL || src_w <= 0 || src_h <= 0) {
+    return 1;
+  }
 
   const int out_w = (rot == 90 || rot == 270) ? src_h : src_w;
   const int out_h = (rot == 90 || rot == 270) ? src_w : src_h;
 
   if (ANativeWindow_setBuffersGeometry(
-          g_uvc_state.preview_window,
+          window,
           out_w,
           out_h,
           WINDOW_FORMAT_RGBA_8888) != 0) {
-    g_uvc_state.stats.preview_surface_failure_count += 1;
-    set_last_error("Failed to configure preview surface geometry");
     return 0;
   }
 
   ANativeWindow_Buffer window_buffer;
-  if (ANativeWindow_lock(g_uvc_state.preview_window, &window_buffer, NULL) != 0) {
-    g_uvc_state.stats.preview_surface_failure_count += 1;
-    set_last_error("Failed to lock preview surface");
+  if (ANativeWindow_lock(window, &window_buffer, NULL) != 0) {
     return 0;
   }
 
-  const uint32_t *src = (const uint32_t *)g_uvc_state.latest_rgba;
-  uint32_t *dst = (uint32_t *)window_buffer.bits;
-  const int dst_stride = window_buffer.stride;
+  blit_rgba_transform(
+      (const uint32_t *)rgba, src_w, src_h,
+      (uint32_t *)window_buffer.bits, window_buffer.stride,
+      rot, fh, fv);
 
-  blit_rgba_transform(src, src_w, src_h, dst, dst_stride, rot, fh, fv);
-
-  ANativeWindow_unlockAndPost(g_uvc_state.preview_window);
+  ANativeWindow_unlockAndPost(window);
   return 1;
 }
 #endif
@@ -355,6 +483,7 @@ static void finish_stop_preview_locked(void) {
 static void close_device_resources_locked(void) {
 #if defined(__ANDROID__)
   release_preview_window_locked();
+  release_recording_window_locked();
 #endif
 
   if (g_uvc_state.rgb_frame != NULL) {
@@ -387,27 +516,22 @@ static void close_device_resources_locked(void) {
   g_uvc_state.error_listener = NULL;
 }
 
-static int ensure_rgb_frame_locked(size_t required_bytes) {
+// No shared stats/error writes: runs on the callback thread outside the
+// mutex (rgb_frame is only ever touched by the callback thread, or with the
+// preview fully stopped). Callers account for failures themselves.
+static int ensure_rgb_frame(size_t required_bytes) {
   if (required_bytes == 0) {
-    set_last_error("Invalid RGB frame size: %zu", required_bytes);
     return 0;
   }
 
   if (g_uvc_state.rgb_frame == NULL) {
     g_uvc_state.rgb_frame = uvc_allocate_frame(required_bytes);
-    if (g_uvc_state.rgb_frame == NULL) {
-      g_uvc_state.stats.buffer_allocation_failure_count += 1;
-      set_last_error("Failed to allocate RGB frame buffer (%zu bytes)", required_bytes);
-      return 0;
-    }
-    return 1;
+    return g_uvc_state.rgb_frame != NULL;
   }
 
   if (g_uvc_state.rgb_frame->data_bytes < required_bytes) {
     uint8_t *new_data = realloc(g_uvc_state.rgb_frame->data, required_bytes);
     if (new_data == NULL) {
-      g_uvc_state.stats.buffer_allocation_failure_count += 1;
-      set_last_error("Failed to grow RGB frame buffer to %zu bytes", required_bytes);
       return 0;
     }
     g_uvc_state.rgb_frame->data = new_data;
@@ -417,36 +541,15 @@ static int ensure_rgb_frame_locked(size_t required_bytes) {
   return 1;
 }
 
-static int update_latest_rgba_locked(void) {
-  const size_t rgba_bytes = (size_t)g_uvc_state.rgb_frame->width * (size_t)g_uvc_state.rgb_frame->height * 4;
-
-  if (g_uvc_state.latest_rgba_bytes != rgba_bytes) {
-    uint8_t *new_buffer = realloc(g_uvc_state.latest_rgba, rgba_bytes);
-    if (new_buffer == NULL) {
-      g_uvc_state.stats.buffer_allocation_failure_count += 1;
-      set_last_error("Failed to allocate %zu bytes for preview frame", rgba_bytes);
-      return 0;
-    }
-    g_uvc_state.latest_rgba = new_buffer;
-    g_uvc_state.latest_rgba_bytes = rgba_bytes;
-  }
-
-  uint8_t *src = (uint8_t *)g_uvc_state.rgb_frame->data;
-  uint8_t *dst = g_uvc_state.latest_rgba;
-  const size_t pixel_count =
-      (size_t)g_uvc_state.rgb_frame->width * (size_t)g_uvc_state.rgb_frame->height;
-
-  for (size_t i = 0; i < pixel_count; ++i) {
-    dst[i * 4 + 0] = src[i * 3 + 0];
-    dst[i * 4 + 1] = src[i * 3 + 1];
-    dst[i * 4 + 2] = src[i * 3 + 2];
-    dst[i * 4 + 3] = 0xFF;
-  }
-
-  g_uvc_state.frame_width = g_uvc_state.rgb_frame->width;
-  g_uvc_state.frame_height = g_uvc_state.rgb_frame->height;
-  g_uvc_state.latest_sequence += 1;
-  return 1;
+// Precondition: mutex held and last_error set. Completes the callback
+// bookkeeping, releases the mutex, and fires the async error listener.
+static void abort_frame_callback_locked_and_notify(void) {
+  uint32_t ring_idx = g_uvc_state.error_ring_next++ % 8;
+  snprintf(g_uvc_state.error_ring[ring_idx], 256, "%s", g_uvc_state.last_error);
+  uvc_error_listener_t listener = g_uvc_state.error_listener;
+  finish_callback_locked();
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+  if (listener) listener(g_uvc_state.error_ring[ring_idx]);
 }
 
 static size_t expected_frame_bytes_for_format(const uvc_frame_t *frame) {
@@ -507,7 +610,6 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
   g_uvc_state.callback_count += 1;
   g_uvc_state.stats.input_frame_count += 1;
   uint32_t callback_count = g_uvc_state.callback_count;
-  uvc_error_listener_t error_listener = NULL;
 
   if (g_uvc_state.stats.has_last_source_sequence &&
       frame->sequence <= g_uvc_state.stats.last_source_sequence) {
@@ -548,12 +650,7 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
         frame->height,
         expected_input_bytes,
         frame->data_bytes);
-    uint32_t _ring_idx = g_uvc_state.error_ring_next++ % 8;
-    snprintf(g_uvc_state.error_ring[_ring_idx], 256, "%s", g_uvc_state.last_error);
-    error_listener = g_uvc_state.error_listener;
-    finish_callback_locked();
-    pthread_mutex_unlock(&g_uvc_state.mutex);
-    if (error_listener) error_listener(g_uvc_state.error_ring[_ring_idx]);
+    abort_frame_callback_locked_and_notify();
     return;
   }
 
@@ -591,73 +688,95 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
           frame->width,
           frame->height,
           frame->data_bytes);
-      uint32_t _ring_idx = g_uvc_state.error_ring_next++ % 8;
-      snprintf(g_uvc_state.error_ring[_ring_idx], 256, "%s", g_uvc_state.last_error);
-      error_listener = g_uvc_state.error_listener;
-      finish_callback_locked();
-      pthread_mutex_unlock(&g_uvc_state.mutex);
-      if (error_listener) error_listener(g_uvc_state.error_ring[_ring_idx]);
+      abort_frame_callback_locked_and_notify();
       return;
     }
   }
 
-  const size_t required_rgb_bytes = (size_t)frame->width * (size_t)frame->height * 3;
+  pthread_mutex_unlock(&g_uvc_state.mutex);
 
-  if (!ensure_rgb_frame_locked(required_rgb_bytes)) {
+  // Phase 2 — no lock held: decode and convert into callback-owned staging
+  // buffers. callbacks_inflight (released at the very end) keeps stop/close
+  // from freeing these buffers while the lock is dropped.
+  const int width = (int)frame->width;
+  const int height = (int)frame->height;
+  const size_t required_rgb_bytes = (size_t)width * (size_t)height * 3;
+
+  if (!ensure_rgb_frame(required_rgb_bytes)) {
     UVC_LOGE(
         "UVC_NATIVE",
-        "frame callback failed to prepare rgb buffer callback=%u width=%u height=%u bytes=%zu",
+        "frame callback failed to prepare rgb buffer callback=%u width=%d height=%d bytes=%zu",
         callback_count,
-        frame->width,
-        frame->height,
+        width,
+        height,
         required_rgb_bytes);
-    uint32_t _ring_idx = g_uvc_state.error_ring_next++ % 8;
-    snprintf(g_uvc_state.error_ring[_ring_idx], 256, "%s", g_uvc_state.last_error);
-    error_listener = g_uvc_state.error_listener;
-    finish_callback_locked();
-    pthread_mutex_unlock(&g_uvc_state.mutex);
-    if (error_listener) error_listener(g_uvc_state.error_ring[_ring_idx]);
+    pthread_mutex_lock(&g_uvc_state.mutex);
+    g_uvc_state.stats.buffer_allocation_failure_count += 1;
+    g_uvc_state.stats.decode_failure_count += 1;
+    set_last_error("Failed to allocate RGB frame buffer (%zu bytes)", required_rgb_bytes);
+    abort_frame_callback_locked_and_notify();
     return;
   }
 
   uvc_error_t convert_result = uvc_any2rgb(frame, g_uvc_state.rgb_frame);
   if (convert_result != UVC_SUCCESS) {
+    UVC_LOGE(
+        "UVC_NATIVE",
+        "uvc_any2rgb failed callback=%u format=%d width=%d height=%d err=%s",
+        callback_count,
+        frame->frame_format,
+        width,
+        height,
+        uvc_strerror(convert_result));
+    pthread_mutex_lock(&g_uvc_state.mutex);
     g_uvc_state.stats.conversion_failure_count += 1;
     g_uvc_state.stats.decode_failure_count += 1;
     set_last_error("uvc_any2rgb failed: %s", uvc_strerror(convert_result));
-    UVC_LOGE(
-        "UVC_NATIVE",
-        "uvc_any2rgb failed callback=%u format=%d width=%u height=%u err=%s",
-        callback_count,
-        frame->frame_format,
-        frame->width,
-        frame->height,
-        uvc_strerror(convert_result));
-    uint32_t _ring_idx = g_uvc_state.error_ring_next++ % 8;
-    snprintf(g_uvc_state.error_ring[_ring_idx], 256, "%s", g_uvc_state.last_error);
-    error_listener = g_uvc_state.error_listener;
-    finish_callback_locked();
-    pthread_mutex_unlock(&g_uvc_state.mutex);
-    if (error_listener) error_listener(g_uvc_state.error_ring[_ring_idx]);
+    abort_frame_callback_locked_and_notify();
     return;
   }
 
-  const size_t rgba_bytes = (size_t)g_uvc_state.rgb_frame->width * (size_t)g_uvc_state.rgb_frame->height * 4;
+  if (!convert_rgb_frame_to_staging()) {
+    pthread_mutex_lock(&g_uvc_state.mutex);
+    g_uvc_state.stats.buffer_allocation_failure_count += 1;
+    g_uvc_state.stats.decode_failure_count += 1;
+    set_last_error(
+        "Failed to allocate %zu bytes for preview frame",
+        (size_t)width * (size_t)height * 4);
+    abort_frame_callback_locked_and_notify();
+    return;
+  }
+
+  int jpeg_staged = 0;
+  if (frame->frame_format == UVC_FRAME_FORMAT_MJPEG) {
+    // Best-effort: a failed copy only degrades uvc_capture_jpeg to the
+    // re-encode path, the preview frame itself already succeeded.
+    jpeg_staged = copy_mjpeg_to_staging(frame);
+  }
+
+  // Phase 3 — short lock: publish the staged frame with pointer swaps and
+  // snapshot everything the blit needs.
   int64_t delivered_sequence = 0;
   uvc_frame_listener_t frame_listener = NULL;
+  const uint8_t *render_rgba = NULL;
+  int render_rot = 0;
+  int render_fh = 0;
+  int render_fv = 0;
+#if defined(__ANDROID__)
+  ANativeWindow *preview_window = NULL;
+  ANativeWindow *recording_window = NULL;
+#endif
 
-  if (!update_latest_rgba_locked()) {
-    uint32_t _ring_idx = g_uvc_state.error_ring_next++ % 8;
-    snprintf(g_uvc_state.error_ring[_ring_idx], 256, "%s", g_uvc_state.last_error);
-    error_listener = g_uvc_state.error_listener;
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  if (g_uvc_state.stopping_preview) {
     finish_callback_locked();
     pthread_mutex_unlock(&g_uvc_state.mutex);
-    if (error_listener) error_listener(g_uvc_state.error_ring[_ring_idx]);
     return;
   }
-#if defined(__ANDROID__)
-  render_latest_rgba_to_preview_surface_locked();
-#endif
+  publish_staging_frame_locked(width, height, jpeg_staged, frame->data_bytes);
+  if (frame->frame_format == UVC_FRAME_FORMAT_MJPEG && !jpeg_staged) {
+    g_uvc_state.stats.buffer_allocation_failure_count += 1;
+  }
   if (g_uvc_state.stats.start_monotonic_ns != 0) {
     if (g_uvc_state.stats.delivered_frame_count == 0) {
       g_uvc_state.stats.first_frame_latency_ns =
@@ -683,7 +802,60 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
   g_uvc_state.stats.decode_success_count += 1;
   delivered_sequence = g_uvc_state.latest_sequence;
   frame_listener = g_uvc_state.frame_listener;
+  render_rgba = g_uvc_state.latest_rgba;
+  render_rot = g_uvc_state.preview_rotation;
+  render_fh = g_uvc_state.preview_flip_h;
+  render_fv = g_uvc_state.preview_flip_v;
+#if defined(__ANDROID__)
+  preview_window = g_uvc_state.preview_window;
+  if (preview_window != NULL) {
+    ANativeWindow_acquire(preview_window);
+  }
+  recording_window = g_uvc_state.recording_window;
+  if (recording_window != NULL) {
+    ANativeWindow_acquire(recording_window);
+  }
+#endif
   clear_last_error();
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+
+  // Phase 4 — no lock held: blit to the surfaces. latest_rgba cannot be
+  // swapped concurrently (libuvc delivers callbacks serially) nor freed
+  // (callbacks_inflight is still held); the windows are kept alive by the
+  // references acquired above.
+#if defined(__ANDROID__)
+  int preview_failed = 0;
+  int recording_failed = 0;
+  if (preview_window != NULL) {
+    preview_failed = !render_rgba_to_window(
+        preview_window, render_rgba, width, height,
+        render_rot, render_fh, render_fv);
+    ANativeWindow_release(preview_window);
+  }
+  if (recording_window != NULL) {
+    recording_failed = !render_rgba_to_window(
+        recording_window, render_rgba, width, height,
+        render_rot, render_fh, render_fv);
+    ANativeWindow_release(recording_window);
+  }
+#else
+  (void)render_rgba;
+  (void)render_rot;
+  (void)render_fh;
+  (void)render_fv;
+#endif
+
+  // Phase 5 — short lock: failure accounting and inflight release.
+  pthread_mutex_lock(&g_uvc_state.mutex);
+#if defined(__ANDROID__)
+  if (preview_failed) {
+    g_uvc_state.stats.preview_surface_failure_count += 1;
+    set_last_error("Failed to render preview surface");
+  }
+  if (recording_failed) {
+    g_uvc_state.stats.recording_surface_failure_count += 1;
+  }
+#endif
   finish_callback_locked();
   pthread_mutex_unlock(&g_uvc_state.mutex);
 
@@ -692,9 +864,9 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
         "UVC_NATIVE",
         "frame callback #%u converted rgb width=%d height=%d rgbaBytes=%zu",
         callback_count,
-        g_uvc_state.frame_width,
-        g_uvc_state.frame_height,
-        rgba_bytes);
+        width,
+        height,
+        (size_t)width * (size_t)height * 4);
   }
 
   if (frame_listener != NULL) {
@@ -827,7 +999,9 @@ FFI_PLUGIN_EXPORT int uvc_start_preview(
   memset(&ctrl, 0, sizeof(ctrl));
 
   const size_t required_rgb_bytes = (size_t)width * (size_t)height * 3;
-  if (!ensure_rgb_frame_locked(required_rgb_bytes)) {
+  if (!ensure_rgb_frame(required_rgb_bytes)) {
+    g_uvc_state.stats.buffer_allocation_failure_count += 1;
+    set_last_error("Failed to allocate RGB frame buffer (%zu bytes)", required_rgb_bytes);
     pthread_mutex_unlock(&g_uvc_state.mutex);
     return UVC_ERROR_NO_MEM;
   }
@@ -985,11 +1159,10 @@ FFI_PLUGIN_EXPORT int uvc_get_supported_modes_json(uint8_t *buffer, int buffer_l
   return (int)offset;
 }
 
+// Atomic read — never touches the mutex, so Dart-side polling cannot block
+// the UI thread behind frame processing.
 FFI_PLUGIN_EXPORT int64_t uvc_latest_frame_sequence(void) {
-  pthread_mutex_lock(&g_uvc_state.mutex);
-  const int64_t latest_sequence = g_uvc_state.latest_sequence;
-  pthread_mutex_unlock(&g_uvc_state.mutex);
-  return latest_sequence;
+  return g_uvc_state.latest_sequence;
 }
 
 FFI_PLUGIN_EXPORT int uvc_get_stream_stats_json(uint8_t *buffer, int buffer_length) {
@@ -1058,6 +1231,7 @@ FFI_PLUGIN_EXPORT int uvc_get_stream_stats_json(uint8_t *buffer, int buffer_leng
           "\"invalidMjpegCount\":%" PRIu64 ","
           "\"bufferAllocationFailureCount\":%" PRIu64 ","
           "\"previewSurfaceFailureCount\":%" PRIu64 ","
+          "\"recordingSurfaceFailureCount\":%" PRIu64 ","
           "\"conversionFailureCount\":%" PRIu64 ","
           "\"inputFps\":%.3f,"
           "\"deliveredFps\":%.3f,"
@@ -1078,6 +1252,7 @@ FFI_PLUGIN_EXPORT int uvc_get_stream_stats_json(uint8_t *buffer, int buffer_leng
           stats.invalid_mjpeg_count,
           stats.buffer_allocation_failure_count,
           stats.preview_surface_failure_count,
+          stats.recording_surface_failure_count,
           stats.conversion_failure_count,
           input_fps,
           delivered_fps,
@@ -1150,11 +1325,9 @@ FFI_PLUGIN_EXPORT void uvc_close_device(void) {
   pthread_mutex_unlock(&g_uvc_state.mutex);
 }
 
+// Atomic read — see uvc_latest_frame_sequence.
 FFI_PLUGIN_EXPORT int uvc_is_previewing(void) {
-  pthread_mutex_lock(&g_uvc_state.mutex);
-  int previewing = g_uvc_state.previewing;
-  pthread_mutex_unlock(&g_uvc_state.mutex);
-  return previewing;
+  return g_uvc_state.previewing;
 }
 
 #if defined(__ANDROID__)
@@ -1194,20 +1367,52 @@ Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeDetachSurface(
   release_preview_window_locked();
   pthread_mutex_unlock(&g_uvc_state.mutex);
 }
+
+JNIEXPORT jint JNICALL
+Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeAttachRecordingSurface(
+    JNIEnv *env,
+    jobject thiz,
+    jobject surface) {
+  (void)thiz;
+
+  if (surface == NULL) {
+    return UVC_ERROR_INVALID_PARAM;
+  }
+
+  ANativeWindow *window = ANativeWindow_fromSurface(env, surface);
+  if (window == NULL) {
+    set_last_error("Failed to acquire ANativeWindow from recording Surface");
+    return UVC_ERROR_IO;
+  }
+
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  release_recording_window_locked();
+  g_uvc_state.recording_window = window;
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+  clear_last_error();
+  return UVC_SUCCESS;
+}
+
+JNIEXPORT void JNICALL
+Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeDetachRecordingSurface(
+    JNIEnv *env,
+    jobject thiz) {
+  (void)env;
+  (void)thiz;
+
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  release_recording_window_locked();
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+}
 #endif
 
+// Atomic reads — see uvc_latest_frame_sequence.
 FFI_PLUGIN_EXPORT int uvc_frame_width(void) {
-  pthread_mutex_lock(&g_uvc_state.mutex);
-  int width = g_uvc_state.frame_width;
-  pthread_mutex_unlock(&g_uvc_state.mutex);
-  return width;
+  return g_uvc_state.frame_width;
 }
 
 FFI_PLUGIN_EXPORT int uvc_frame_height(void) {
-  pthread_mutex_lock(&g_uvc_state.mutex);
-  int height = g_uvc_state.frame_height;
-  pthread_mutex_unlock(&g_uvc_state.mutex);
-  return height;
+  return g_uvc_state.frame_height;
 }
 
 FFI_PLUGIN_EXPORT int uvc_copy_latest_frame_rgba(uint8_t *buffer, int buffer_length) {
@@ -1295,6 +1500,153 @@ FFI_PLUGIN_EXPORT int uvc_copy_latest_frame_rgba_transformed(
   return expected_bytes;
 }
 
+#if defined(FLUTTER_FFI_UVC_HAVE_JPEG)
+typedef struct {
+  struct jpeg_error_mgr pub;
+  jmp_buf setjmp_buffer;
+} capture_jpeg_error_mgr_t;
+
+static void capture_jpeg_error_exit(j_common_ptr cinfo) {
+  capture_jpeg_error_mgr_t *err = (capture_jpeg_error_mgr_t *)cinfo->err;
+  longjmp(err->setjmp_buffer, 1);
+}
+
+static int encode_rgba_to_jpeg(
+    const uint8_t *rgba,
+    int width,
+    int height,
+    int quality,
+    uint8_t *buffer,
+    int buffer_length) {
+  struct jpeg_compress_struct cinfo;
+  capture_jpeg_error_mgr_t jerr;
+  unsigned char *out_data = NULL;
+  unsigned long out_bytes = 0;
+
+  cinfo.err = jpeg_std_error(&jerr.pub);
+  jerr.pub.error_exit = capture_jpeg_error_exit;
+  if (setjmp(jerr.setjmp_buffer)) {
+    jpeg_destroy_compress(&cinfo);
+    free(out_data);
+    set_last_error("JPEG encoding failed");
+    return 0;
+  }
+
+  jpeg_create_compress(&cinfo);
+  jpeg_mem_dest(&cinfo, &out_data, &out_bytes);
+  cinfo.image_width = (JDIMENSION)width;
+  cinfo.image_height = (JDIMENSION)height;
+  // libjpeg-turbo extended color space: encode straight from the shared RGBA
+  // buffer without an RGB repack.
+  cinfo.input_components = 4;
+  cinfo.in_color_space = JCS_EXT_RGBA;
+  jpeg_set_defaults(&cinfo);
+  jpeg_set_quality(&cinfo, quality, TRUE);
+  jpeg_start_compress(&cinfo, TRUE);
+
+  const size_t row_stride = (size_t)width * 4;
+  while (cinfo.next_scanline < cinfo.image_height) {
+    JSAMPROW row = (JSAMPROW)(rgba + (size_t)cinfo.next_scanline * row_stride);
+    jpeg_write_scanlines(&cinfo, &row, 1);
+  }
+
+  jpeg_finish_compress(&cinfo);
+  jpeg_destroy_compress(&cinfo);
+
+  if (out_bytes == 0 || out_bytes > (unsigned long)buffer_length) {
+    free(out_data);
+    set_last_error(
+        "JPEG capture buffer too small: need %lu, have %d",
+        out_bytes,
+        buffer_length);
+    return 0;
+  }
+
+  memcpy(buffer, out_data, out_bytes);
+  free(out_data);
+  return (int)out_bytes;
+}
+#endif
+
+FFI_PLUGIN_EXPORT int uvc_capture_jpeg(
+    uint8_t *buffer,
+    int buffer_length,
+    int quality,
+    int *out_width,
+    int *out_height,
+    int64_t *out_sequence) {
+  if (buffer == NULL || buffer_length <= 0) {
+    return 0;
+  }
+
+  int q = quality <= 0 ? 90 : quality;
+  if (q > 100) q = 100;
+
+  pthread_mutex_lock(&g_uvc_state.mutex);
+
+  // MJPEG passthrough: the raw camera frame is already a complete JPEG.
+  if (g_uvc_state.latest_jpeg != NULL && g_uvc_state.latest_jpeg_bytes > 0) {
+    if ((size_t)buffer_length < g_uvc_state.latest_jpeg_bytes) {
+      set_last_error(
+          "JPEG capture buffer too small: need %zu, have %d",
+          g_uvc_state.latest_jpeg_bytes,
+          buffer_length);
+      pthread_mutex_unlock(&g_uvc_state.mutex);
+      return 0;
+    }
+    const int bytes = (int)g_uvc_state.latest_jpeg_bytes;
+    memcpy(buffer, g_uvc_state.latest_jpeg, g_uvc_state.latest_jpeg_bytes);
+    if (out_width != NULL) *out_width = g_uvc_state.latest_jpeg_width;
+    if (out_height != NULL) *out_height = g_uvc_state.latest_jpeg_height;
+    if (out_sequence != NULL) *out_sequence = g_uvc_state.latest_jpeg_sequence;
+    pthread_mutex_unlock(&g_uvc_state.mutex);
+    return bytes;
+  }
+
+#if defined(FLUTTER_FFI_UVC_HAVE_JPEG)
+  if (g_uvc_state.latest_rgba == NULL ||
+      g_uvc_state.latest_rgba_bytes == 0 ||
+      g_uvc_state.frame_width <= 0 ||
+      g_uvc_state.frame_height <= 0 ||
+      g_uvc_state.latest_sequence <= 0) {
+    set_last_error("No frame available for JPEG capture");
+    pthread_mutex_unlock(&g_uvc_state.mutex);
+    return 0;
+  }
+
+  const int width = g_uvc_state.frame_width;
+  const int height = g_uvc_state.frame_height;
+  const int64_t sequence = g_uvc_state.latest_sequence;
+  const size_t rgba_bytes = g_uvc_state.latest_rgba_bytes;
+
+  // Copy the RGBA frame so the encode below can run without holding the mutex
+  // (encoding a large frame would otherwise stall the camera frame callback).
+  uint8_t *rgba_copy = malloc(rgba_bytes);
+  if (rgba_copy == NULL) {
+    g_uvc_state.stats.buffer_allocation_failure_count += 1;
+    set_last_error("Failed to allocate %zu bytes for JPEG capture", rgba_bytes);
+    pthread_mutex_unlock(&g_uvc_state.mutex);
+    return 0;
+  }
+  memcpy(rgba_copy, g_uvc_state.latest_rgba, rgba_bytes);
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+
+  const int encoded = encode_rgba_to_jpeg(rgba_copy, width, height, q, buffer, buffer_length);
+  free(rgba_copy);
+  if (encoded <= 0) {
+    return 0;
+  }
+  if (out_width != NULL) *out_width = width;
+  if (out_height != NULL) *out_height = height;
+  if (out_sequence != NULL) *out_sequence = sequence;
+  return encoded;
+#else
+  set_last_error("JPEG encoding unavailable in this build");
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+  return 0;
+#endif
+}
+
 FFI_PLUGIN_EXPORT void uvc_set_frame_listener(uvc_frame_listener_t listener) {
   pthread_mutex_lock(&g_uvc_state.mutex);
   g_uvc_state.frame_listener = listener;
@@ -1316,15 +1668,20 @@ FFI_PLUGIN_EXPORT void uvc_inject_test_frame_rgba(
   const size_t rgba_bytes = (size_t)width * (size_t)height * 4;
 
   pthread_mutex_lock(&g_uvc_state.mutex);
-  uint8_t *new_buffer = realloc(g_uvc_state.latest_rgba, rgba_bytes);
-  if (new_buffer != NULL) {
+  if (g_uvc_state.latest_rgba_capacity < rgba_bytes) {
+    uint8_t *new_buffer = realloc(g_uvc_state.latest_rgba, rgba_bytes);
+    if (new_buffer == NULL) {
+      pthread_mutex_unlock(&g_uvc_state.mutex);
+      return;
+    }
     g_uvc_state.latest_rgba = new_buffer;
-    g_uvc_state.latest_rgba_bytes = rgba_bytes;
-    memcpy(g_uvc_state.latest_rgba, buffer, rgba_bytes);
-    g_uvc_state.frame_width = width;
-    g_uvc_state.frame_height = height;
-    g_uvc_state.latest_sequence += 1;
+    g_uvc_state.latest_rgba_capacity = rgba_bytes;
   }
+  g_uvc_state.latest_rgba_bytes = rgba_bytes;
+  memcpy(g_uvc_state.latest_rgba, buffer, rgba_bytes);
+  g_uvc_state.frame_width = width;
+  g_uvc_state.frame_height = height;
+  g_uvc_state.latest_sequence += 1;
   pthread_mutex_unlock(&g_uvc_state.mutex);
 }
 
