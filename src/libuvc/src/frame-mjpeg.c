@@ -37,6 +37,7 @@
  */
 #include "libuvc/libuvc.h"
 #include "libuvc/libuvc_internal.h"
+#include "libuvc/uvc_log.h"
 #include <jpeglib.h>
 #include <setjmp.h>
 
@@ -152,6 +153,23 @@ static uvc_error_t uvc_mjpeg_convert(uvc_frame_t *in, uvc_frame_t *out) {
   dinfo.dct_method = JDCT_IFAST;
 
   jpeg_start_decompress(&dinfo);
+
+  /* The JPEG's own dimensions can exceed the negotiated frame size (e.g.
+     firmware still streaming a larger mode after an unclean disconnect).
+     Decoding such a frame would overflow out->data, which is sized for
+     in->width x in->height — drop it instead of crashing. */
+  if ((size_t)dinfo.output_width * (size_t)dinfo.out_color_components >
+          (size_t)out->step ||
+      dinfo.output_height > out->height) {
+    UVC_LOGW(
+        "UVC_FRAME",
+        "dropping oversized MJPEG frame jpeg=%ux%u expected=%ux%u",
+        dinfo.output_width,
+        dinfo.output_height,
+        in->width,
+        in->height);
+    goto fail;
+  }
 
   lines_read = 0;
   while (dinfo.output_scanline < dinfo.output_height) {

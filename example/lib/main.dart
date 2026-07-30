@@ -340,7 +340,21 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
     _setStatus('Switching mode: ${mode.label}', openingDevice: true);
     await _stopCurrentPreview(clearPreviewImage: true);
 
-    final UvcPreviewStartResult probeResult = await _startPreview(mode, policy: UvcPreviewPolicy.sequenceOnly);
+    // A mode switch reconfigures the sensor; large modes (e.g. 4K) can take
+    // longer than the short probe window to deliver their first frame. The
+    // negotiation already succeeded in that case, so retry once with a
+    // longer window — the stream is already "primed" by the first attempt.
+    // Only verification timeouts are retried; negotiation failures
+    // (nativeErrorCode != 0) would fail again immediately.
+    UvcPreviewStartResult probeResult = await _startPreview(mode, policy: UvcPreviewPolicy.sequenceOnly);
+    if (!probeResult.success && probeResult.nativeErrorCode == 0) {
+      _log('Probe timed out, retrying with longer window: ${mode.label}');
+      probeResult = await _startPreview(
+        mode,
+        policy: UvcPreviewPolicy.sequenceOnly,
+        timeout: const Duration(seconds: 4),
+      );
+    }
     if (!probeResult.success) {
       _setStatus(
         'Failed to switch mode: ${_startFailureMessage(probeResult)}',
@@ -575,13 +589,14 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
   Future<UvcPreviewStartResult> _startPreview(
     UvcCameraMode mode, {
     UvcPreviewPolicy policy = UvcPreviewPolicy.stableFrames,
+    Duration timeout = _startupProbeTimeout,
   }) async {
     _log('libuvc preview start attempt: ${mode.label} / Texture');
     final UvcPreviewStartResult result = await _camera.startPreview(
       mode,
       policy: policy,
       consecutiveValidFrames: 3,
-      timeout: _startupProbeTimeout,
+      timeout: timeout,
     );
     if (result.success) {
       await _onPreviewStarted(mode);

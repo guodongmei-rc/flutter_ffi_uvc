@@ -921,6 +921,44 @@ static void reset_streaming_interfaces_locked(uvc_device_handle_t *devh) {
   }
 }
 
+// Performs a full USB device reset (USBDEVFS_RESET) through a temporary
+// libusb handle wrapped around the fd. Some firmware ignores new stream
+// negotiations after an unclean host disconnect — it answers PROBE/COMMIT
+// successfully but keeps streaming the stale format from the previous
+// session. The per-interface reset (reset_streaming_interfaces_locked)
+// cannot recover that state; a port-level reset forces the device to
+// re-enumerate and forget it. The fd stays valid across the reset (usbfs
+// keeps the device node), and libusb_close on a wrapped handle does not
+// close the caller's fd. Failures are logged but non-fatal.
+static void reset_usb_device_by_fd(int fd) {
+  libusb_context *reset_ctx = NULL;
+  libusb_device_handle *reset_handle = NULL;
+
+  int rc = libusb_init(&reset_ctx);
+  if (rc != 0) {
+    UVC_LOGW("UVC_NATIVE", "usb reset: libusb_init failed rc=%d", rc);
+    return;
+  }
+  rc = libusb_wrap_sys_device(reset_ctx, (intptr_t)fd, &reset_handle);
+  if (rc != 0) {
+    UVC_LOGW("UVC_NATIVE", "usb reset: wrap_sys_device failed rc=%d", rc);
+    libusb_exit(reset_ctx);
+    return;
+  }
+  rc = libusb_reset_device(reset_handle);
+  if (rc != 0) {
+    UVC_LOGW("UVC_NATIVE", "usb reset: libusb_reset_device failed rc=%d", rc);
+  } else {
+    UVC_LOGI("UVC_NATIVE", "usb reset: device reset ok fd=%d", fd);
+  }
+  libusb_close(reset_handle);
+  libusb_exit(reset_ctx);
+
+  // Give the firmware a moment to re-enumerate and become responsive
+  // before uvc_wrap starts issuing requests.
+  usleep(200 * 1000);
+}
+
 FFI_PLUGIN_EXPORT int uvc_open_fd(int fd) {
   if (fd < 0) {
     set_last_error("Invalid file descriptor: %d", fd);
@@ -944,6 +982,11 @@ FFI_PLUGIN_EXPORT int uvc_open_fd(int fd) {
   }
   close_device_resources_locked();
   clear_last_error();
+
+  // Full port-level reset before wrapping: firmware left streaming by a
+  // dead process can otherwise keep ignoring new negotiations. Held under
+  // the mutex like the rest of the open path; it takes ~200ms.
+  reset_usb_device_by_fd(fd);
 
   uvc_error_t result = uvc_init(&g_uvc_state.ctx, NULL);
   if (result != UVC_SUCCESS) {
