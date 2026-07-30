@@ -19,6 +19,7 @@
 #endif
 
 #include "libuvc/libuvc.h"
+#include "libuvc/libuvc_internal.h"
 #include "libuvc/uvc_log.h"
 
 int g_uvc_native_log_level = UVC_LOG_LEVEL_DEFAULT;
@@ -885,6 +886,41 @@ FFI_PLUGIN_EXPORT int sum_long_running(int a, int b) {
   return a + b;
 }
 
+// Forces every VideoStreaming interface back to alternate setting 0 and
+// clears a possible endpoint halt. When the previous process died without
+// stopping the stream (app killed, crash), the camera firmware can be left
+// believing it is still streaming; negotiation then succeeds but no frames
+// ever arrive. This replays the halt a clean uvc_stop_streaming would have
+// sent, so every open starts from a known device state. Failures are
+// logged but non-fatal. Caller must hold g_uvc_state.mutex.
+static void reset_streaming_interfaces_locked(uvc_device_handle_t *devh) {
+  uvc_streaming_interface_t *stream_if = NULL;
+  DL_FOREACH(devh->info->stream_ifs, stream_if) {
+    const int idx = stream_if->bInterfaceNumber;
+    if (uvc_claim_if(devh, idx) != UVC_SUCCESS) {
+      UVC_LOGW("UVC_NATIVE", "stream reset: failed to claim interface %d", idx);
+      continue;
+    }
+    if (libusb_set_interface_alt_setting(devh->usb_devh, idx, 0) != 0) {
+      UVC_LOGW("UVC_NATIVE", "stream reset: SET_INTERFACE(0) failed on interface %d", idx);
+    }
+    if (stream_if->bEndpointAddress != 0 &&
+        libusb_clear_halt(devh->usb_devh, stream_if->bEndpointAddress) != 0) {
+      UVC_LOGW(
+          "UVC_NATIVE",
+          "stream reset: clear_halt failed on interface %d endpoint 0x%02x",
+          idx,
+          stream_if->bEndpointAddress);
+    }
+    // uvc_release_if also sets alt setting 0 before releasing.
+    uvc_release_if(devh, idx);
+    UVC_LOGI(
+        "UVC_NATIVE",
+        "stream reset: interface %d returned to alt setting 0",
+        idx);
+  }
+}
+
 FFI_PLUGIN_EXPORT int uvc_open_fd(int fd) {
   if (fd < 0) {
     set_last_error("Invalid file descriptor: %d", fd);
@@ -924,6 +960,10 @@ FFI_PLUGIN_EXPORT int uvc_open_fd(int fd) {
     pthread_mutex_unlock(&g_uvc_state.mutex);
     return result;
   }
+
+  // A previous process may have died mid-stream, leaving the camera in a
+  // stale streaming state. Reset the streaming interfaces before use.
+  reset_streaming_interfaces_locked(g_uvc_state.devh);
 
   UVC_LOGI("UVC_NATIVE", "uvc_open_fd success fd=%d", fd);
   uvc_device_t *device = uvc_get_device(g_uvc_state.devh);

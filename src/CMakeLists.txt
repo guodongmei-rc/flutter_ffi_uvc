@@ -82,6 +82,10 @@ set_target_properties(flutter_ffi_uvc PROPERTIES
 
 target_compile_definitions(flutter_ffi_uvc PUBLIC DART_SHARED_LIB)
 target_link_libraries(flutter_ffi_uvc PRIVATE LibUVC::UVCStatic)
+# libuvc_internal.h pulls in <libusb.h>; link libusb for its include dirs.
+if(TARGET LibUSB::LibUSB)
+  target_link_libraries(flutter_ffi_uvc PRIVATE LibUSB::LibUSB)
+endif()
 target_include_directories(flutter_ffi_uvc PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/libuvc/include"
   "${CMAKE_CURRENT_BINARY_DIR}/libuvc/include"
