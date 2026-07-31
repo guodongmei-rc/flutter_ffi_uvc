@@ -350,13 +350,35 @@ class _FlutterFfiUvcCamera implements UvcCamera {
     _ensureAndroid();
     await _requireGalleryPermission();
 
-    final int frameWidth = _bindings.uvc_frame_width();
-    final int frameHeight = _bindings.uvc_frame_height();
-    if (!isPreviewing || frameWidth <= 0 || frameHeight <= 0) {
-      throw const UvcException(
-        code: UvcErrorCode.io,
-        message: 'Cannot record: preview is not delivering frames',
-      );
+    // H.264/H.265 streams are recorded passthrough: the native layer writes
+    // the camera's own NAL stream and the platform remuxes it, instead of
+    // re-encoding RGBA frames (which compressed formats don't produce).
+    final String? formatName = _lastPreviewRequest?.mode.formatName;
+    final bool passthrough = formatName == 'H264' || formatName == 'H265';
+
+    final int frameWidth;
+    final int frameHeight;
+    if (passthrough) {
+      // Compressed formats never touch the RGBA staging path, so
+      // uvc_frame_width/height stay 0; the decoder-rendered frame sequence
+      // is the liveness signal instead.
+      if (!isPreviewing || latestFrameSequence() <= 0) {
+        throw const UvcException(
+          code: UvcErrorCode.io,
+          message: 'Cannot record: preview is not delivering frames',
+        );
+      }
+      frameWidth = _lastPreviewRequest!.mode.width;
+      frameHeight = _lastPreviewRequest!.mode.height;
+    } else {
+      frameWidth = _bindings.uvc_frame_width();
+      frameHeight = _bindings.uvc_frame_height();
+      if (!isPreviewing || frameWidth <= 0 || frameHeight <= 0) {
+        throw const UvcException(
+          code: UvcErrorCode.io,
+          message: 'Cannot record: preview is not delivering frames',
+        );
+      }
     }
 
     // The recording surface receives the same transformed blit as the preview
@@ -373,6 +395,7 @@ class _FlutterFfiUvcCamera implements UvcCamera {
         'height': height,
         'bitRate': ?bitRate,
         'frameRate': frameRate,
+        'passthrough': passthrough,
       },
     );
     _videoRecording = true;

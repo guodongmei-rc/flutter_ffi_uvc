@@ -22,6 +22,7 @@
 #include "libuvc/libuvc_internal.h"
 #include "libuvc/uvc_log.h"
 #include "h26x_decoder.h"
+#include "h26x_rawrec.h"
 
 int g_uvc_native_log_level = UVC_LOG_LEVEL_DEFAULT;
 
@@ -103,6 +104,9 @@ typedef struct {
   // compressed-video frame of a session, destroyed on stop/close. Renders
   // directly into preview_window.
   h26x_decoder_t *h26x_decoder;
+  // Passthrough recorder for H.264/H.265 streams; active while a raw
+  // recording session is in progress, auto-stopped on stop/close.
+  h26x_rawrec_t *h26x_rawrec;
   int preview_rotation;  // 0, 90, 180, 270 (clockwise)
   int preview_flip_h;    // mirror left-right
   int preview_flip_v;    // mirror top-bottom
@@ -495,6 +499,11 @@ static int begin_stop_preview_locked(uvc_device_handle_t **devh_to_stop) {
 static void finish_stop_preview_locked(void) {
   wait_for_callbacks_locked();
   reset_frame_buffer_locked();
+  if (g_uvc_state.h26x_rawrec != NULL) {
+    // Keep the temp file; the platform layer finalizes (remuxes) it later.
+    h26x_rawrec_stop(g_uvc_state.h26x_rawrec);
+    g_uvc_state.h26x_rawrec = NULL;
+  }
   if (g_uvc_state.h26x_decoder != NULL) {
     // Safe to destroy here: wait_for_callbacks_locked() guarantees no
     // callback is feeding the decoder anymore.
@@ -505,6 +514,10 @@ static void finish_stop_preview_locked(void) {
 }
 
 static void close_device_resources_locked(void) {
+  if (g_uvc_state.h26x_rawrec != NULL) {
+    h26x_rawrec_stop(g_uvc_state.h26x_rawrec);
+    g_uvc_state.h26x_rawrec = NULL;
+  }
   if (g_uvc_state.h26x_decoder != NULL) {
     h26x_decoder_destroy(g_uvc_state.h26x_decoder);
     g_uvc_state.h26x_decoder = NULL;
@@ -714,6 +727,16 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
       frame->frame_format == UVC_FRAME_FORMAT_H265) {
     if (callback_count <= 12) {
       dump_h264_frame_recon(callback_count, frame);
+    }
+    // Passthrough recording: assemble AUs from the raw NAL stream into the
+    // temp file. Independent of the decoder, so recording also works while
+    // no preview window is attached.
+    if (g_uvc_state.h26x_rawrec != NULL) {
+      h26x_rawrec_write_nal(
+          g_uvc_state.h26x_rawrec,
+          (const uint8_t *)frame->data,
+          frame->data_bytes,
+          callback_monotonic_ns / 1000ull);
     }
 #if defined(__ANDROID__)
     ANativeWindow *window = g_uvc_state.preview_window;
@@ -1591,6 +1614,73 @@ Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeDetachSurface(
   pthread_mutex_lock(&g_uvc_state.mutex);
   release_preview_window_locked();
   pthread_mutex_unlock(&g_uvc_state.mutex);
+}
+
+// Starts passthrough recording of the active H.264/H.265 stream into the
+// given temp file. Returns 0 on success, negative on error (no compressed
+// stream active, decoder not configured yet, or file cannot be opened).
+JNIEXPORT jint JNICALL
+Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeRawRecStart(
+    JNIEnv *env,
+    jobject thiz,
+    jstring path) {
+  (void)thiz;
+  if (path == NULL) {
+    return UVC_ERROR_INVALID_PARAM;
+  }
+  const char *path_chars = (*env)->GetStringUTFChars(env, path, NULL);
+  if (path_chars == NULL) {
+    return UVC_ERROR_INVALID_PARAM;
+  }
+
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  int result = UVC_ERROR_OTHER;
+  int codec = 0;
+  const uint8_t *csd = NULL;
+  size_t csd_bytes = 0;
+  int width = 0;
+  int height = 0;
+  if (g_uvc_state.h26x_rawrec != NULL) {
+    result = UVC_ERROR_BUSY;
+  } else if (g_uvc_state.h26x_decoder == NULL ||
+             !g_uvc_state.previewing ||
+             h26x_decoder_get_config(
+                 g_uvc_state.h26x_decoder,
+                 &codec,
+                 &csd,
+                 &csd_bytes,
+                 &width,
+                 &height) != 0) {
+    // No active H.264/H.265 stream (or CSD not seen yet).
+    result = UVC_ERROR_INVALID_DEVICE;
+  } else {
+    g_uvc_state.h26x_rawrec = h26x_rawrec_start(
+        path_chars, codec, csd, csd_bytes, width, height);
+    result = g_uvc_state.h26x_rawrec != NULL ? UVC_SUCCESS : UVC_ERROR_IO;
+  }
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+
+  (*env)->ReleaseStringUTFChars(env, path, path_chars);
+  return result;
+}
+
+// Stops passthrough recording. Returns the number of access units written,
+// or 0 when no recording was active.
+JNIEXPORT jint JNICALL
+Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeRawRecStop(
+    JNIEnv *env,
+    jobject thiz) {
+  (void)env;
+  (void)thiz;
+
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  jint count = 0;
+  if (g_uvc_state.h26x_rawrec != NULL) {
+    count = (jint)h26x_rawrec_stop(g_uvc_state.h26x_rawrec);
+    g_uvc_state.h26x_rawrec = NULL;
+  }
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+  return count;
 }
 
 JNIEXPORT jint JNICALL

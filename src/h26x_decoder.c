@@ -326,6 +326,24 @@ int h26x_decoder_feed(
   return result;
 }
 
+int h26x_decoder_get_config(
+    const h26x_decoder_t *decoder,
+    int *codec,
+    const uint8_t **csd,
+    size_t *csd_bytes,
+    int *width,
+    int *height) {
+  if (decoder == NULL || !h26x_csd_complete(decoder)) {
+    return -1;
+  }
+  if (codec != NULL) *codec = decoder->codec;
+  if (csd != NULL) *csd = decoder->csd;
+  if (csd_bytes != NULL) *csd_bytes = decoder->csd_bytes;
+  if (width != NULL) *width = decoder->width;
+  if (height != NULL) *height = decoder->height;
+  return 0;
+}
+
 void h26x_decoder_destroy(h26x_decoder_t *decoder) {
   if (decoder == NULL) {
     return;
@@ -360,6 +378,22 @@ int h26x_decoder_feed(
   (void)data;
   (void)bytes;
   return H26X_FEED_ERROR;
+}
+
+int h26x_decoder_get_config(
+    const h26x_decoder_t *decoder,
+    int *codec,
+    const uint8_t **csd,
+    size_t *csd_bytes,
+    int *width,
+    int *height) {
+  (void)decoder;
+  (void)codec;
+  (void)csd;
+  (void)csd_bytes;
+  (void)width;
+  (void)height;
+  return -1;
 }
 
 void h26x_decoder_destroy(h26x_decoder_t *decoder) {

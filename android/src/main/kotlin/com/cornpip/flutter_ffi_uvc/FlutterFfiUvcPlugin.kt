@@ -73,6 +73,7 @@ class FlutterFfiUvcPlugin :
 
     // Recording
     private var videoRecorder: VideoRecorder? = null
+    private var rawRecTempFile: File? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val usbPermissionAction: String
@@ -176,6 +177,9 @@ class FlutterFfiUvcPlugin :
         nativeDetachRecordingSurface()
         videoRecorder?.abort()
         videoRecorder = null
+        nativeRawRecStop()
+        rawRecTempFile?.delete()
+        rawRecTempFile = null
         nativeDetachSurface()
         attachedTextureId = null
         textures.values.forEach { it.release() }
@@ -436,12 +440,31 @@ class FlutterFfiUvcPlugin :
                     result.error("gallery_permission_denied", "Gallery permission not granted", null)
                     return
                 }
-                if (videoRecorder != null) {
+                if (videoRecorder != null || rawRecTempFile != null) {
                     result.error("already_recording", "A recording is already in progress", null)
                     return
                 }
                 val context = appContext ?: run {
                     result.error("unavailable", "Context not available", null)
+                    return
+                }
+                // Passthrough: the active stream is already H.264/H.265, so the
+                // native layer writes the camera's own NAL stream to a temp
+                // file and stopVideoRecording remuxes it — no re-encoding.
+                if (call.argument<Boolean>("passthrough") == true) {
+                    val tempFile = File(context.cacheDir, "uvc_raw_${System.currentTimeMillis()}.bin")
+                    val startResult = nativeRawRecStart(tempFile.absolutePath)
+                    if (startResult != 0) {
+                        tempFile.delete()
+                        result.error(
+                            "start_failed",
+                            "nativeRawRecStart failed with code $startResult",
+                            startResult,
+                        )
+                        return
+                    }
+                    rawRecTempFile = tempFile
+                    result.success(null)
                     return
                 }
                 val bitRate = call.argument<Number>("bitRate")?.toInt()
@@ -468,6 +491,32 @@ class FlutterFfiUvcPlugin :
             }
 
             "stopVideoRecording" -> {
+                // Passthrough finalization: stop the native recorder (a
+                // no-op if a preview stop already ended it) and remux the
+                // temp file into the gallery.
+                val rawFile = rawRecTempFile
+                if (rawFile != null) {
+                    rawRecTempFile = null
+                    Thread({
+                        try {
+                            nativeRawRecStop()
+                            val context = appContext
+                                ?: throw IllegalStateException("Context not available")
+                            val muxResult = RawVideoMuxer.mux(context, rawFile)
+                            rawFile.delete()
+                            mainHandler.post {
+                                result.success(mapOf("uri" to muxResult.uri, "path" to muxResult.path))
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "stopVideoRecording(passthrough) failed", e)
+                            rawFile.delete()
+                            mainHandler.post {
+                                result.error("stop_failed", e.message ?: "Failed to finish recording", null)
+                            }
+                        }
+                    }, "uvc-raw-video-mux").start()
+                    return
+                }
                 val recorder = videoRecorder ?: run {
                     result.error("not_recording", "No recording in progress", null)
                     return
@@ -645,4 +694,6 @@ class FlutterFfiUvcPlugin :
     private external fun nativeDetachSurface()
     private external fun nativeAttachRecordingSurface(surface: Surface): Int
     private external fun nativeDetachRecordingSurface()
+    private external fun nativeRawRecStart(path: String): Int
+    private external fun nativeRawRecStop(): Int
 }

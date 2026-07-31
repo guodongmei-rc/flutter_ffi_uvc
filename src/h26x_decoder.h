@@ -49,6 +49,17 @@ int h26x_decoder_feed(
 
 void h26x_decoder_destroy(h26x_decoder_t *decoder);
 
+/* Exposes the negotiated codec, collected CSD and dimensions for the
+ * passthrough recorder. Returns 0 when the CSD is complete, -1 otherwise.
+ * The csd pointer borrows the decoder's internal buffer. */
+int h26x_decoder_get_config(
+    const h26x_decoder_t *decoder,
+    int *codec,
+    const uint8_t **csd,
+    size_t *csd_bytes,
+    int *width,
+    int *height);
+
 #ifdef __cplusplus
 }
 #endif

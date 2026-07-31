@@ -74,6 +74,7 @@ add_subdirectory(libuvc)
 add_library(flutter_ffi_uvc SHARED
   "flutter_ffi_uvc.c"
   "h26x_decoder.c"
+  "h26x_rawrec.c"
 )
 
 set_target_properties(flutter_ffi_uvc PROPERTIES
