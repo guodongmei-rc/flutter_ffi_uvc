@@ -635,6 +635,21 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
     Duration timeout = _startupProbeTimeout,
   }) async {
     _log('libuvc preview start attempt: ${mode.label} / Texture');
+    // H.264/H.265 are decoded by MediaCodec, which must claim the producer
+    // side of the preview SurfaceTexture. A previous MJPEG session holds it
+    // as a CPU producer (software blit), so the codec's connect would fail
+    // with "already connected". Attaching before start replaces the window
+    // with a fresh, unconnected one the codec can claim.
+    final bool isCompressed =
+        mode.formatName == 'H264' || mode.formatName == 'H265';
+    final int? textureId = _previewTextureId;
+    if (isCompressed && textureId != null) {
+      await _camera.attachPreviewTexture(
+        textureId,
+        width: mode.width,
+        height: mode.height,
+      );
+    }
     final UvcPreviewStartResult result = await _camera.startPreview(
       mode,
       policy: policy,
@@ -655,7 +670,11 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
   /// [UvcCamera.startPreviewAuto].
   Future<void> _onPreviewStarted(UvcCameraMode mode) async {
     final int? textureId = _previewTextureId;
-    if (textureId != null) {
+    // H.264/H.265 already attached before start (MediaCodec owns the
+    // surface); re-attaching now would swap the window mid-decode.
+    final bool isCompressed =
+        mode.formatName == 'H264' || mode.formatName == 'H265';
+    if (textureId != null && !isCompressed) {
       await _camera.attachPreviewTexture(
         textureId,
         width: mode.width,

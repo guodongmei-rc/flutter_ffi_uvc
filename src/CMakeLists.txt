@@ -73,6 +73,7 @@ add_subdirectory(libuvc)
 
 add_library(flutter_ffi_uvc SHARED
   "flutter_ffi_uvc.c"
+  "h26x_decoder.c"
 )
 
 set_target_properties(flutter_ffi_uvc PROPERTIES
@@ -94,7 +95,8 @@ target_include_directories(flutter_ffi_uvc PRIVATE
 if (ANDROID)
   # Support Android 15 16k page size
   target_link_options(flutter_ffi_uvc PRIVATE "-Wl,-z,max-page-size=16384")
-  target_link_libraries(flutter_ffi_uvc PRIVATE android log)
+  # mediandk: AMediaCodec for the H.264/H.265 hardware decoder.
+  target_link_libraries(flutter_ffi_uvc PRIVATE android log mediandk)
 endif()
 
 # JPEG capture support (uvc_capture_jpeg) for non-MJPEG streams. Without

@@ -21,6 +21,7 @@
 #include "libuvc/libuvc.h"
 #include "libuvc/libuvc_internal.h"
 #include "libuvc/uvc_log.h"
+#include "h26x_decoder.h"
 
 int g_uvc_native_log_level = UVC_LOG_LEVEL_DEFAULT;
 
@@ -98,6 +99,10 @@ typedef struct {
   ANativeWindow *preview_window;
   ANativeWindow *recording_window;
 #endif
+  // Hardware decoder for H.264/H.265 streams; created lazily on the first
+  // compressed-video frame of a session, destroyed on stop/close. Renders
+  // directly into preview_window.
+  h26x_decoder_t *h26x_decoder;
   int preview_rotation;  // 0, 90, 180, 270 (clockwise)
   int preview_flip_h;    // mirror left-right
   int preview_flip_v;    // mirror top-bottom
@@ -158,6 +163,10 @@ static const char *frame_format_name(enum uvc_frame_format format) {
       return "UYVY";
     case UVC_FRAME_FORMAT_GRAY8:
       return "GRAY8";
+    case UVC_FRAME_FORMAT_H264:
+      return "H264";
+    case UVC_FRAME_FORMAT_H265:
+      return "H265";
     default:
       return "UNKNOWN";
   }
@@ -184,6 +193,14 @@ static enum uvc_frame_format format_desc_to_frame_format(const uvc_format_desc_t
       }
       if (memcmp(format_desc->fourccFormat, "BGR ", 4) == 0) {
         return UVC_FRAME_FORMAT_BGR;
+      }
+      if (format_desc->bDescriptorSubtype == UVC_VS_FORMAT_FRAME_BASED &&
+          memcmp(format_desc->fourccFormat, "H264", 4) == 0) {
+        return UVC_FRAME_FORMAT_H264;
+      }
+      if (format_desc->bDescriptorSubtype == UVC_VS_FORMAT_FRAME_BASED &&
+          memcmp(format_desc->fourccFormat, "H265", 4) == 0) {
+        return UVC_FRAME_FORMAT_H265;
       }
       return UVC_FRAME_FORMAT_UNKNOWN;
     default:
@@ -478,10 +495,20 @@ static int begin_stop_preview_locked(uvc_device_handle_t **devh_to_stop) {
 static void finish_stop_preview_locked(void) {
   wait_for_callbacks_locked();
   reset_frame_buffer_locked();
+  if (g_uvc_state.h26x_decoder != NULL) {
+    // Safe to destroy here: wait_for_callbacks_locked() guarantees no
+    // callback is feeding the decoder anymore.
+    h26x_decoder_destroy(g_uvc_state.h26x_decoder);
+    g_uvc_state.h26x_decoder = NULL;
+  }
   g_uvc_state.stopping_preview = 0;
 }
 
 static void close_device_resources_locked(void) {
+  if (g_uvc_state.h26x_decoder != NULL) {
+    h26x_decoder_destroy(g_uvc_state.h26x_decoder);
+    g_uvc_state.h26x_decoder = NULL;
+  }
 #if defined(__ANDROID__)
   release_preview_window_locked();
   release_recording_window_locked();
@@ -585,6 +612,54 @@ static int has_mjpeg_soi_marker(const uvc_frame_t *frame) {
   return data[0] == 0xFF && data[1] == 0xD8;
 }
 
+// Phase-0 recon for H.264 support: dumps the frame head and scans Annex B
+// start codes so the log shows the bytestream layout (start code form,
+// NAL types present, whether SPS/PPS ride in-band, one AU per frame).
+// Caller must hold g_uvc_state.mutex.
+static void dump_h264_frame_recon(uint32_t callback_count, const uvc_frame_t *frame) {
+  const uint8_t *data = (const uint8_t *)frame->data;
+  const size_t bytes = frame->data_bytes;
+  char hex[32 * 3 + 1];
+  const size_t hex_len = bytes < 32 ? bytes : 32;
+  for (size_t i = 0; i < hex_len; i++) {
+    sprintf(hex + i * 3, "%02x ", data[i]);
+  }
+  hex[hex_len * 3] = '\0';
+  UVC_LOGI(
+      "UVC_H264",
+      "frame #%u bytes=%zu w=%u h=%u head=%s",
+      callback_count,
+      bytes,
+      frame->width,
+      frame->height,
+      hex);
+
+  int nals = 0;
+  for (size_t i = 0; i + 3 < bytes && nals < 16; i++) {
+    size_t sc = 0;
+    if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
+      sc = 3;
+    } else if (i + 4 < bytes && data[i] == 0 && data[i + 1] == 0 &&
+               data[i + 2] == 0 && data[i + 3] == 1) {
+      sc = 4;
+    }
+    if (sc != 0) {
+      UVC_LOGI(
+          "UVC_H264",
+          "  nal #%d offset=%zu startcode=%zu type=%u",
+          nals,
+          i,
+          sc,
+          data[i + sc] & 0x1f);
+      nals++;
+      i += sc;
+    }
+  }
+  if (nals == 0) {
+    UVC_LOGI("UVC_H264", "  no Annex B start codes found in frame");
+  }
+}
+
 static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
   (void)user_ptr;
   const uint64_t callback_monotonic_ns = monotonic_time_ns();
@@ -629,6 +704,70 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
         frame->height,
         frame->data_bytes,
         frame->sequence);
+  }
+
+  // H.264/H.265: no RGBA staging path — frames go straight to the hardware
+  // decoder, which renders into the preview window. The verification
+  // sequence advances per rendered frame, so startPreview verification,
+  // stall detection and startPreviewAuto all work unchanged.
+  if (frame->frame_format == UVC_FRAME_FORMAT_H264 ||
+      frame->frame_format == UVC_FRAME_FORMAT_H265) {
+    if (callback_count <= 12) {
+      dump_h264_frame_recon(callback_count, frame);
+    }
+#if defined(__ANDROID__)
+    ANativeWindow *window = g_uvc_state.preview_window;
+    if (window != NULL) {
+      ANativeWindow_acquire(window);
+    }
+    if (g_uvc_state.h26x_decoder == NULL) {
+      g_uvc_state.h26x_decoder = h26x_decoder_create(
+          frame->frame_format == UVC_FRAME_FORMAT_H265
+              ? H26X_CODEC_H265
+              : H26X_CODEC_H264,
+          (int)frame->width,
+          (int)frame->height);
+    }
+    h26x_decoder_t *decoder = g_uvc_state.h26x_decoder;
+    uvc_frame_listener_t frame_listener = g_uvc_state.frame_listener;
+    pthread_mutex_unlock(&g_uvc_state.mutex);
+
+    int feed_result = H26X_FEED_ERROR;
+    if (decoder != NULL) {
+      feed_result = h26x_decoder_feed(
+          decoder,
+          window,
+          (const uint8_t *)frame->data,
+          frame->data_bytes);
+    }
+    if (window != NULL) {
+      ANativeWindow_release(window);
+    }
+
+    pthread_mutex_lock(&g_uvc_state.mutex);
+    if (feed_result == H26X_FEED_ERROR) {
+      g_uvc_state.stats.decode_failure_count += 1;
+      set_last_error("H.264/H.265 hardware decode failed");
+      abort_frame_callback_locked_and_notify();
+      return;
+    }
+    int64_t delivered_sequence = 0;
+    if (feed_result == H26X_FEED_RENDERED) {
+      g_uvc_state.latest_sequence += 1;
+      g_uvc_state.stats.delivered_frame_count += 1;
+      delivered_sequence = g_uvc_state.latest_sequence;
+    }
+    finish_callback_locked();
+    pthread_mutex_unlock(&g_uvc_state.mutex);
+    if (delivered_sequence != 0 && frame_listener != NULL) {
+      frame_listener(delivered_sequence);
+    }
+    return;
+#else
+    finish_callback_locked();
+    pthread_mutex_unlock(&g_uvc_state.mutex);
+    return;
+#endif
   }
 
   const size_t expected_input_bytes = expected_frame_bytes_for_format(frame);

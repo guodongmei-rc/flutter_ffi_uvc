@@ -87,6 +87,8 @@ enum uvc_frame_format {
   UVC_FRAME_FORMAT_NV12,
   /** YUV: P010 */
   UVC_FRAME_FORMAT_P010,
+  /** H.265/HEVC encoded images (frame-based format, UVC 1.5) */
+  UVC_FRAME_FORMAT_H265,
   /** Number of formats understood */
   UVC_FRAME_FORMAT_COUNT,
 };
