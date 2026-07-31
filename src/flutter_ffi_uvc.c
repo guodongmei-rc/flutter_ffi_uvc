@@ -955,8 +955,11 @@ static void reset_usb_device_by_fd(int fd) {
   libusb_exit(reset_ctx);
 
   // Give the firmware a moment to re-enumerate and become responsive
-  // before uvc_wrap starts issuing requests.
-  usleep(200 * 1000);
+  // before uvc_wrap starts issuing requests. Observed firmware boots its
+  // video pipeline well after it starts answering control transfers, so
+  // this is only a minimum settle — the first stream probe after open
+  // should still use a generous timeout.
+  usleep(500 * 1000);
 }
 
 FFI_PLUGIN_EXPORT int uvc_open_fd(int fd) {

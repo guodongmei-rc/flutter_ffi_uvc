@@ -199,9 +199,11 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
       }
 
       // Deduplicate: descriptors can repeat a mode, and the dropdown requires
-      // exactly one item equal to its selected value.
-      final List<UvcCameraMode> libuvcModes =
-          <UvcCameraMode>{..._camera.supportedModes()}.toList();
+      // exactly one item equal to its selected value. Modes below 1920x1080
+      // are filtered out entirely — they are neither listed nor probed.
+      final List<UvcCameraMode> libuvcModes = <UvcCameraMode>{
+        ..._camera.supportedModes(),
+      }.where((m) => m.width * m.height >= 1920 * 1080).toList();
       final List<UvcCameraControl> controls = _camera.supportedControls();
       _log(
         'Controls: ${controls.map((UvcCameraControl c) => '${c.name}(id=${c.id.nativeValue},cur=${c.cur})').join(', ')}',
@@ -229,21 +231,39 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
         libuvcModes,
       );
       _setStatus(
-        'Opening device... Auto-selecting a working mode...',
+        'Opening device... Starting 1920x1080...',
         openingDevice: true,
       );
-      // startPreviewAuto() runs the MJPEG-first fallback loop this example
-      // used to implement by hand: each candidate is verified like
-      // startPreview and rejected on failure, keeping the first mode that
-      // actually delivers frames. The default reliability preference probes
-      // smaller, safer modes first; pass
-      // preference: UvcAutoPreviewPreference.quality to try larger
-      // resolutions first instead.
-      final UvcAutoPreviewResult autoResult = await _camera.startPreviewAuto(
-        perModeTimeout: _startupProbeTimeout,
-        maxCandidates: 3,
-      );
-      final UvcCameraMode? startedMode = autoResult.mode;
+      // Startup mode is fixed: 1920x1080 at the highest frame rate. The
+      // full USB reset at open reboots the camera, and this firmware needs
+      // ~10-15s before its video pipeline delivers frames — much longer
+      // than any single probe window. Retry the fixed mode in a loop
+      // (exactly what tapping the mode manually did) until the camera
+      // comes up or the overall deadline hits. A healthy device succeeds
+      // on the first attempt and never enters the retry path.
+      final List<UvcCameraMode> openCandidates = _preferHdOpenModes(libuvcModes);
+      final List<UvcPreviewStartResult> attempts = <UvcPreviewStartResult>[];
+      UvcCameraMode? startedMode;
+      final Stopwatch openDeadline = Stopwatch()..start();
+      const Duration maxOpenWait = Duration(seconds: 40);
+      while (startedMode == null && openDeadline.elapsed < maxOpenWait) {
+        final UvcAutoPreviewResult autoResult = await _camera.startPreviewAuto(
+          candidates: openCandidates.take(1).toList(),
+          perModeTimeout: const Duration(seconds: 6),
+        );
+        attempts.addAll(autoResult.attempts);
+        startedMode = autoResult.mode;
+        if (startedMode == null && openDeadline.elapsed < maxOpenWait) {
+          _setStatus(
+            'Waiting for camera to come up... '
+            '(${openDeadline.elapsed.inSeconds}s)',
+            openingDevice: true,
+          );
+          await Future<void>.delayed(const Duration(milliseconds: 500));
+        }
+      }
+      final UvcAutoPreviewResult autoResult =
+          UvcAutoPreviewResult(attempts: attempts);
       if (startedMode != null) {
         await _onPreviewStarted(startedMode);
       }
@@ -371,6 +391,29 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
       _status = 'Preview running: ${mode.label} / Texture';
     });
     _log('Preview mode changed: ${mode.label} / Texture');
+  }
+
+  /// Candidate order for the initial open: 1920x1080 at the highest frame
+  /// rate first, then the remaining modes best-first (MJPEG before
+  /// uncompressed, larger resolution and frame rate before smaller).
+  List<UvcCameraMode> _preferHdOpenModes(List<UvcCameraMode> modes) {
+    int formatRank(UvcCameraMode m) => m.formatName == 'MJPEG' ? 0 : 1;
+    bool isHd(UvcCameraMode m) => m.width == 1920 && m.height == 1080;
+
+    final List<UvcCameraMode> hd = modes.where(isHd).toList()
+      ..sort((UvcCameraMode a, UvcCameraMode b) {
+        final int byFormat = formatRank(a).compareTo(formatRank(b));
+        return byFormat != 0 ? byFormat : b.fps.compareTo(a.fps);
+      });
+    final List<UvcCameraMode> rest = modes.where((m) => !isHd(m)).toList()
+      ..sort((UvcCameraMode a, UvcCameraMode b) {
+        final int byFormat = formatRank(a).compareTo(formatRank(b));
+        if (byFormat != 0) return byFormat;
+        final int byArea =
+            (b.width * b.height).compareTo(a.width * a.height);
+        return byArea != 0 ? byArea : b.fps.compareTo(a.fps);
+      });
+    return <UvcCameraMode>[...hd, ...rest];
   }
 
   List<UvcCameraMode> _sortModesByPreference(List<UvcCameraMode> modes) {

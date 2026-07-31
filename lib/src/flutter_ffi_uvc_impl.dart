@@ -57,6 +57,7 @@ class _FlutterFfiUvcCamera implements UvcCamera {
   bool _inStallEpisode = false;
   bool _restartInProgress = false;
   int _restartAttempts = 0;
+  int _userStartInProgress = 0;
   _PreviewRequest? _lastPreviewRequest;
 
   void _setupNativeErrorListener() {
@@ -467,7 +468,7 @@ class _FlutterFfiUvcCamera implements UvcCamera {
     UvcPreviewPolicy policy = UvcPreviewPolicy.stableFrames,
     int consecutiveValidFrames = 3,
     Duration timeout = const Duration(seconds: 2),
-  }) {
+  }) async {
     _sessionEpoch += 1;
     _lastPreviewRequest = _PreviewRequest(
       mode: mode,
@@ -476,12 +477,22 @@ class _FlutterFfiUvcCamera implements UvcCamera {
       timeout: timeout,
     );
     _resetStallTracking();
-    return _startPreviewInternal(
-      mode,
-      policy: policy,
-      requiredConsecutiveValidFrames: consecutiveValidFrames,
-      timeout: timeout,
-    );
+    // Block stall-triggered restarts while a user-initiated start is in
+    // flight. The probe timeout can legitimately exceed the stall timeout
+    // (e.g. a patient first probe riding out the camera's boot window);
+    // without this guard the watchdog would stop the very stream being
+    // verified, and both sides would fail.
+    _userStartInProgress += 1;
+    try {
+      return await _startPreviewInternal(
+        mode,
+        policy: policy,
+        requiredConsecutiveValidFrames: consecutiveValidFrames,
+        timeout: timeout,
+      );
+    } finally {
+      _userStartInProgress -= 1;
+    }
   }
 
   @override
@@ -617,7 +628,9 @@ class _FlutterFfiUvcCamera implements UvcCamera {
 
   void _stallTick() {
     final UvcStallDetectionConfig? config = _stallConfig;
-    if (config == null || _restartInProgress) return;
+    if (config == null || _restartInProgress || _userStartInProgress > 0) {
+      return;
+    }
     if (!isPreviewing) {
       _resetStallTracking();
       return;
