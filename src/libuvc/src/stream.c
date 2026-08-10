@@ -45,6 +45,41 @@
 #endif
 #include "errno.h"
 
+// Added for flutter_ffi_uvc: probe/commit negotiation must not block the
+// caller forever. A device that accepts the control URB but never completes
+// it (e.g. firmware whose video pipeline is still booting, or that silently
+// drops off the bus mid-negotiation) would otherwise hang the calling
+// thread indefinitely inside libusb_control_transfer(timeout=0), freezing
+// the Dart UI isolate until ANR. Failing fast lets the Dart-side retry loop
+// re-attempt the negotiation until the firmware is ready.
+static const unsigned int UVC_STREAM_CTRL_TRANSFER_TIMEOUT_MS = 1000;
+
+// Added for flutter_ffi_uvc to apply a finite timeout to stream control transfers.
+static int uvc_stream_libusb_control_transfer(
+    libusb_device_handle *dev_handle,
+    uint8_t bmRequestType,
+    uint8_t bRequest,
+    uint16_t wValue,
+    uint16_t wIndex,
+    unsigned char *data,
+    uint16_t wLength,
+    unsigned int timeout) {
+  if (timeout == 0) {
+    timeout = UVC_STREAM_CTRL_TRANSFER_TIMEOUT_MS;
+  }
+  return libusb_control_transfer(
+      dev_handle,
+      bmRequestType,
+      bRequest,
+      wValue,
+      wIndex,
+      data,
+      wLength,
+      timeout);
+}
+
+#define libusb_control_transfer uvc_stream_libusb_control_transfer
+
 #ifdef _MSC_VER
 
 #define DELTA_EPOCH_IN_MICROSECS  116444736000000000Ui64

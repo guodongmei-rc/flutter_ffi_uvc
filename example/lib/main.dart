@@ -39,7 +39,10 @@ class UvcPreviewPage extends StatefulWidget {
 class _UvcPreviewPageState extends State<UvcPreviewPage>
     with WidgetsBindingObserver {
   static const String _logPrefix = '@@@@UVC_EXAMPLE';
-  static const Duration _startupProbeTimeout = Duration(seconds: 2);
+  // Probe timeout must cover the worst case before the first visible frame:
+  // parameter-set wait (~1s) + decoder warmup suppression (1.2s) + the
+  // verification frames themselves.
+  static const Duration _startupProbeTimeout = Duration(seconds: 4);
   static const Duration _fpsSampleInterval = Duration(milliseconds: 1000);
   static const Duration _streamErrorSnackbarCooldown = Duration(seconds: 3);
   UvcCamera get _camera => widget.camera;
@@ -247,6 +250,23 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
       final Stopwatch openDeadline = Stopwatch()..start();
       const Duration maxOpenWait = Duration(seconds: 40);
       while (startedMode == null && openDeadline.elapsed < maxOpenWait) {
+        // H.264/H.265 decode straight into the preview surface via
+        // MediaCodec, so the texture must be attached before the stream
+        // starts — startPreviewAuto has no chance to do it afterwards.
+        // (Same ordering as _startPreview; without it the decoder waits
+        // for a window forever and the probe times out with no frames.)
+        final UvcCameraMode openCandidate = openCandidates.first;
+        final bool openCandidateIsCompressed =
+            openCandidate.formatName == 'H264' ||
+                openCandidate.formatName == 'H265';
+        final int? openTextureId = _previewTextureId;
+        if (openCandidateIsCompressed && openTextureId != null) {
+          await _camera.attachPreviewTexture(
+            openTextureId,
+            width: openCandidate.width,
+            height: openCandidate.height,
+          );
+        }
         final UvcAutoPreviewResult autoResult = await _camera.startPreviewAuto(
           candidates: openCandidates.take(1).toList(),
           perModeTimeout: const Duration(seconds: 6),
@@ -635,20 +655,25 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
     Duration timeout = _startupProbeTimeout,
   }) async {
     _log('libuvc preview start attempt: ${mode.label} / Texture');
-    // H.264/H.265 are decoded by MediaCodec, which must claim the producer
-    // side of the preview SurfaceTexture. A previous MJPEG session holds it
-    // as a CPU producer (software blit), so the codec's connect would fail
-    // with "already connected". Attaching before start replaces the window
-    // with a fresh, unconnected one the codec can claim.
     final bool isCompressed =
         mode.formatName == 'H264' || mode.formatName == 'H265';
-    final int? textureId = _previewTextureId;
-    if (isCompressed && textureId != null) {
-      await _camera.attachPreviewTexture(
-        textureId,
-        width: mode.width,
-        height: mode.height,
-      );
+    if (isCompressed) {
+      // Start each compressed session on a brand-new SurfaceTexture. A
+      // reused BufferQueue carries stale slots across codec sessions; those
+      // never-rewritten slots are what surfaces as the green flash while the
+      // new codec ramps up. A fresh queue has no stale slots to display.
+      await _disposePreviewTexture();
+      await _ensurePreviewTexture();
+      final int? textureId = _previewTextureId;
+      if (textureId != null) {
+        // MediaCodec must claim the producer side of the preview
+        // SurfaceTexture, so attach before the stream starts.
+        await _camera.attachPreviewTexture(
+          textureId,
+          width: mode.width,
+          height: mode.height,
+        );
+      }
     }
     final UvcPreviewStartResult result = await _camera.startPreview(
       mode,
@@ -1197,6 +1222,19 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
                               ),
                             ),
                     ),
+                    // Covers the dead window between stop and the first
+                    // rendered frame of the new session (codec configure +
+                    // warmup suppression), which would otherwise be a plain
+                    // black screen.
+                    if (_openingDevice)
+                      const Positioned.fill(
+                        child: ColoredBox(
+                          color: Colors.black,
+                          child: Center(
+                            child: CircularProgressIndicator(),
+                          ),
+                        ),
+                      ),
                     if (_focusValueVisible && _focusAbsControl != null)
                       Positioned(
                         left: 0,

@@ -40,6 +40,21 @@ struct h26x_decoder {
   int have_pps;
   int codec_failures;
   uint64_t pts_us;
+  /* Temporary diagnostics for the "green first frames after mode switch"
+   * investigation: count fed frames and whether an IDR has been seen since
+   * the last (re)configure. */
+  uint64_t frames_fed;
+  int seen_idr;
+  /* Render suppression window after each (re)configure. While the vendor
+   * codec ramps up, its first outputs reach the surface through a buffer
+   * migration/copy path that loses the chroma planes — those frames show as
+   * green-tinted (real luma, zero chroma). The phase is time-based (the
+   * codec dumps its primed pipeline in a burst, so counting outputs
+   * under-covers it); measured at ~0.5s on c2.qti.hevc.decoder, suppressed
+   * for 1.2s for margin. Suppressed frames are not reported as rendered, so
+   * stream validation completes when the first frame is actually visible. */
+  uint64_t suppress_render_until_us;
+  int suppression_lift_logged;
 };
 
 static uint64_t h26x_now_us(void) {
@@ -94,6 +109,34 @@ static int h26x_csd_complete(const h26x_decoder_t *decoder) {
     return decoder->have_vps && decoder->have_sps && decoder->have_pps;
   }
   return decoder->have_sps && decoder->have_pps;
+}
+
+/* Returns non-zero when the NAL type is an IDR picture. */
+static int h26x_is_idr_nal(const h26x_decoder_t *decoder, int nal_type) {
+  if (decoder->codec == H26X_CODEC_H265) {
+    return nal_type == 19 || nal_type == 20; /* IDR_W_RADL / IDR_N_LP */
+  }
+  return nal_type == 5;
+}
+
+/* Scans one frame for an IDR NAL (diagnostic for the green-frames issue). */
+static int h26x_frame_has_idr(
+    const h26x_decoder_t *decoder,
+    const uint8_t *data,
+    size_t bytes) {
+  size_t offset = 0;
+  while (offset + 4 < bytes) {
+    const size_t sc = h26x_start_code_at(data, bytes, offset);
+    if (sc != 0 && offset + sc < bytes) {
+      if (h26x_is_idr_nal(decoder, h26x_nal_type(decoder, data[offset + sc]))) {
+        return 1;
+      }
+      offset += sc + 1;
+    } else {
+      offset++;
+    }
+  }
+  return 0;
 }
 
 /* Scans one frame for parameter-set NALs and appends them to the CSD
@@ -181,19 +224,30 @@ static int h26x_configure(h26x_decoder_t *decoder, ANativeWindow *window) {
   }
   decoder->window = window;
   ANativeWindow_acquire(window);
+  decoder->frames_fed = 0;
+  decoder->seen_idr = 0;
+  decoder->suppress_render_until_us = h26x_now_us() + 1200000; /* 1.2s */
+  decoder->suppression_lift_logged = 0;
   UVC_LOGI(H26X_LOG_TAG, "codec configured mime=%s csd=%zu", mime, decoder->csd_bytes);
   return 0;
 }
 
 /* Queues one frame and drains any rendered output. Returns H26X_FEED_OK or
- * H26X_FEED_RENDERED; H26X_FEED_ERROR on fatal codec failure. */
+ * H26X_FEED_RENDERED; H26X_FEED_ERROR on fatal codec failure. has_idr marks
+ * frames carrying an IDR: those must never be dropped. Right after
+ * AMediaCodec_start the component may need tens of ms to hand out input
+ * buffers, and losing the startup IDR leaves every following P-frame
+ * without a reference — decoded output stays green until the next
+ * random-access point (the "green frames after mode switch" symptom). */
 static int h26x_feed_and_drain(
     h26x_decoder_t *decoder,
     const uint8_t *data,
-    size_t bytes) {
+    size_t bytes,
+    int has_idr) {
   int rendered = 0;
 
-  ssize_t input_index = AMediaCodec_dequeueInputBuffer(decoder->media_codec, 10000);
+  ssize_t input_index = AMediaCodec_dequeueInputBuffer(
+      decoder->media_codec, has_idr ? 200000 : 10000);
   if (input_index >= 0) {
     size_t capacity = 0;
     uint8_t *buffer =
@@ -218,7 +272,15 @@ static int h26x_feed_and_drain(
     }
   }
   /* input_index < 0: no free input slot right now — drop the NAL; for
-   * preview the next frame is a few ms away and the decoder will catch up. */
+   * preview the next frame is a few ms away and the decoder will catch up.
+   * An IDR must never reach this path (its dequeue timeout is 20x longer);
+   * log it loudly if it does — that is a decoder-wedging event. */
+  if (input_index < 0 && has_idr) {
+    UVC_LOGW(
+        H26X_LOG_TAG,
+        "dropping IDR frame: no codec input buffer after 200ms bytes=%zu",
+        bytes);
+  }
 
   for (;;) {
     AMediaCodecBufferInfo info;
@@ -239,13 +301,50 @@ static int h26x_feed_and_drain(
     if (output_index < 0) {
       break;
     }
+    /* An output buffer with size 0 carries no decoded image. Releasing it
+     * with render=true would queue an uninitialized (green) buffer to the
+     * surface — codec2 components emit such buffers around startup and
+     * format changes. Release those without rendering, and log the early
+     * output sizes so the green window can be correlated with the stream. */
+    const int has_image = info.size > 0;
+    int render = has_image;
+    if (render && h26x_now_us() < decoder->suppress_render_until_us) {
+      render = 0;
+    } else if (
+        render && decoder->suppress_render_until_us != 0 &&
+        !decoder->suppression_lift_logged) {
+      decoder->suppression_lift_logged = 1;
+      UVC_LOGI(H26X_LOG_TAG, "warmup suppression lifted");
+    }
+    if (decoder->frames_fed < 30 || !has_image) {
+      UVC_LOGI(
+          H26X_LOG_TAG,
+          "codec output size=%d flags=0x%x render=%d",
+          (int)info.size,
+          info.flags,
+          render);
+    }
     media_status_t status = AMediaCodec_releaseOutputBuffer(
-        decoder->media_codec, (size_t)output_index, true);
+        decoder->media_codec, (size_t)output_index, render);
     if (status != AMEDIA_OK) {
       UVC_LOGW(H26X_LOG_TAG, "releaseOutputBuffer failed status=%d", status);
       return H26X_FEED_ERROR;
     }
-    rendered = 1;
+    if (!decoder->seen_idr) {
+      /* Diagnostic: rendering decoder output produced before any IDR was
+       * fed — this is the suspected source of the green first frames. */
+      UVC_LOGI(
+          H26X_LOG_TAG,
+          "rendered output before first IDR frames_fed=%llu",
+          (unsigned long long)decoder->frames_fed);
+    }
+    /* Suppressed frames do not count as rendered: the delivered sequence
+     * then advances only once frames actually reach the screen, so preview
+     * verification (and the example's busy spinner) completes in sync with
+     * the first visible frame instead of ~1s earlier. */
+    if (render) {
+      rendered = 1;
+    }
   }
   return rendered ? H26X_FEED_RENDERED : H26X_FEED_OK;
 }
@@ -305,7 +404,23 @@ int h26x_decoder_feed(
   if (decoder->media_codec == NULL) {
     return H26X_FEED_NEED_CSD;
   }
-  const int result = h26x_feed_and_drain(decoder, data, bytes);
+  /* Diagnostic: log the first frames after each (re)configure so a mode
+   * switch shows exactly which NALs reach the codec before the first IDR. */
+  const int frame_has_idr = h26x_frame_has_idr(decoder, data, bytes);
+  if (decoder->frames_fed < 30 || (frame_has_idr && !decoder->seen_idr)) {
+    UVC_LOGI(
+        H26X_LOG_TAG,
+        "feed frame seq=%llu bytes=%zu has_idr=%d seen_idr=%d",
+        (unsigned long long)decoder->frames_fed,
+        bytes,
+        frame_has_idr,
+        decoder->seen_idr);
+  }
+  decoder->frames_fed += 1;
+  if (frame_has_idr) {
+    decoder->seen_idr = 1;
+  }
+  const int result = h26x_feed_and_drain(decoder, data, bytes, frame_has_idr);
   if (result == H26X_FEED_ERROR) {
     decoder->codec_failures += 1;
     if (decoder->codec_failures < H26X_MAX_CODEC_FAILURES) {
