@@ -39,6 +39,7 @@
 #include "libuvc/libuvc_internal.h"
 #include "libuvc/uvc_log.h"
 #include <jpeglib.h>
+#include <jerror.h>
 #include <setjmp.h>
 
 extern uvc_error_t uvc_ensure_frame_size(uvc_frame_t *frame, size_t need_bytes);
@@ -57,13 +58,18 @@ static void _error_exit(j_common_ptr dinfo) {
 
 /* Warnings (corrupt data, premature EOF) do not abort decoding — libjpeg
  * fills the undecoded remainder with gray and carries on. Count them so the
- * caller can reject the frame instead of displaying a partial image. */
+ * caller can reject the frame instead of displaying a partial image.
+ * Exception: JWRN_EXTRANEOUS_DATA only means padding bytes were found between
+ * the entropy data and the next marker (usually EOI). Many UVC cameras pad
+ * every frame to a fixed payload size, so this warning is expected and the
+ * decoded image is complete — log it but don't reject the frame for it. */
 static void _emit_message(j_common_ptr dinfo, int msg_level) {
   struct error_mgr *myerr = (struct error_mgr *)dinfo->err;
   if (msg_level < 0) {
     char msg[JMSG_LENGTH_MAX];
     (*dinfo->err->format_message)(dinfo, msg);
-    myerr->warning_count += 1;
+    if (dinfo->err->msg_code != JWRN_EXTRANEOUS_DATA)
+      myerr->warning_count += 1;
     UVC_LOGW("UVC_FRAME", "mjpeg decode warning: %s", msg);
   }
 }
