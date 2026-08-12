@@ -48,6 +48,7 @@ static inline const char *uvc_log_level_name(int level) {
 }
 
 static inline void uvc_log_write(int level, const char *tag, const char *scope, const char *format, ...) {
+  /* 打印已注释停用。需要排查问题时，删掉下面的 (void) 行并恢复注释块即可。
   if (!uvc_log_enabled(level)) {
     return;
   }
@@ -78,6 +79,11 @@ static inline void uvc_log_write(int level, const char *tag, const char *scope, 
 #else
   fprintf(stderr, "@@@@%s/%s %s\n", scope, uvc_log_level_name(level), message);
 #endif
+  */
+  (void)level;
+  (void)tag;
+  (void)scope;
+  (void)format;
 }
 
 #define UVC_LOGE(scope, ...) uvc_log_write(UVC_LOG_LEVEL_ERROR, "flutter_ffi_uvc", scope, __VA_ARGS__)
