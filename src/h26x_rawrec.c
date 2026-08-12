@@ -144,12 +144,29 @@ void h26x_rawrec_write_nal(
   if (rec == NULL || data == NULL || bytes == 0) {
     return;
   }
-  /* Skip mid-stream-join tails without a leading start code. */
-  if (rawrec_start_code_at(data, bytes, 0) == 0) {
-    return;
-  }
 
   size_t offset = 0;
+  if (rawrec_start_code_at(data, bytes, 0) == 0) {
+    /* Headless frame: a continuation tail of a frame the camera split
+     * across UVC transfers (large frames on motion spikes), or a
+     * mid-stream-join tail. Bytes before the first start code belong to
+     * the NAL currently being assembled — append them when an AU is open,
+     * skip them when there is nothing to continue (join case). Complete
+     * NALs after the tail are processed normally; dropping the whole
+     * frame here would lose them and corrupt the recording. */
+    size_t first_sc = 0;
+    while (first_sc + 3 < bytes && rawrec_start_code_at(data, bytes, first_sc) == 0) {
+      first_sc++;
+    }
+    if (rec->au_bytes > 0 && first_sc > 0) {
+      rawrec_au_append(rec, data, first_sc);
+    }
+    if (first_sc + 3 >= bytes) {
+      return;  // The whole frame was a continuation tail.
+    }
+    offset = first_sc;
+  }
+
   while (offset + 3 < bytes) {
     const size_t sc = rawrec_start_code_at(data, bytes, offset);
     if (sc == 0) {

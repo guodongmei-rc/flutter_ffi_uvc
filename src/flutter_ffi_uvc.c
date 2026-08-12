@@ -118,6 +118,159 @@ static ffi_uvc_state_t g_uvc_state = {
     .callback_cond = PTHREAD_COND_INITIALIZER,
 };
 
+// ---------------------------------------------------------------------------
+// Recording writer: decouples passthrough-recording I/O from the libuvc
+// callback thread. The callback only memcpy's the compressed frame into a
+// queue slot; a dedicated worker performs the (occasionally stalling)
+// fwrite. Without this, a write stall longer than one frame interval makes
+// the callback thread fall behind and whole compressed frames are lost —
+// for H.264/H.265 a single lost P-frame breaks the reference chain and the
+// recorded video shows artifacts until the next IDR.
+// ---------------------------------------------------------------------------
+
+#define REC_WRITER_QUEUE_CAPACITY 64
+#define REC_WRITER_LOG_TAG "UVC_REC"
+
+typedef struct {
+  uint8_t *data;
+  size_t bytes;
+  uint64_t pts_us;
+} rec_writer_slot_t;
+
+typedef struct {
+  h26x_rawrec_t *rawrec;
+  rec_writer_slot_t slots[REC_WRITER_QUEUE_CAPACITY];
+  int head;
+  int count;
+  pthread_t thread;
+  int thread_started;
+  int stop_requested;
+  uint64_t dropped_frames;
+  pthread_mutex_t mutex;
+  pthread_cond_t cond;
+} rec_writer_t;
+
+static rec_writer_t g_rec_writer = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .cond = PTHREAD_COND_INITIALIZER,
+};
+
+static void *rec_writer_main(void *arg) {
+  (void)arg;
+  pthread_mutex_lock(&g_rec_writer.mutex);
+  for (;;) {
+    while (g_rec_writer.count == 0 && !g_rec_writer.stop_requested) {
+      pthread_cond_wait(&g_rec_writer.cond, &g_rec_writer.mutex);
+    }
+    if (g_rec_writer.count == 0) {
+      break;  // stop requested and the queue is drained
+    }
+    rec_writer_slot_t *slot = &g_rec_writer.slots[g_rec_writer.head];
+    uint8_t *data = slot->data;
+    const size_t bytes = slot->bytes;
+    const uint64_t pts_us = slot->pts_us;
+    slot->data = NULL;
+    g_rec_writer.head = (g_rec_writer.head + 1) % REC_WRITER_QUEUE_CAPACITY;
+    g_rec_writer.count -= 1;
+    h26x_rawrec_t *rawrec = g_rec_writer.rawrec;
+    pthread_mutex_unlock(&g_rec_writer.mutex);
+
+    if (rawrec != NULL) {
+      h26x_rawrec_write_nal(rawrec, data, bytes, pts_us);
+    }
+    free(data);
+
+    pthread_mutex_lock(&g_rec_writer.mutex);
+  }
+  pthread_mutex_unlock(&g_rec_writer.mutex);
+  return NULL;
+}
+
+// Starts the writer thread for a rawrec session. Returns 0 on success.
+static int rec_writer_start(h26x_rawrec_t *rawrec) {
+  pthread_mutex_lock(&g_rec_writer.mutex);
+  g_rec_writer.rawrec = rawrec;
+  g_rec_writer.head = 0;
+  g_rec_writer.count = 0;
+  g_rec_writer.stop_requested = 0;
+  g_rec_writer.dropped_frames = 0;
+  if (pthread_create(&g_rec_writer.thread, NULL, rec_writer_main, NULL) != 0) {
+    g_rec_writer.rawrec = NULL;
+    pthread_mutex_unlock(&g_rec_writer.mutex);
+    return -1;
+  }
+  g_rec_writer.thread_started = 1;
+  pthread_mutex_unlock(&g_rec_writer.mutex);
+  return 0;
+}
+
+// Enqueues a copy of one compressed frame. Returns 0 on success; on queue
+// overflow the frame is dropped (and logged) — the only remaining loss
+// path, reachable only when storage stalls for ~1s straight.
+static int rec_writer_push(const uint8_t *data, size_t bytes, uint64_t pts_us) {
+  pthread_mutex_lock(&g_rec_writer.mutex);
+  if (!g_rec_writer.thread_started ||
+      g_rec_writer.count == REC_WRITER_QUEUE_CAPACITY) {
+    g_rec_writer.dropped_frames += 1;
+    if ((g_rec_writer.dropped_frames & 0x3f) == 1) {
+      UVC_LOGW(
+          REC_WRITER_LOG_TAG,
+          "recording queue full, dropping frame total_dropped=%llu",
+          (unsigned long long)g_rec_writer.dropped_frames);
+    }
+    pthread_mutex_unlock(&g_rec_writer.mutex);
+    return -1;
+  }
+  uint8_t *copy = malloc(bytes);
+  if (copy == NULL) {
+    g_rec_writer.dropped_frames += 1;
+    pthread_mutex_unlock(&g_rec_writer.mutex);
+    return -1;
+  }
+  memcpy(copy, data, bytes);
+  rec_writer_slot_t *slot =
+      &g_rec_writer.slots[(g_rec_writer.head + g_rec_writer.count) % REC_WRITER_QUEUE_CAPACITY];
+  slot->data = copy;
+  slot->bytes = bytes;
+  slot->pts_us = pts_us;
+  g_rec_writer.count += 1;
+  pthread_cond_signal(&g_rec_writer.cond);
+  pthread_mutex_unlock(&g_rec_writer.mutex);
+  return 0;
+}
+
+// Drains the queue, joins the worker and closes the raw recording. Returns
+// the number of access units written (0 when no session was active).
+static uint32_t rec_writer_stop(void) {
+  pthread_mutex_lock(&g_rec_writer.mutex);
+  if (!g_rec_writer.thread_started) {
+    pthread_mutex_unlock(&g_rec_writer.mutex);
+    return 0;
+  }
+  g_rec_writer.stop_requested = 1;
+  pthread_cond_broadcast(&g_rec_writer.cond);
+  pthread_mutex_unlock(&g_rec_writer.mutex);
+
+  // Safe while holding the caller's locks: the worker never touches them.
+  pthread_join(g_rec_writer.thread, NULL);
+
+  pthread_mutex_lock(&g_rec_writer.mutex);
+  h26x_rawrec_t *rawrec = g_rec_writer.rawrec;
+  g_rec_writer.rawrec = NULL;
+  g_rec_writer.thread_started = 0;
+  g_rec_writer.stop_requested = 0;
+  const uint64_t dropped = g_rec_writer.dropped_frames;
+  pthread_mutex_unlock(&g_rec_writer.mutex);
+
+  if (dropped > 0) {
+    UVC_LOGW(
+        REC_WRITER_LOG_TAG,
+        "recording session dropped %llu frames (queue overflow)",
+        (unsigned long long)dropped);
+  }
+  return rawrec != NULL ? h26x_rawrec_stop(rawrec) : 0;
+}
+
 static uint64_t monotonic_time_ns(void) {
   struct timespec ts;
   if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
@@ -501,7 +654,7 @@ static void finish_stop_preview_locked(void) {
   reset_frame_buffer_locked();
   if (g_uvc_state.h26x_rawrec != NULL) {
     // Keep the temp file; the platform layer finalizes (remuxes) it later.
-    h26x_rawrec_stop(g_uvc_state.h26x_rawrec);
+    rec_writer_stop();
     g_uvc_state.h26x_rawrec = NULL;
   }
   if (g_uvc_state.h26x_decoder != NULL) {
@@ -515,7 +668,7 @@ static void finish_stop_preview_locked(void) {
 
 static void close_device_resources_locked(void) {
   if (g_uvc_state.h26x_rawrec != NULL) {
-    h26x_rawrec_stop(g_uvc_state.h26x_rawrec);
+    rec_writer_stop();
     g_uvc_state.h26x_rawrec = NULL;
   }
   if (g_uvc_state.h26x_decoder != NULL) {
@@ -727,6 +880,19 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
       frame->sequence <= g_uvc_state.stats.last_source_sequence) {
     g_uvc_state.stats.stale_frame_count += 1;
   }
+  /* A forward jump in the libuvc sequence means whole frames were dropped
+   * before reaching this callback (the callback thread fell behind and
+   * libuvc coalesced frames). For compressed streams each skipped frame
+   * corrupts the recording until the next IDR — log it loudly. */
+  if (g_uvc_state.stats.has_last_source_sequence &&
+      frame->sequence > g_uvc_state.stats.last_source_sequence + 1) {
+    UVC_LOGW(
+        "UVC_NATIVE",
+        "source frame gap: seq %u -> %u (%u frame(s) lost upstream of callback)",
+        g_uvc_state.stats.last_source_sequence,
+        frame->sequence,
+        frame->sequence - g_uvc_state.stats.last_source_sequence - 1);
+  }
   g_uvc_state.stats.last_source_sequence = frame->sequence;
   g_uvc_state.stats.has_last_source_sequence = 1;
 
@@ -751,12 +917,12 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
     if (callback_count <= 12) {
       dump_h264_frame_recon(callback_count, frame);
     }
-    // Passthrough recording: assemble AUs from the raw NAL stream into the
-    // temp file. Independent of the decoder, so recording also works while
-    // no preview window is attached.
+    // Passthrough recording: queue a copy of the raw NAL stream for the
+    // writer thread. The copy keeps frame->data lifetime simple and keeps
+    // fwrite stalls off this callback thread (a stall here would cost whole
+    // compressed frames and corrupt the recording until the next IDR).
     if (g_uvc_state.h26x_rawrec != NULL) {
-      h26x_rawrec_write_nal(
-          g_uvc_state.h26x_rawrec,
+      rec_writer_push(
           (const uint8_t *)frame->data,
           frame->data_bytes,
           callback_monotonic_ns / 1000ull);
@@ -1696,9 +1862,15 @@ Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeRawRecStart(
     // No active H.264/H.265 stream (or CSD not seen yet).
     result = UVC_ERROR_INVALID_DEVICE;
   } else {
-    g_uvc_state.h26x_rawrec = h26x_rawrec_start(
-        path_chars, codec, csd, csd_bytes, width, height);
-    result = g_uvc_state.h26x_rawrec != NULL ? UVC_SUCCESS : UVC_ERROR_IO;
+    h26x_rawrec_t *rawrec =
+        h26x_rawrec_start(path_chars, codec, csd, csd_bytes, width, height);
+    if (rawrec != NULL && rec_writer_start(rawrec) != 0) {
+      UVC_LOGW("UVC_NATIVE", "failed to start recording writer thread");
+      h26x_rawrec_stop(rawrec);
+      rawrec = NULL;
+    }
+    g_uvc_state.h26x_rawrec = rawrec;
+    result = rawrec != NULL ? UVC_SUCCESS : UVC_ERROR_IO;
   }
   pthread_mutex_unlock(&g_uvc_state.mutex);
 
@@ -1718,7 +1890,7 @@ Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeRawRecStop(
   pthread_mutex_lock(&g_uvc_state.mutex);
   jint count = 0;
   if (g_uvc_state.h26x_rawrec != NULL) {
-    count = (jint)h26x_rawrec_stop(g_uvc_state.h26x_rawrec);
+    count = (jint)rec_writer_stop();
     g_uvc_state.h26x_rawrec = NULL;
   }
   pthread_mutex_unlock(&g_uvc_state.mutex);

@@ -45,6 +45,10 @@ struct h26x_decoder {
    * the last (re)configure. */
   uint64_t frames_fed;
   int seen_idr;
+  /* Zero until the first frame has been queued after (re)configure; only
+   * then may an IDR feed block (the component needs tens of ms to hand out
+   * input buffers after start). Once running, no feed may block. */
+  int fed_since_configure;
   /* Render suppression window after each (re)configure. While the vendor
    * codec ramps up, its first outputs reach the surface through a buffer
    * migration/copy path that loses the chroma planes — those frames show as
@@ -226,6 +230,7 @@ static int h26x_configure(h26x_decoder_t *decoder, ANativeWindow *window) {
   ANativeWindow_acquire(window);
   decoder->frames_fed = 0;
   decoder->seen_idr = 0;
+  decoder->fed_since_configure = 0;
   decoder->suppress_render_until_us = h26x_now_us() + 1200000; /* 1.2s */
   decoder->suppression_lift_logged = 0;
   UVC_LOGI(H26X_LOG_TAG, "codec configured mime=%s csd=%zu", mime, decoder->csd_bytes);
@@ -246,8 +251,19 @@ static int h26x_feed_and_drain(
     int has_idr) {
   int rendered = 0;
 
-  ssize_t input_index = AMediaCodec_dequeueInputBuffer(
-      decoder->media_codec, has_idr ? 200000 : 10000);
+  /* The 200ms wait is allowed only for the first feed after (re)configure:
+   * right after AMediaCodec_start the component may need tens of ms to hand
+   * out input buffers, and losing the startup IDR leaves every following
+   * P-frame without a reference. Once running, NO feed may block: this runs
+   * on the libuvc callback thread, and a block longer than one frame
+   * interval makes libuvc silently skip whole frames — a lost frame
+   * corrupts BOTH the preview and the passthrough recording until the next
+   * IDR. Dropping a frame here only affects the preview (concealed by the
+   * decoder); the recorder already received its copy upstream. */
+  const long timeout_us =
+      (has_idr && !decoder->fed_since_configure) ? 200000 : 0;
+  ssize_t input_index =
+      AMediaCodec_dequeueInputBuffer(decoder->media_codec, timeout_us);
   if (input_index >= 0) {
     size_t capacity = 0;
     uint8_t *buffer =
@@ -269,19 +285,35 @@ static int h26x_feed_and_drain(
         UVC_LOGW(H26X_LOG_TAG, "queueInputBuffer failed status=%d", status);
         return H26X_FEED_ERROR;
       }
+      decoder->fed_since_configure = 1;
     }
   }
   /* input_index < 0: no free input slot right now — drop the NAL; for
    * preview the next frame is a few ms away and the decoder will catch up.
-   * An IDR must never reach this path (its dequeue timeout is 20x longer);
-   * log it loudly if it does — that is a decoder-wedging event. */
+   * An IDR should only reach this path when the pipeline is throttled;
+   * log it loudly either way. */
   if (input_index < 0 && has_idr) {
     UVC_LOGW(
         H26X_LOG_TAG,
-        "dropping IDR frame: no codec input buffer after 200ms bytes=%zu",
+        "dropping IDR frame: no codec input buffer bytes=%zu",
+        bytes);
+  } else if (input_index < 0) {
+    UVC_LOGT(
+        H26X_LOG_TAG,
+        "decoder input busy, dropping non-IDR nal bytes=%zu",
         bytes);
   }
 
+  /* Drain all pending outputs, but render only the NEWEST image. When the
+   * surface consumer runs below the stream rate (observed: 58fps in,
+   * 45fps rendered), rendering every output fills the surface's buffer
+   * queue and releaseOutputBuffer starts to block — stalling the libuvc
+   * callback thread and making libuvc skip whole frames for both preview
+   * and recording. Releasing stale outputs without rendering keeps the
+   * pipeline unblocked; the preview just shows the freshest frame. */
+  ssize_t pending[16];
+  AMediaCodecBufferInfo pending_info[16];
+  int pending_count = 0;
   for (;;) {
     AMediaCodecBufferInfo info;
     ssize_t output_index =
@@ -301,14 +333,33 @@ static int h26x_feed_and_drain(
     if (output_index < 0) {
       break;
     }
+    if (pending_count == 16) {
+      /* Batch full: release the overflow without rendering; the freshest
+       * image of the next batch still gets rendered. */
+      AMediaCodec_releaseOutputBuffer(
+          decoder->media_codec, (size_t)output_index, 0);
+      continue;
+    }
+    pending[pending_count] = output_index;
+    pending_info[pending_count] = info;
+    pending_count += 1;
+  }
+
+  int newest_image = -1;
+  for (int i = 0; i < pending_count; i++) {
+    if (pending_info[i].size > 0) {
+      newest_image = i;
+    }
+  }
+  const int suppress = h26x_now_us() < decoder->suppress_render_until_us;
+  for (int i = 0; i < pending_count; i++) {
     /* An output buffer with size 0 carries no decoded image. Releasing it
      * with render=true would queue an uninitialized (green) buffer to the
      * surface — codec2 components emit such buffers around startup and
-     * format changes. Release those without rendering, and log the early
-     * output sizes so the green window can be correlated with the stream. */
-    const int has_image = info.size > 0;
-    int render = has_image;
-    if (render && h26x_now_us() < decoder->suppress_render_until_us) {
+     * format changes. Release those without rendering. */
+    const int has_image = pending_info[i].size > 0;
+    int render = has_image && i == newest_image;
+    if (render && suppress) {
       render = 0;
     } else if (
         render && decoder->suppress_render_until_us != 0 &&
@@ -320,17 +371,17 @@ static int h26x_feed_and_drain(
       UVC_LOGI(
           H26X_LOG_TAG,
           "codec output size=%d flags=0x%x render=%d",
-          (int)info.size,
-          info.flags,
+          (int)pending_info[i].size,
+          pending_info[i].flags,
           render);
     }
     media_status_t status = AMediaCodec_releaseOutputBuffer(
-        decoder->media_codec, (size_t)output_index, render);
+        decoder->media_codec, (size_t)pending[i], render);
     if (status != AMEDIA_OK) {
       UVC_LOGW(H26X_LOG_TAG, "releaseOutputBuffer failed status=%d", status);
       return H26X_FEED_ERROR;
     }
-    if (!decoder->seen_idr) {
+    if (render && !decoder->seen_idr) {
       /* Diagnostic: rendering decoder output produced before any IDR was
        * fed — this is the suspected source of the green first frames. */
       UVC_LOGI(
@@ -374,10 +425,15 @@ int h26x_decoder_feed(
     UVC_LOGW(H26X_LOG_TAG, "dropping oversized h26x frame bytes=%zu", bytes);
     return H26X_FEED_OK;
   }
-  /* Mid-stream joins deliver headless tails; feeding them would corrupt the
-   * Annex B stream the codec parses. Only frames that start with a start
-   * code are ever fed. */
-  if (h26x_start_code_at(data, bytes, 0) == 0) {
+  /* Headless frames (no leading start code) come in two flavors:
+   * mid-stream-join tails before the decoder is running — dropped, since
+   * there is nothing to continue — and continuation tails of frames the
+   * camera split across UVC transfers (large frames on motion spikes).
+   * Once running, the tail must be fed: the codec reassembles the Annex B
+   * stream seamlessly, while dropping it truncates the AU and corrupts
+   * decoding until the next IDR. */
+  if (h26x_start_code_at(data, bytes, 0) == 0 &&
+      decoder->state != H26X_STATE_RUNNING) {
     return H26X_FEED_OK;
   }
 

@@ -31,7 +31,10 @@ h26x_rawrec_t *h26x_rawrec_start(
 
 /* Feeds one UVC frame (Annex B, one or more NALs with start codes).
  * Parameter-set NALs are skipped (already in the header CSD). Frames not
- * starting with a start code are ignored. */
+ * starting with a start code are continuation tails of frames the camera
+ * split across UVC transfers: their leading bytes are appended to the
+ * access unit currently being assembled, and any complete NALs after the
+ * first start code are processed normally. */
 void h26x_rawrec_write_nal(
     h26x_rawrec_t *rec,
     const uint8_t *data,
