@@ -46,12 +46,26 @@ extern uvc_error_t uvc_ensure_frame_size(uvc_frame_t *frame, size_t need_bytes);
 struct error_mgr {
   struct jpeg_error_mgr super;
   jmp_buf jmp;
+  int warning_count;
 };
 
 static void _error_exit(j_common_ptr dinfo) {
   struct error_mgr *myerr = (struct error_mgr *)dinfo->err;
   (*dinfo->err->output_message)(dinfo);
   longjmp(myerr->jmp, 1);
+}
+
+/* Warnings (corrupt data, premature EOF) do not abort decoding — libjpeg
+ * fills the undecoded remainder with gray and carries on. Count them so the
+ * caller can reject the frame instead of displaying a partial image. */
+static void _emit_message(j_common_ptr dinfo, int msg_level) {
+  struct error_mgr *myerr = (struct error_mgr *)dinfo->err;
+  if (msg_level < 0) {
+    char msg[JMSG_LENGTH_MAX];
+    (*dinfo->err->format_message)(dinfo, msg);
+    myerr->warning_count += 1;
+    UVC_LOGW("UVC_FRAME", "mjpeg decode warning: %s", msg);
+  }
 }
 
 /* ISO/IEC 10918-1:1993(E) K.3.3. Default Huffman tables used by MJPEG UVC devices
@@ -129,6 +143,8 @@ static uvc_error_t uvc_mjpeg_convert(uvc_frame_t *in, uvc_frame_t *out) {
   size_t lines_read;
   dinfo.err = jpeg_std_error(&jerr.super);
   jerr.super.error_exit = _error_exit;
+  jerr.super.emit_message = _emit_message;
+  jerr.warning_count = 0;
 
   if (setjmp(jerr.jmp)) {
     goto fail;
@@ -181,6 +197,15 @@ static uvc_error_t uvc_mjpeg_convert(uvc_frame_t *in, uvc_frame_t *out) {
   }
 
   jpeg_finish_decompress(&dinfo);
+  if (jerr.warning_count > 0) {
+    /* Decoded with warnings (e.g. truncated data): the image contains
+     * gray/garbage regions — reject the frame rather than show it. */
+    UVC_LOGW(
+        "UVC_FRAME",
+        "rejecting corrupt MJPEG frame: %d decoder warnings",
+        jerr.warning_count);
+    goto fail;
+  }
   jpeg_destroy_decompress(&dinfo);
   return 0;
 

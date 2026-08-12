@@ -625,6 +625,29 @@ static int has_mjpeg_soi_marker(const uvc_frame_t *frame) {
   return data[0] == 0xFF && data[1] == 0xD8;
 }
 
+// End-of-image marker (FF D9) within a small tail window: some cameras
+// zero-pad the tail to the USB packet size, so the marker is not required
+// to be the very last two bytes.
+static int has_mjpeg_eoi_marker(const uvc_frame_t *frame) {
+  const uint8_t *data;
+  size_t end;
+  size_t floor;
+
+  if (frame == NULL || frame->data == NULL || frame->data_bytes < 4) {
+    return 0;
+  }
+
+  data = (const uint8_t *)frame->data;
+  end = frame->data_bytes;
+  floor = end > 18 ? end - 18 : 0;
+  for (size_t i = end; i-- > floor + 1;) {
+    if (data[i - 1] == 0xFF && data[i] == 0xD9) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 // Phase-0 recon for H.264 support: dumps the frame head and scans Annex B
 // start codes so the log shows the bytestream layout (start code form,
 // NAL types present, whether SPS/PPS ride in-band, one AU per frame).
@@ -852,6 +875,25 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
           frame->height,
           frame->data_bytes);
       abort_frame_callback_locked_and_notify();
+      return;
+    }
+
+    if (!has_mjpeg_eoi_marker(frame)) {
+      /* Truncated frame (USB packet loss or a misreported
+       * dwMaxVideoFrameSize): decoding it would fill the tail with
+       * gray/garbage and flash on both the preview and the recording.
+       * MJPEG frames are independent, so drop it quietly — count and
+       * log, but do not fire the error listener for a transient loss. */
+      g_uvc_state.stats.invalid_mjpeg_count += 1;
+      UVC_LOGW(
+          "UVC_NATIVE",
+          "dropping MJPEG frame missing EOI marker callback=%u width=%u height=%u bytes=%zu",
+          callback_count,
+          frame->width,
+          frame->height,
+          frame->data_bytes);
+      finish_callback_locked();
+      pthread_mutex_unlock(&g_uvc_state.mutex);
       return;
     }
   }
