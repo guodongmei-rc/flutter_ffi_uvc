@@ -30,7 +30,7 @@ class _FakeCamera implements UvcCamera {
   Future<UvcGalleryMedia> takePicture({int quality = 90}) async =>
       const UvcGalleryMedia();
   @override
-  Future<void> startVideoRecording({int? bitRate, int frameRate = 30}) async {}
+  Future<void> startVideoRecording({int? bitRate, int? frameRate}) async {}
   @override
   Future<UvcGalleryMedia> stopVideoRecording() async =>
       const UvcGalleryMedia();

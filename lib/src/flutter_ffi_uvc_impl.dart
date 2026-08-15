@@ -346,7 +346,7 @@ class _FlutterFfiUvcCamera implements UvcCamera {
   }
 
   @override
-  Future<void> startVideoRecording({int? bitRate, int frameRate = 30}) async {
+  Future<void> startVideoRecording({int? bitRate, int? frameRate}) async {
     _ensureAndroid();
     await _requireGalleryPermission();
 
@@ -388,13 +388,18 @@ class _FlutterFfiUvcCamera implements UvcCamera {
     final int width = swapped ? frameHeight : frameWidth;
     final int height = swapped ? frameWidth : frameHeight;
 
+    // Record at the frame rate of the active preview mode unless the caller
+    // overrides it.
+    final int effectiveFrameRate =
+        frameRate ?? _lastPreviewRequest?.mode.fps ?? 30;
+
     await _textureChannel.invokeMethod<void>(
       'startVideoRecording',
       <String, Object?>{
         'width': width,
         'height': height,
         'bitRate': ?bitRate,
-        'frameRate': frameRate,
+        'frameRate': effectiveFrameRate,
         'passthrough': passthrough,
       },
     );

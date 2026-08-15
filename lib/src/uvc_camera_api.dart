@@ -1340,11 +1340,12 @@ abstract interface class UvcCamera {
   ///
   /// Recording follows the current [previewTransform] (what the preview
   /// texture shows is what is recorded). [bitRate] defaults to a heuristic
-  /// based on the frame size and [frameRate].
+  /// based on the frame size and [frameRate]. [frameRate] defaults to the
+  /// frame rate of the currently active preview mode.
   ///
   /// Throws [UvcException] if no preview is running, or [PlatformException]
   /// if the encoder/muxer fails to start.
-  Future<void> startVideoRecording({int? bitRate, int frameRate = 30});
+  Future<void> startVideoRecording({int? bitRate, int? frameRate});
 
   /// Stops the active video recording and publishes it to the gallery.
   ///
