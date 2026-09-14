@@ -1,25 +1,28 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter_ffi_uvc/flutter_ffi_uvc.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 // ---------------------------------------------------------------------------
-// Fake camera that exposes a controllable streamErrors sink for testing.
+// Fake camera that records the withAudio argument of startVideoRecording.
 // ---------------------------------------------------------------------------
 
 class _FakeCamera implements UvcCamera {
-  final StreamController<UvcStreamError> _errorController =
-      StreamController<UvcStreamError>.broadcast();
-
-  void injectError(String message) =>
-      _errorController.add(UvcStreamError(message: message));
-
-  void close() => _errorController.close();
+  bool? lastWithAudio;
 
   @override
-  Stream<UvcStreamError> get streamErrors => _errorController.stream;
+  Future<void> startVideoRecording({
+    int? bitRate,
+    int? frameRate,
+    bool withAudio = true,
+  }) async {
+    lastWithAudio = withAudio;
+  }
 
   // --- unused stubs ---
+  @override
+  Stream<UvcStreamError> get streamErrors => const Stream.empty();
   @override
   void setLogLevel(UvcLogLevel level) {}
   @override
@@ -29,12 +32,6 @@ class _FakeCamera implements UvcCamera {
   @override
   Future<UvcGalleryMedia> takePicture({int quality = 90}) async =>
       const UvcGalleryMedia();
-  @override
-  Future<void> startVideoRecording({
-    int? bitRate,
-    int? frameRate,
-    bool withAudio = true,
-  }) async {}
   @override
   Future<UvcGalleryMedia> stopVideoRecording() async =>
       const UvcGalleryMedia();
@@ -170,101 +167,33 @@ class _FakeCamera implements UvcCamera {
 // ---------------------------------------------------------------------------
 
 void main() {
-  group('UvcStreamError', () {
-    test('toString includes message', () {
-      const UvcStreamError err = UvcStreamError(message: 'decode failed');
-      expect(err.toString(), contains('decode failed'));
+  group('startVideoRecording withAudio', () {
+    test('defaults to true and passes explicit values through', () async {
+      final _FakeCamera camera = _FakeCamera();
+
+      await camera.startVideoRecording();
+      expect(camera.lastWithAudio, isTrue);
+
+      await camera.startVideoRecording(withAudio: false);
+      expect(camera.lastWithAudio, isFalse);
+
+      await camera.startVideoRecording(withAudio: true);
+      expect(camera.lastWithAudio, isTrue);
     });
 
-    test('message is preserved exactly', () {
-      const String msg = 'Frame too small: expected>=1228800 actual=0';
-      expect(UvcStreamError(message: msg).message, msg);
-    });
-  });
+    test('is accepted on the shared service and still platform-guarded', () {
+      if (Platform.isAndroid) {
+        return;
+      }
 
-  group('streamErrors stream', () {
-    late _FakeCamera camera;
-
-    setUp(() => camera = _FakeCamera());
-    tearDown(() => camera.close());
-
-    test('delivers single injected error to subscriber', () async {
-      final List<UvcStreamError> received = <UvcStreamError>[];
-      final StreamSubscription<UvcStreamError> sub =
-          camera.streamErrors.listen(received.add);
-
-      camera.injectError('uvc_any2rgb failed');
-
-      await Future<void>.delayed(Duration.zero);
-      await sub.cancel();
-
-      expect(received, hasLength(1));
-      expect(received.first.message, 'uvc_any2rgb failed');
-    });
-
-    test('delivers multiple errors in order', () async {
-      final List<String> messages = <String>[];
-      final StreamSubscription<UvcStreamError> sub =
-          camera.streamErrors.listen((UvcStreamError e) => messages.add(e.message));
-
-      camera.injectError('error 1');
-      camera.injectError('error 2');
-      camera.injectError('error 3');
-
-      await Future<void>.delayed(Duration.zero);
-      await sub.cancel();
-
-      expect(messages, <String>['error 1', 'error 2', 'error 3']);
-    });
-
-    test('broadcast: all subscribers receive each error', () async {
-      final List<UvcStreamError> received1 = <UvcStreamError>[];
-      final List<UvcStreamError> received2 = <UvcStreamError>[];
-
-      final StreamSubscription<UvcStreamError> sub1 =
-          camera.streamErrors.listen(received1.add);
-      final StreamSubscription<UvcStreamError> sub2 =
-          camera.streamErrors.listen(received2.add);
-
-      camera.injectError('broadcast error');
-
-      await Future<void>.delayed(Duration.zero);
-      await sub1.cancel();
-      await sub2.cancel();
-
-      expect(received1, hasLength(1));
-      expect(received2, hasLength(1));
-      expect(received1.first.message, received2.first.message);
-    });
-
-    test('subscriber added after error misses past events', () async {
-      camera.injectError('before subscription');
-
-      await Future<void>.delayed(Duration.zero);
-
-      final List<UvcStreamError> received = <UvcStreamError>[];
-      final StreamSubscription<UvcStreamError> sub =
-          camera.streamErrors.listen(received.add);
-
-      await Future<void>.delayed(Duration.zero);
-      await sub.cancel();
-
-      expect(received, isEmpty);
-    });
-
-    test('cancelled subscription no longer receives errors', () async {
-      final List<UvcStreamError> received = <UvcStreamError>[];
-      final StreamSubscription<UvcStreamError> sub =
-          camera.streamErrors.listen(received.add);
-
-      camera.injectError('before cancel');
-      await Future<void>.delayed(Duration.zero);
-      await sub.cancel();
-
-      camera.injectError('after cancel');
-      await Future<void>.delayed(Duration.zero);
-
-      expect(received, hasLength(1));
+      expect(
+        () => uvcCamera.startVideoRecording(withAudio: false),
+        throwsA(isA<UnsupportedError>()),
+      );
+      expect(
+        () => uvcCamera.startVideoRecording(withAudio: true),
+        throwsA(isA<UnsupportedError>()),
+      );
     });
   });
 }

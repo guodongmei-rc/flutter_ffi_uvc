@@ -24,6 +24,10 @@
 #include "h26x_decoder.h"
 #include "h26x_rawrec.h"
 
+#if defined(__ANDROID__)
+#include "uac_audio.h"
+#endif
+
 int g_uvc_native_log_level = UVC_LOG_LEVEL_DEFAULT;
 
 // libuvc only exposes this declaration when libusb version macros are visible.
@@ -107,6 +111,12 @@ typedef struct {
   // Passthrough recorder for H.264/H.265 streams; active while a raw
   // recording session is in progress, auto-stopped on stop/close.
   h26x_rawrec_t *h26x_rawrec;
+#if defined(__ANDROID__)
+  // UAC microphone capture feeding the recording's audio track; started and
+  // stopped via JNI from the platform recorder. Stopped (never just leaked)
+  // before the USB device handle is closed.
+  uac_audio_t *audio;
+#endif
   int preview_rotation;  // 0, 90, 180, 270 (clockwise)
   int preview_flip_h;    // mirror left-right
   int preview_flip_v;    // mirror top-bottom
@@ -657,6 +667,14 @@ static void finish_stop_preview_locked(void) {
     rec_writer_stop();
     g_uvc_state.h26x_rawrec = NULL;
   }
+#if defined(__ANDROID__)
+  if (g_uvc_state.audio != NULL) {
+    // Preview teardown ends any recording; stop the UAC capture so the
+    // platform audio feeder sees end-of-stream instead of dangling.
+    uac_audio_stop(g_uvc_state.audio);
+    g_uvc_state.audio = NULL;
+  }
+#endif
   if (g_uvc_state.h26x_decoder != NULL) {
     // Safe to destroy here: wait_for_callbacks_locked() guarantees no
     // callback is feeding the decoder anymore.
@@ -671,6 +689,15 @@ static void close_device_resources_locked(void) {
     rec_writer_stop();
     g_uvc_state.h26x_rawrec = NULL;
   }
+#if defined(__ANDROID__)
+  if (g_uvc_state.audio != NULL) {
+    // Stop audio capture before uvc_close frees the underlying libusb
+    // handle. Blocks until isoc callbacks and readers drain; they only take
+    // the audio session's own mutex, never g_uvc_state.mutex.
+    uac_audio_stop(g_uvc_state.audio);
+    g_uvc_state.audio = NULL;
+  }
+#endif
   if (g_uvc_state.h26x_decoder != NULL) {
     h26x_decoder_destroy(g_uvc_state.h26x_decoder);
     g_uvc_state.h26x_decoder = NULL;
@@ -1932,6 +1959,122 @@ Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeDetachRecordingSurf
   pthread_mutex_lock(&g_uvc_state.mutex);
   release_recording_window_locked();
   pthread_mutex_unlock(&g_uvc_state.mutex);
+}
+
+// ---------------------------------------------------------------------------
+// UAC audio capture bridge (NativeAudio.kt). All failures return NULL /
+// negative codes — the platform layer logs and degrades to video-only
+// recording; audio must never break a recording.
+// ---------------------------------------------------------------------------
+
+// Returns {sampleRate, channels, bits} of the camera's UAC capture
+// interface, or NULL when the device has none.
+JNIEXPORT jintArray JNICALL
+Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_probe(
+    JNIEnv *env,
+    jobject thiz) {
+  (void)thiz;
+
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  uac_audio_info_t info;
+  int probe_result = UVC_ERROR_NO_DEVICE;
+  if (g_uvc_state.devh != NULL) {
+    probe_result = uac_audio_probe(g_uvc_state.devh->usb_devh, &info);
+  }
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+  if (probe_result != 0) {
+    return NULL;
+  }
+
+  jintArray result = (*env)->NewIntArray(env, 3);
+  if (result == NULL) {
+    return NULL;
+  }
+  const jint values[3] = {info.sample_rate, info.channels, info.bits};
+  (*env)->SetIntArrayRegion(env, result, 0, 3, values);
+  return result;
+}
+
+// Starts PCM capture from the camera's UAC interface. 0 on success.
+JNIEXPORT jint JNICALL
+Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_start(
+    JNIEnv *env,
+    jobject thiz) {
+  (void)env;
+  (void)thiz;
+
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  jint result = UVC_ERROR_OTHER;
+  if (g_uvc_state.audio != NULL) {
+    result = UVC_ERROR_BUSY;
+  } else if (g_uvc_state.devh == NULL) {
+    result = UVC_ERROR_NO_DEVICE;
+  } else {
+    uac_audio_info_t info;
+    if (uac_audio_probe(g_uvc_state.devh->usb_devh, &info) != 0) {
+      result = UVC_ERROR_INVALID_DEVICE;
+    } else {
+      g_uvc_state.audio = uac_audio_start(g_uvc_state.devh->usb_devh, &info);
+      result = g_uvc_state.audio != NULL ? UVC_SUCCESS : UVC_ERROR_IO;
+    }
+  }
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+  return result;
+}
+
+// Fills a direct ByteBuffer with captured PCM. Returns the byte count, 0 on
+// timeout, -1 when the capture is stopped (end of stream).
+JNIEXPORT jint JNICALL
+Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_read(
+    JNIEnv *env,
+    jobject thiz,
+    jobject buffer,
+    jint timeout_ms) {
+  (void)thiz;
+
+  if (buffer == NULL) {
+    return UVC_ERROR_INVALID_PARAM;
+  }
+  uint8_t *dst = (uint8_t *)(*env)->GetDirectBufferAddress(env, buffer);
+  const jlong capacity = (*env)->GetDirectBufferCapacity(env, buffer);
+  if (dst == NULL || capacity <= 0) {
+    return UVC_ERROR_INVALID_PARAM;
+  }
+
+  // The session is stopped and freed only by callers holding
+  // g_uvc_state.mutex (nativeAudioStop, preview stop, device close), so
+  // retaining under the mutex keeps the session alive for this read.
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  uac_audio_t *audio = g_uvc_state.audio;
+  if (audio != NULL) {
+    uac_audio_retain(audio);
+  }
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+  if (audio == NULL) {
+    return -1;
+  }
+
+  const int bytes =
+      uac_audio_read(audio, dst, (int)capacity, (int)timeout_ms);
+  uac_audio_release(audio);
+  return bytes;
+}
+
+// Stops the capture and releases the interface. Idempotent, returns 0.
+JNIEXPORT jint JNICALL
+Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_stop(
+    JNIEnv *env,
+    jobject thiz) {
+  (void)env;
+  (void)thiz;
+
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  if (g_uvc_state.audio != NULL) {
+    uac_audio_stop(g_uvc_state.audio);
+    g_uvc_state.audio = NULL;
+  }
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+  return UVC_SUCCESS;
 }
 #endif
 

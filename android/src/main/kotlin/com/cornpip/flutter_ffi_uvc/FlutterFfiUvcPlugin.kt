@@ -74,6 +74,8 @@ class FlutterFfiUvcPlugin :
     // Recording
     private var videoRecorder: VideoRecorder? = null
     private var rawRecTempFile: File? = null
+    private var aacFileRecorder: AacFileRecorder? = null
+    private var rawRecAudioTempFile: File? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val usbPermissionAction: String
@@ -178,8 +180,13 @@ class FlutterFfiUvcPlugin :
         videoRecorder?.abort()
         videoRecorder = null
         nativeRawRecStop()
+        try { aacFileRecorder?.stop() } catch (_: Exception) {}
+        aacFileRecorder = null
+        stopAudioCaptureQuietly()
         rawRecTempFile?.delete()
         rawRecTempFile = null
+        rawRecAudioTempFile?.delete()
+        rawRecAudioTempFile = null
         nativeDetachSurface()
         attachedTextureId = null
         textures.values.forEach { it.release() }
@@ -464,13 +471,23 @@ class FlutterFfiUvcPlugin :
                         return
                     }
                     rawRecTempFile = tempFile
+                    if (call.argument<Boolean>("withAudio") ?: true) {
+                        startPassthroughAudio(context)
+                    }
                     result.success(null)
                     return
                 }
                 val bitRate = call.argument<Number>("bitRate")?.toInt()
                 val frameRate = call.argument<Number>("frameRate")?.toInt() ?: 30
+                val audioEncoder = if (call.argument<Boolean>("withAudio") ?: true) {
+                    tryStartAudioCapture()?.let { AacAudioEncoder(it[0], it[1]) }
+                } else {
+                    null
+                }
                 try {
-                    val recorder = VideoRecorder(context, width, height, bitRate, frameRate)
+                    val recorder = VideoRecorder(
+                        context, width, height, bitRate, frameRate, audioEncoder,
+                    )
                     val surface = recorder.start()
                     val attachResult = nativeAttachRecordingSurface(surface)
                     if (attachResult != 0) {
@@ -486,6 +503,9 @@ class FlutterFfiUvcPlugin :
                     result.success(null)
                 } catch (e: Exception) {
                     Log.e(TAG, "startVideoRecording failed", e)
+                    // The capture is also stopped inside VideoRecorder's
+                    // failure paths; NativeAudio.stop is idempotent.
+                    if (audioEncoder != null) stopAudioCaptureQuietly()
                     result.error("start_failed", e.message ?: "Failed to start recording", null)
                 }
             }
@@ -497,19 +517,32 @@ class FlutterFfiUvcPlugin :
                 val rawFile = rawRecTempFile
                 if (rawFile != null) {
                     rawRecTempFile = null
+                    val audioRecorder = aacFileRecorder
+                    val audioFile = rawRecAudioTempFile
+                    aacFileRecorder = null
+                    rawRecAudioTempFile = null
                     Thread({
                         try {
                             nativeRawRecStop()
+                            // Stop the capture before finalizing: the AAC
+                            // encoder drains its tail once nativeAudioRead
+                            // reports end-of-stream.
+                            if (audioRecorder != null) {
+                                stopAudioCaptureQuietly()
+                                audioRecorder.stop()
+                            }
                             val context = appContext
                                 ?: throw IllegalStateException("Context not available")
-                            val muxResult = RawVideoMuxer.mux(context, rawFile)
+                            val muxResult = RawVideoMuxer.mux(context, rawFile, audioFile)
                             rawFile.delete()
+                            audioFile?.delete()
                             mainHandler.post {
                                 result.success(mapOf("uri" to muxResult.uri, "path" to muxResult.path))
                             }
                         } catch (e: Exception) {
                             Log.e(TAG, "stopVideoRecording(passthrough) failed", e)
                             rawFile.delete()
+                            audioFile?.delete()
                             mainHandler.post {
                                 result.error("stop_failed", e.message ?: "Failed to finish recording", null)
                             }
@@ -542,6 +575,60 @@ class FlutterFfiUvcPlugin :
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
+
+    // Audio capture for recordings. Every failure logs a warning and degrades
+    // to video-only — audio must never break a recording.
+    private fun tryStartAudioCapture(): IntArray? {
+        val info = try {
+            NativeAudio.probe()
+        } catch (e: Throwable) {
+            Log.w(TAG, "Audio probe failed; recording video-only", e)
+            null
+        }
+        if (info == null) {
+            Log.w(TAG, "No UAC audio interface; recording video-only")
+            return null
+        }
+        if (info.size < 3 || info[0] <= 0 || info[1] <= 0 || info[2] != 16) {
+            Log.w(TAG, "Unsupported UAC format ${info.contentToString()}; recording video-only")
+            return null
+        }
+        val startResult = try {
+            NativeAudio.start()
+        } catch (e: Throwable) {
+            Log.w(TAG, "Audio capture start threw; recording video-only", e)
+            -1
+        }
+        if (startResult != 0) {
+            Log.w(TAG, "Audio capture start failed (rc=$startResult); recording video-only")
+            return null
+        }
+        return info
+    }
+
+    private fun stopAudioCaptureQuietly() {
+        try {
+            NativeAudio.stop()
+        } catch (e: Throwable) {
+            Log.w(TAG, "Audio capture stop failed", e)
+        }
+    }
+
+    /** Starts the AAC temp-file recorder for the passthrough recording path. */
+    private fun startPassthroughAudio(context: Context) {
+        val info = tryStartAudioCapture() ?: return
+        try {
+            val audioFile =
+                File(context.cacheDir, "uvc_audio_${System.currentTimeMillis()}.bin")
+            val recorder = AacFileRecorder(audioFile, info[0], info[1])
+            recorder.start()
+            rawRecAudioTempFile = audioFile
+            aacFileRecorder = recorder
+        } catch (e: Exception) {
+            Log.w(TAG, "Audio recorder failed to start; recording video-only", e)
+            stopAudioCaptureQuietly()
+        }
+    }
 
     // Saving media through MediaStore needs no runtime permission on
     // Android 10+ (scoped storage); earlier releases need WRITE_EXTERNAL_STORAGE.

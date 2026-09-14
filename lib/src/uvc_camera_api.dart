@@ -1343,9 +1343,18 @@ abstract interface class UvcCamera {
   /// based on the frame size and [frameRate]. [frameRate] defaults to the
   /// frame rate of the currently active preview mode.
   ///
+  /// When [withAudio] is true (the default) the camera's USB Audio Class
+  /// interface is probed and, if present, its microphone is recorded as an
+  /// AAC audio track. Cameras without an audio interface — or any audio
+  /// startup failure — silently degrade to a video-only recording.
+  ///
   /// Throws [UvcException] if no preview is running, or [PlatformException]
   /// if the encoder/muxer fails to start.
-  Future<void> startVideoRecording({int? bitRate, int? frameRate});
+  Future<void> startVideoRecording({
+    int? bitRate,
+    int? frameRate,
+    bool withAudio = true,
+  });
 
   /// Stops the active video recording and publishes it to the gallery.
   ///

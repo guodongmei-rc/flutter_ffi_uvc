@@ -77,6 +77,11 @@ add_library(flutter_ffi_uvc SHARED
   "h26x_rawrec.c"
 )
 
+# UAC microphone capture for video recording (isochronous PCM over libusb).
+if(ANDROID)
+  target_sources(flutter_ffi_uvc PRIVATE "uac_audio.c")
+endif()
+
 set_target_properties(flutter_ffi_uvc PROPERTIES
   PUBLIC_HEADER flutter_ffi_uvc.h
   OUTPUT_NAME "flutter_ffi_uvc"

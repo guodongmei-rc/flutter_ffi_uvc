@@ -346,7 +346,11 @@ class _FlutterFfiUvcCamera implements UvcCamera {
   }
 
   @override
-  Future<void> startVideoRecording({int? bitRate, int? frameRate}) async {
+  Future<void> startVideoRecording({
+    int? bitRate,
+    int? frameRate,
+    bool withAudio = true,
+  }) async {
     _ensureAndroid();
     await _requireGalleryPermission();
 
@@ -401,6 +405,7 @@ class _FlutterFfiUvcCamera implements UvcCamera {
         'bitRate': ?bitRate,
         'frameRate': effectiveFrameRate,
         'passthrough': passthrough,
+        'withAudio': withAudio,
       },
     );
     _videoRecording = true;

@@ -62,6 +62,7 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
   bool _savingPhoto = false;
   bool _saveToGallery = true;
   bool _recordingVideo = false;
+  bool _recordAudio = true;
   bool _transformControlsExpanded = false;
   bool _manualFocusControlsVisible = false;
   StreamSubscription<UvcStreamError>? _streamErrorSub;
@@ -993,10 +994,15 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
       return;
     }
     try {
-      await _camera.startVideoRecording();
+      await _camera.startVideoRecording(withAudio: _recordAudio);
       _startRecordingTimer();
       setState(() => _recordingVideo = true);
-      _setStatus('Recording video...');
+      // Without a UAC microphone the plugin silently records video-only.
+      _setStatus(
+        _recordAudio
+            ? 'Recording video with audio (if the camera has a mic)...'
+            : 'Recording video...',
+      );
     } on UvcException catch (error) {
       _setStatus('Failed to start recording: ${error.message}', error: error);
     } on PlatformException catch (error) {
@@ -1578,6 +1584,20 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
                                 value: _saveToGallery,
                                 onChanged: (bool value) =>
                                     setState(() => _saveToGallery = value),
+                              ),
+                            if (_cameraModes.isNotEmpty)
+                              SwitchListTile(
+                                contentPadding: const EdgeInsets.symmetric(
+                                  horizontal: 12,
+                                ),
+                                title: const Text('Record audio'),
+                                subtitle: const Text(
+                                  'Adds the camera microphone (UAC) as an AAC '
+                                  'track; silently video-only when absent',
+                                ),
+                                value: _recordAudio,
+                                onChanged: (bool value) =>
+                                    setState(() => _recordAudio = value),
                               ),
                             if (_cameraModes.isNotEmpty)
                               SwitchListTile(

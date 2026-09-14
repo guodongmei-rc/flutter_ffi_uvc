@@ -27,14 +27,82 @@ import java.util.Locale
 internal object RawVideoMuxer {
     private const val TAG = "flutter_ffi_uvc"
     private const val MAGIC = "UVCRAW01"
+    private const val AUDIO_MAGIC = "UVCAUD02"
     private const val CODEC_H264 = 0
     private const val CODEC_H265 = 1
     private const val FLAG_KEYFRAME = 0x01
 
     class Result(val uri: String?, val path: String?)
 
-    /** Muxes [input] into the gallery and deletes the temp file on success. */
-    fun mux(context: Context, input: File): Result {
+    private class AudioSample(val ptsUs: Long, val payload: ByteArray)
+
+    private class AudioHeader(
+        val file: RandomAccessFile,
+        val sampleRate: Int,
+        val channels: Int,
+        val asc: ByteArray,
+        // Absolute monotonic µs when the audio encoder started; sample PTS in
+        // the file are relative to this base.
+        val baseUs: Long,
+    )
+
+    /**
+     * Opens an AacFileRecorder temp file and validates its header. Returns
+     * null (and logs) on any inconsistency so a broken audio side never
+     * fails the video mux.
+     */
+    private fun readAudioHeader(input: File): AudioHeader? = try {
+        val raf = RandomAccessFile(input, "r")
+        val magic = ByteArray(8)
+        raf.readFully(magic)
+        val sampleRate = raf.readIntLE() ?: -1
+        val channels = raf.read()
+        raf.read() // reserved
+        val ascLen = raf.readUnsignedShortLE()
+        val asc = ByteArray(ascLen.coerceAtLeast(0))
+        raf.readFully(asc)
+        val baseUs = raf.readLongLE() ?: -1L
+        if (String(magic, Charsets.US_ASCII) != AUDIO_MAGIC ||
+            sampleRate <= 0 || channels <= 0 || ascLen <= 0 || baseUs < 0
+        ) {
+            Log.w(TAG, "Bad audio recording header; muxing video-only")
+            raf.close()
+            null
+        } else {
+            AudioHeader(raf, sampleRate, channels, asc, baseUs)
+        }
+    } catch (e: Exception) {
+        Log.w(TAG, "Failed to read audio temp file; muxing video-only", e)
+        null
+    }
+
+    /** Reads one AAC sample record, or null at end of file. */
+    private fun readAudioSample(header: AudioHeader?): AudioSample? {
+        if (header == null) return null
+        val ptsUs = header.file.readLongLE() ?: return null
+        val payloadLen = header.file.readIntLE() ?: return null
+        if (payloadLen <= 0 || payloadLen > 1024 * 1024) return null
+        val payload = ByteArray(payloadLen)
+        header.file.readFully(payload)
+        return AudioSample(ptsUs, payload)
+    }
+
+    /**
+     * Audio sample PTS on the normalized video timeline: absolute monotonic
+     * (base + relative) minus the first video frame's PTS, clamped to 0 for
+     * audio that predates the first frame.
+     */
+    private fun audioPtsUs(header: AudioHeader?, sample: AudioSample, videoBaseUs: Long): Long {
+        val base = header?.baseUs ?: 0L
+        return (base + sample.ptsUs - videoBaseUs).coerceAtLeast(0L)
+    }
+
+    /**
+     * Muxes [input] into the gallery and deletes the temp file on success.
+     * When [audioInput] (an AacFileRecorder temp file) is given, an AAC audio
+     * track is interleaved by presentation time.
+     */
+    fun mux(context: Context, input: File, audioInput: File? = null): Result {
         var contentUri: Uri? = null
         var outputFile: File? = null
         try {
@@ -51,6 +119,13 @@ internal object RawVideoMuxer {
                 val csd = ByteArray(csdLen)
                 raf.readFully(csd)
                 require(width > 0 && height > 0 && csdLen > 0) { "Bad raw recording header" }
+
+                // ── Optional audio temp file (AAC samples + header) ──────
+                // A broken audio side never fails the mux: log and continue
+                // video-only.
+                val audioHeader = audioInput?.let { readAudioHeader(it) }
+                var audioTrackIndex = -1
+                var audioSampleCount = 0L
 
                 val mime = when (codec) {
                     CODEC_H264 -> MediaFormat.MIMETYPE_VIDEO_AVC
@@ -104,9 +179,26 @@ internal object RawVideoMuxer {
                         }
                     }
                     val trackIndex = muxer.addTrack(format)
+                    if (audioHeader != null) {
+                        val audioFormat = MediaFormat.createAudioFormat(
+                            MediaFormat.MIMETYPE_AUDIO_AAC,
+                            audioHeader.sampleRate,
+                            audioHeader.channels,
+                        ).apply {
+                            // AudioSpecificConfig goes into csd-0.
+                            setByteBuffer("csd-0", ByteBuffer.wrap(audioHeader.asc))
+                        }
+                        audioTrackIndex = muxer.addTrack(audioFormat)
+                    }
                     muxer.start()
 
                     val info = MediaCodec.BufferInfo()
+                    var nextAudio = readAudioSample(audioHeader)
+                    // Video PTS in the temp file are absolute monotonic µs;
+                    // normalize the track so the first frame sits at 0, and
+                    // shift audio (base_us + relative pts) onto the same zero
+                    // so the two tracks play in sync.
+                    var videoBaseUs = -1L
                     while (true) {
                         val ptsUs = raf.readLongLE() ?: break
                         val payloadLen = raf.readIntLE() ?: break
@@ -114,10 +206,30 @@ internal object RawVideoMuxer {
                         if (payloadLen <= 0 || payloadLen > 64 * 1024 * 1024) break
                         val payload = ByteArray(payloadLen)
                         raf.readFully(payload)
+                        if (videoBaseUs < 0) videoBaseUs = ptsUs
+                        // Flush every audio sample up to this video PTS first
+                        // so the two tracks stay interleaved in time.
+                        while (nextAudio != null &&
+                            audioPtsUs(audioHeader, nextAudio!!, videoBaseUs) <= ptsUs - videoBaseUs
+                        ) {
+                            info.set(
+                                0,
+                                nextAudio!!.payload.size,
+                                audioPtsUs(audioHeader, nextAudio!!, videoBaseUs),
+                                0,
+                            )
+                            muxer.writeSampleData(
+                                audioTrackIndex,
+                                ByteBuffer.wrap(nextAudio!!.payload),
+                                info,
+                            )
+                            audioSampleCount += 1
+                            nextAudio = readAudioSample(audioHeader)
+                        }
                         info.set(
                             0,
                             payloadLen,
-                            ptsUs,
+                            ptsUs - videoBaseUs,
                             if (flags and FLAG_KEYFRAME != 0) {
                                 MediaCodec.BUFFER_FLAG_KEY_FRAME
                             } else {
@@ -127,10 +239,27 @@ internal object RawVideoMuxer {
                         muxer.writeSampleData(trackIndex, ByteBuffer.wrap(payload), info)
                         sampleCount += 1
                     }
+                    // Audio tail past the last video frame.
+                    while (nextAudio != null) {
+                        info.set(
+                            0,
+                            nextAudio!!.payload.size,
+                            audioPtsUs(audioHeader, nextAudio!!, videoBaseUs),
+                            0,
+                        )
+                        muxer.writeSampleData(
+                            audioTrackIndex,
+                            ByteBuffer.wrap(nextAudio!!.payload),
+                            info,
+                        )
+                        audioSampleCount += 1
+                        nextAudio = readAudioSample(audioHeader)
+                    }
                     require(sampleCount > 0) { "No access units in raw recording" }
 
                     muxer.stop()
                 } finally {
+                    try { audioHeader?.file?.close() } catch (_: Exception) {}
                     try { muxer.release() } catch (_: Exception) {}
                     try { pfd?.close() } catch (_: Exception) {}
                 }
@@ -143,7 +272,11 @@ internal object RawVideoMuxer {
                         MediaScannerConnection.scanFile(context, arrayOf(it.absolutePath), null, null)
                     }
                 }
-                Log.i(TAG, "Raw recording muxed: $sampleCount samples -> ${contentUri ?: outputFile}")
+                Log.i(
+                    TAG,
+                    "Raw recording muxed: $sampleCount video + $audioSampleCount audio " +
+                        "samples -> ${contentUri ?: outputFile}",
+                )
                 return Result(contentUri?.toString(), outputFile?.absolutePath)
             }
         } catch (e: Exception) {

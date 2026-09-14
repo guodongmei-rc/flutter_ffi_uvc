@@ -15,6 +15,7 @@ import android.provider.MediaStore
 import android.util.Log
 import android.view.Surface
 import java.io.File
+import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -25,6 +26,12 @@ import java.util.Locale
  * [start] returns the encoder input [Surface]; the caller attaches it to the
  * native frame pipeline, which renders every preview frame into it. Encoded
  * output is muxed into an MP4 published to the device gallery (MediaStore).
+ *
+ * When [audioEncoder] is given, an AAC audio track (PCM from the camera's
+ * UAC interface, see AacAudioEncoder) is muxed alongside; the muxer then
+ * starts only after both tracks reported their output format. Audio startup
+ * failures degrade to a video-only recording — audio never breaks a
+ * recording.
  */
 internal class VideoRecorder(
     private val context: Context,
@@ -32,6 +39,7 @@ internal class VideoRecorder(
     private val height: Int,
     bitRate: Int?,
     private val frameRate: Int,
+    private val audioEncoder: AacAudioEncoder? = null,
 ) {
     companion object {
         private const val TAG = "flutter_ffi_uvc"
@@ -58,6 +66,20 @@ internal class VideoRecorder(
     private var drainThread: Thread? = null
     @Volatile private var stopRequested = false
 
+    // Audio track state. muxerLock serializes the video drain thread and the
+    // audio drain callback around MediaMuxer (not thread-safe).
+    private val muxerLock = Any()
+    private var audioStarted = false
+    private var tracksExpected = 1
+    private var tracksAdded = 0
+    private var audioTrackIndex = -1
+    private var audioSampleCount = 0L
+
+    // PTS normalization: video samples carry absolute monotonic µs (Surface
+    // input timestamps) and audio PTS are relative to the audio encoder's
+    // start. Both are shifted so the recording starts at 0.
+    private var ptsBaseUs = 0L
+
     private var contentUri: Uri? = null
     private var pfd: ParcelFileDescriptor? = null
     private var outputFile: File? = null
@@ -71,6 +93,10 @@ internal class VideoRecorder(
 
         try {
             openMuxerTarget()
+
+            ptsBaseUs = System.nanoTime() / 1_000
+            audioStarted = startAudioEncoder()
+            tracksExpected = if (audioStarted) 2 else 1
 
             val format = MediaFormat.createVideoFormat(MIME_TYPE, width, height).apply {
                 setInteger(
@@ -91,6 +117,7 @@ internal class VideoRecorder(
             drainThread = Thread({ drainLoop() }, "uvc-video-recorder").also { it.start() }
             return surface
         } catch (e: Exception) {
+            stopAudio()
             releaseResources()
             discardOutput()
             throw e
@@ -110,6 +137,10 @@ internal class VideoRecorder(
         Thread({
             try {
                 stopRequested = true
+                // Stop audio first: ending the native capture makes the audio
+                // feeder queue AAC end-of-stream, so the audio track is fully
+                // drained before the video EOS.
+                stopAudio()
                 try {
                     encoder.signalEndOfInputStream()
                 } catch (e: IllegalStateException) {
@@ -141,10 +172,69 @@ internal class VideoRecorder(
     /** Aborts a recording that failed to start; discards any partial output. */
     fun abort() {
         stopRequested = true
+        stopAudio()
         try { codec?.signalEndOfInputStream() } catch (_: Exception) {}
         drainThread?.join(STOP_JOIN_TIMEOUT_MS)
         releaseResources()
         discardOutput()
+    }
+
+    /** Starts the AAC encoder; failures degrade to a video-only recording. */
+    private fun startAudioEncoder(): Boolean {
+        val audio = audioEncoder ?: return false
+        audio.onFormatChanged = { format -> onAudioFormatChanged(format) }
+        audio.onEncodedSample = { buffer, info -> onAudioSample(buffer, info) }
+        return try {
+            audio.start()
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "Audio encoder failed to start; recording video-only", e)
+            stopAudioCapture()
+            false
+        }
+    }
+
+    /** Stops the audio encoder and the native UAC capture. Idempotent. */
+    private fun stopAudio() {
+        if (!audioStarted) return
+        audioStarted = false
+        stopAudioCapture()
+        audioEncoder?.stop()
+    }
+
+    private fun stopAudioCapture() {
+        try {
+            NativeAudio.stop()
+        } catch (e: Exception) {
+            Log.w(TAG, "Audio capture stop failed", e)
+        }
+    }
+
+    private fun onAudioFormatChanged(format: MediaFormat) {
+        synchronized(muxerLock) {
+            val m = muxer ?: return
+            audioTrackIndex = m.addTrack(format)
+            tracksAdded += 1
+            if (tracksAdded == tracksExpected) {
+                m.start()
+                muxerStarted = true
+            }
+        }
+    }
+
+    private fun onAudioSample(buffer: ByteBuffer, info: MediaCodec.BufferInfo) {
+        synchronized(muxerLock) {
+            if (muxerStarted && audioTrackIndex >= 0) {
+                // Shift the audio sample (absolute base + relative pts) onto
+                // the same zero as the video track.
+                info.presentationTimeUs = (
+                    (audioEncoder?.startTimeUs ?: ptsBaseUs) +
+                        info.presentationTimeUs - ptsBaseUs
+                    ).coerceAtLeast(0L)
+                muxer?.writeSampleData(audioTrackIndex, buffer, info)
+                audioSampleCount += 1
+            }
+        }
     }
 
     private fun drainLoop() {
@@ -156,19 +246,35 @@ internal class VideoRecorder(
                 when {
                     index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                         val m = muxer ?: break
-                        trackIndex = m.addTrack(encoder.outputFormat)
-                        m.start()
-                        muxerStarted = true
+                        synchronized(muxerLock) {
+                            trackIndex = m.addTrack(encoder.outputFormat)
+                            tracksAdded += 1
+                            // With an audio track, start only after every
+                            // track reported its format; video-only keeps the
+                            // original single-track behavior.
+                            if (tracksAdded == tracksExpected) {
+                                m.start()
+                                muxerStarted = true
+                            }
+                        }
                     }
                     index >= 0 -> {
                         val buffer = encoder.getOutputBuffer(index)
                         if (buffer != null &&
                             info.size > 0 &&
-                            muxerStarted &&
                             (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0
                         ) {
-                            muxer?.writeSampleData(trackIndex, buffer, info)
-                            sampleCount += 1
+                            synchronized(muxerLock) {
+                                if (muxerStarted) {
+                                    // Surface input timestamps are absolute
+                                    // monotonic µs; rebase to the recording
+                                    // start so the track begins at 0.
+                                    info.presentationTimeUs =
+                                        (info.presentationTimeUs - ptsBaseUs).coerceAtLeast(0L)
+                                    muxer?.writeSampleData(trackIndex, buffer, info)
+                                    sampleCount += 1
+                                }
+                            }
                         }
                         encoder.releaseOutputBuffer(index, false)
                         if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
