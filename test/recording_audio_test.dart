@@ -38,6 +38,8 @@ class _FakeCamera implements UvcCamera {
   @override
   bool get isVideoRecording => false;
   @override
+  Future<UvcAudioInfo?> queryAudioInterface() async => null;
+  @override
   Future<List<UvcUsbDevice>> listUsbDevices() async => const [];
   @override
   Future<int> openUsbDevice(int deviceId) async => -1;
@@ -192,6 +194,19 @@ void main() {
       );
       expect(
         () => uvcCamera.startVideoRecording(withAudio: true),
+        throwsA(isA<UnsupportedError>()),
+      );
+    });
+  });
+
+  group('queryAudioInterface', () {
+    test('is platform-guarded on the shared service', () {
+      if (Platform.isAndroid) {
+        return;
+      }
+
+      expect(
+        () => uvcCamera.queryAudioInterface(),
         throwsA(isA<UnsupportedError>()),
       );
     });

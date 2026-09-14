@@ -570,6 +570,24 @@ class FlutterFfiUvcPlugin :
                 })
             }
 
+            "probeAudioInterface" -> {
+                val info = try {
+                    NativeAudio.probe()
+                } catch (e: Throwable) {
+                    Log.w(TAG, "probeAudioInterface failed", e)
+                    null
+                }
+                result.success(
+                    info?.let {
+                        mapOf(
+                            "sampleRate" to it[0],
+                            "channels" to it[1],
+                            "bitsPerSample" to it[2],
+                        )
+                    },
+                )
+            }
+
             else -> result.notImplemented()
         }
     }

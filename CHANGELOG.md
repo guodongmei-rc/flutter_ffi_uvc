@@ -3,6 +3,7 @@
 ### Added
 
 * `startVideoRecording({bool withAudio = true})` — when the camera exposes a USB Audio Class (UAC) microphone interface, the recording now includes an AAC audio track. The native layer captures PCM from the UAC isochronous endpoint on the same libusb context as the video stream; both the re-encode (MediaCodec) and passthrough (H.264/H.265 remux) recording paths mux the audio track. At capture start the camera's UAC Feature Unit is unmuted and set to its maximum volume, and the PCM is boosted with an 8x saturating software gain before AAC encoding, because camera firmwares commonly default the mic gain very low. Cameras without an audio interface — or any audio startup failure — silently degrade to video-only (a logcat warning is emitted; recording is never interrupted).
+* `queryAudioInterface()` — probes the opened device for a UAC microphone interface and returns its capture format (`UvcAudioInfo`: sample rate, channels, bit depth), or null when the device has no audio interface (recording then silently stays video-only). Lets apps decide whether to show audio-recording UI right after opening the device, without starting a recording.
 
 ### Fixed
 

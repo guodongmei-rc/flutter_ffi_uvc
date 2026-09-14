@@ -41,6 +41,8 @@ class _FakeCamera implements UvcCamera {
   @override
   bool get isVideoRecording => false;
   @override
+  Future<UvcAudioInfo?> queryAudioInterface() async => null;
+  @override
   Future<List<UvcUsbDevice>> listUsbDevices() async => const [];
   @override
   Future<int> openUsbDevice(int deviceId) async => -1;

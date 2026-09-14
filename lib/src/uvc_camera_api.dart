@@ -1118,6 +1118,42 @@ class UvcGalleryMedia {
   String toString() => 'UvcGalleryMedia(uri: $uri, path: $path)';
 }
 
+/// The UAC (USB Audio Class) microphone interface of the opened device.
+///
+/// UVC cameras with a microphone expose it as a separate USB audio interface
+/// next to the video interface. Returned by [UvcCamera.queryAudioInterface];
+/// when the device has no audio interface the query returns null and video
+/// recording silently stays video-only.
+class UvcAudioInfo {
+  const UvcAudioInfo({
+    required this.sampleRate,
+    required this.channels,
+    required this.bitsPerSample,
+  });
+
+  factory UvcAudioInfo.fromMap(Map<Object?, Object?> map) {
+    return UvcAudioInfo(
+      sampleRate: (map['sampleRate'] as num?)?.toInt() ?? 0,
+      channels: (map['channels'] as num?)?.toInt() ?? 0,
+      bitsPerSample: (map['bitsPerSample'] as num?)?.toInt() ?? 0,
+    );
+  }
+
+  /// PCM sample rate of the capture endpoint (e.g. 48000).
+  final int sampleRate;
+
+  /// Channel count of the capture endpoint (1 = mono, 2 = stereo).
+  final int channels;
+
+  /// PCM bit depth (currently only 16-bit capture is recorded).
+  final int bitsPerSample;
+
+  @override
+  String toString() =>
+      'UvcAudioInfo(sampleRate: $sampleRate, channels: $channels, '
+      'bitsPerSample: $bitsPerSample)';
+}
+
 /// High-level camera API for the shared native UVC session.
 ///
 /// This package exposes a single shared camera service through [uvcCamera].
@@ -1365,6 +1401,15 @@ abstract interface class UvcCamera {
 
   /// Whether a video recording is currently in progress.
   bool get isVideoRecording;
+
+  /// Probes the opened device for a UAC microphone interface. Android only.
+  ///
+  /// Returns the capture format when the device exposes a USB Audio Class
+  /// streaming interface (this is what [startVideoRecording] records when
+  /// `withAudio` is true), or null when the device has no microphone — in
+  /// which case recording silently stays video-only. Requires an opened
+  /// device; returns null when none is open.
+  Future<UvcAudioInfo?> queryAudioInterface();
 
   /// Returns all controls supported by the currently opened device.
   List<UvcCameraControl> supportedControls();
