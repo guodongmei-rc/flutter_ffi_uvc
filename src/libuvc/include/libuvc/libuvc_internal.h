@@ -250,6 +250,9 @@ struct uvc_stream_handle {
   uint32_t pts, hold_pts;
   uint32_t last_scr, hold_last_scr;
   size_t got_bytes, hold_bytes;
+  /* Set when the frame being assembled in outbuf lost payload bytes (USB
+   * transfer error bit or a missing EOF): the delivered frame is incomplete. */
+  uint8_t outbuf_corrupt, hold_corrupt;
   uint8_t *outbuf, *holdbuf;
   pthread_mutex_t cb_mutex;
   pthread_cond_t cb_cond;

@@ -164,6 +164,27 @@ static void uac_estimate_format(uac_audio_info_t *info, uint8_t ep_interval) {
   }
 }
 
+/* Reads bTerminalLink from the AS General descriptor of an AudioStreaming
+ * interface; 0 when absent. The link tells which AudioControl terminal this
+ * streaming interface carries — a capture interface should link to the
+ * output terminal fed by the microphone. */
+static int uac_as_terminal_link(const unsigned char *extra, int extra_length) {
+  int offset = 0;
+  while (offset + 4 <= extra_length) {
+    const int length = extra[offset];
+    const int type = extra[offset + 1];
+    if (length < 2 || offset + length > extra_length) {
+      break;
+    }
+    if (type == UAC_DT_CS_INTERFACE && extra[offset + 2] == 0x01 &&
+        length >= 4) {
+      return extra[offset + 3];
+    }
+    offset += length;
+  }
+  return 0;
+}
+
 int uac_audio_probe(libusb_device_handle *usb_devh, uac_audio_info_t *out) {
   if (usb_devh == NULL || out == NULL) {
     return -1;
@@ -179,9 +200,9 @@ int uac_audio_probe(libusb_device_handle *usb_devh, uac_audio_info_t *out) {
   int found = 0;
   uac_audio_info_t info;
   memset(&info, 0, sizeof(info));
-  for (int i = 0; i < config->bNumInterfaces && !found; i++) {
+  for (int i = 0; i < config->bNumInterfaces; i++) {
     const struct libusb_interface *iface = &config->interface[i];
-    for (int a = 0; a < iface->num_altsetting && !found; a++) {
+    for (int a = 0; a < iface->num_altsetting; a++) {
       const struct libusb_interface_descriptor *alt = &iface->altsetting[a];
       if (alt->bInterfaceClass != UAC_CLASS_AUDIO ||
           alt->bInterfaceSubClass != UAC_SUBCLASS_STREAMING) {
@@ -195,22 +216,41 @@ int uac_audio_probe(libusb_device_handle *usb_devh, uac_audio_info_t *out) {
         if ((ep->bEndpointAddress & 0x80) == 0) {
           continue;  /* capture needs IN */
         }
-        info.packet_size = ep->wMaxPacketSize & 0x7ff;
-        if (info.packet_size == 0) {
+        const uint32_t packet_size = ep->wMaxPacketSize & 0x7ff;
+        if (packet_size == 0) {
           continue;  /* zero-bandwidth altsetting */
         }
-        info.interface_no = alt->bInterfaceNumber;
-        info.altsetting = alt->bAlternateSetting;
-        info.ep_address = ep->bEndpointAddress;
+        /* Every candidate is logged: devices with several streaming
+         * interfaces need the full list to diagnose a wrong pick. */
+        uac_audio_info_t candidate;
+        memset(&candidate, 0, sizeof(candidate));
+        candidate.packet_size = packet_size;
+        candidate.interface_no = alt->bInterfaceNumber;
+        candidate.altsetting = alt->bAlternateSetting;
+        candidate.ep_address = ep->bEndpointAddress;
         uac_parse_format(
             alt->extra,
             alt->extra_length,
-            &info.channels,
-            &info.bits,
-            &info.sample_rate);
-        uac_estimate_format(&info, ep->bInterval);
-        found = 1;
-        break;
+            &candidate.channels,
+            &candidate.bits,
+            &candidate.sample_rate);
+        uac_estimate_format(&candidate, ep->bInterval);
+        UAC_STATS_LOGI(
+            "probe candidate: interface=%d alt=%d ep=0x%02x packet=%u "
+            "rate=%d ch=%d bits=%d terminal_link=%d%s",
+            candidate.interface_no,
+            candidate.altsetting,
+            candidate.ep_address,
+            candidate.packet_size,
+            candidate.sample_rate,
+            candidate.channels,
+            candidate.bits,
+            uac_as_terminal_link(alt->extra, alt->extra_length),
+            found ? "" : " (selected)");
+        if (!found) {
+          info = candidate;
+          found = 1;
+        }
       }
     }
   }
@@ -220,15 +260,6 @@ int uac_audio_probe(libusb_device_handle *usb_devh, uac_audio_info_t *out) {
     UAC_STATS_LOGI( "probe: no UAC AudioStreaming capture interface");
     return -1;
   }
-  UAC_STATS_LOGI(
-      "probe: interface=%d alt=%d ep=0x%02x packet=%u rate=%d ch=%d bits=%d",
-      info.interface_no,
-      info.altsetting,
-      info.ep_address,
-      info.packet_size,
-      info.sample_rate,
-      info.channels,
-      info.bits);
   *out = info;
   return 0;
 }
@@ -239,16 +270,26 @@ int uac_audio_probe(libusb_device_handle *usb_devh, uac_audio_info_t *out) {
 
 /* UAC1 AudioControl constants. */
 #define UAC_SUBCLASS_CONTROL 0x01
+#define UAC_ST_INPUT_TERMINAL 0x02
+#define UAC_ST_OUTPUT_TERMINAL 0x03
+#define UAC_ST_SELECTOR_UNIT 0x05
 #define UAC_ST_FEATURE_UNIT 0x06
 #define UAC_REQ_SET_CUR 0x01
+#define UAC_REQ_GET_CUR 0x81
 #define UAC_REQ_GET_MAX 0x83
 #define UAC_CS_MUTE 0x01
 #define UAC_CS_VOLUME 0x02
 
-/* Best-effort: unmutes and maxes the volume of the first Feature Unit found
- * on the AudioControl interface. Many camera firmwares default the mic gain
- * low; failures are logged and ignored. */
-static void uac_try_max_volume(libusb_device_handle *usb_devh) {
+/* Best-effort mic enable. Walks every AudioControl interface and:
+ *  - logs every unit/terminal descriptor (diagnosing a silent mic needs the
+ *    topology in logcat);
+ *  - unmutes and maxes the volume of EVERY channel of every UAC1 Feature
+ *    Unit — some firmwares expose only per-channel controls, and handling
+ *    just the master channel leaves the mic silent;
+ *  - logs the current input of every Selector Unit (a selector defaulting
+ *    to an unconnected input captures only noise floor).
+ * Failures are logged and ignored. */
+static void uac_configure_audio_controls(libusb_device_handle *usb_devh) {
   libusb_device *dev = libusb_get_device(usb_devh);
   struct libusb_config_descriptor *config = NULL;
   if (libusb_get_active_config_descriptor(dev, &config) != 0 &&
@@ -266,57 +307,109 @@ static void uac_try_max_volume(libusb_device_handle *usb_devh) {
         alt->bInterfaceSubClass != UAC_SUBCLASS_CONTROL) {
       continue;
     }
-    /* Walk class-specific descriptors for a Feature Unit. */
     const unsigned char *extra = alt->extra;
-    int remaining = alt->extra_length;
+    const int remaining = alt->extra_length;
     int offset = 0;
-    while (offset + 6 <= remaining) {
+    while (offset + 3 <= remaining) {
       const int length = extra[offset];
       const int type = extra[offset + 1];
       if (length < 2 || offset + length > remaining) {
         break;
       }
-      if (type == UAC_DT_CS_INTERFACE &&
-          extra[offset + 2] == UAC_ST_FEATURE_UNIT && length >= 7) {
-        const int unit_id = extra[offset + 3];
-        const int control_size = extra[offset + 5];
-        const int master_controls = control_size >= 1 ? extra[offset + 6] : 0;
-        const uint16_t windex =
-            (uint16_t)((unit_id << 8) | alt->bInterfaceNumber);
-        if (master_controls & 0x01) {
-          /* Mute supported: force unmute on the master channel. */
-          uint8_t mute = 0;
-          const int rc = libusb_control_transfer(
-              usb_devh, 0x21, UAC_REQ_SET_CUR, (uint16_t)(UAC_CS_MUTE << 8),
-              windex, &mute, 1, 300);
-          UAC_STATS_LOGI("uac volume: unmute unit=%d rc=%d", unit_id, rc);
-        }
-        if (master_controls & 0x02) {
-          /* Volume supported: read the max and set it (1/256 dB units). */
-          uint8_t buf[2] = {0, 0};
-          int rc = libusb_control_transfer(
-              usb_devh, 0xa1, UAC_REQ_GET_MAX, (uint16_t)(UAC_CS_VOLUME << 8),
-              windex, buf, 2, 300);
-          if (rc == 2) {
-            const int16_t max_vol = (int16_t)(buf[0] | (buf[1] << 8));
-            rc = libusb_control_transfer(
-                usb_devh, 0x21, UAC_REQ_SET_CUR,
-                (uint16_t)(UAC_CS_VOLUME << 8), windex, buf, 2, 300);
+      if (type != UAC_DT_CS_INTERFACE) {
+        offset += length;
+        continue;
+      }
+      const int subtype = extra[offset + 2];
+      const unsigned char *d = extra + offset;
+      const uint16_t ifc = alt->bInterfaceNumber;
+      switch (subtype) {
+        case UAC_ST_INPUT_TERMINAL:
+          if (length >= 6) {
             UAC_STATS_LOGI(
-                "uac volume: set max unit=%d max=%d/256dB rc=%d",
-                unit_id, max_vol, rc);
-          } else {
-            UAC_STATS_LOGW("uac volume: GET_MAX failed unit=%d rc=%d", unit_id, rc);
+                "ac: input terminal id=%d type=0x%02x%02x ifc=%d",
+                d[3], d[5], d[4], ifc);
           }
-        }
-        libusb_free_config_descriptor(config);
-        return;
+          break;
+        case UAC_ST_OUTPUT_TERMINAL:
+          if (length >= 8) {
+            /* d[4..5]=wTerminalType, d[6]=bAssocTerminal, d[7]=bSourceID. */
+            UAC_STATS_LOGI(
+                "ac: output terminal id=%d type=0x%02x%02x source=%d ifc=%d",
+                d[3], d[5], d[4], d[7], ifc);
+          }
+          break;
+        case UAC_ST_SELECTOR_UNIT:
+          if (length >= 5) {
+            const int unit_id = d[3];
+            uint8_t cur = 0;
+            const int rc = libusb_control_transfer(
+                usb_devh, 0xa1, UAC_REQ_GET_CUR, 0,
+                (uint16_t)((unit_id << 8) | ifc), &cur, 1, 300);
+            UAC_STATS_LOGI(
+                "ac: selector unit=%d inputs=%d current=%d rc=%d ifc=%d",
+                unit_id, d[4], rc == 1 ? (int)cur : -1, rc, ifc);
+          }
+          break;
+        case UAC_ST_FEATURE_UNIT:
+          if (length >= 7) {
+            const int unit_id = d[3];
+            const int control_size = d[5];
+            if (control_size < 1 || control_size > 4) {
+              break;
+            }
+            /* Entry 0 is the master channel, then one per logical channel. */
+            const int entries = (length - 6) / control_size;
+            for (int ch = 0; ch < entries && ch < 9; ch++) {
+              const int controls = d[6 + ch * control_size];
+              const uint16_t windex = (uint16_t)((unit_id << 8) | ifc);
+              if (controls & 0x01) {
+                uint8_t mute = 0;
+                const int rc = libusb_control_transfer(
+                    usb_devh, 0x21, UAC_REQ_SET_CUR,
+                    (uint16_t)((UAC_CS_MUTE << 8) | ch),
+                    windex, &mute, 1, 300);
+                UAC_STATS_LOGI(
+                    "ac: unmute unit=%d ch=%d rc=%d", unit_id, ch, rc);
+              }
+              if (controls & 0x02) {
+                uint8_t buf[2] = {0, 0};
+                int rc = libusb_control_transfer(
+                    usb_devh, 0xa1, UAC_REQ_GET_MAX,
+                    (uint16_t)((UAC_CS_VOLUME << 8) | ch),
+                    windex, buf, 2, 300);
+                if (rc == 2) {
+                  const int16_t max_vol = (int16_t)(buf[0] | (buf[1] << 8));
+                  rc = libusb_control_transfer(
+                      usb_devh, 0x21, UAC_REQ_SET_CUR,
+                      (uint16_t)((UAC_CS_VOLUME << 8) | ch),
+                      windex, buf, 2, 300);
+                  UAC_STATS_LOGI(
+                      "ac: volume max unit=%d ch=%d max=%d/256dB rc=%d",
+                      unit_id, ch, max_vol, rc);
+                } else {
+                  UAC_STATS_LOGW(
+                      "ac: volume GET_MAX failed unit=%d ch=%d rc=%d",
+                      unit_id, ch, rc);
+                }
+              }
+            }
+            if (entries == 0) {
+              UAC_STATS_LOGI(
+                  "ac: feature unit=%d ifc=%d has no controls", unit_id, ifc);
+            }
+          }
+          break;
+        default:
+          UAC_STATS_LOGI(
+              "ac: unit subtype=0x%02x id=%d len=%d ifc=%d",
+              subtype, length >= 4 ? d[3] : -1, length, ifc);
+          break;
       }
       offset += length;
     }
   }
   libusb_free_config_descriptor(config);
-  UAC_STATS_LOGI("uac volume: no Feature Unit with volume control found");
 }
 
 // ---------------------------------------------------------------------------
@@ -509,15 +602,28 @@ uac_audio_t *uac_audio_start(
     return NULL;
   }
 
-  int rc = libusb_claim_interface(usb_devh, info->interface_no);
-  if (rc == LIBUSB_ERROR_BUSY) {
-    /* The kernel audio driver (snd-usb-audio) may hold the interface. */
-    libusb_detach_kernel_driver(usb_devh, info->interface_no);
+  /* A capture stopped moments ago can leave the interface briefly
+   * unclaimable (the altsetting-0 reset is still in flight); retry a few
+   * times before giving up. */
+  int rc = -1;
+  for (int attempt = 0; attempt < 3; attempt++) {
     rc = libusb_claim_interface(usb_devh, info->interface_no);
-  }
-  if (rc == 0) {
-    rc = libusb_set_interface_alt_setting(
-        usb_devh, info->interface_no, info->altsetting);
+    if (rc == LIBUSB_ERROR_BUSY) {
+      /* The kernel audio driver (snd-usb-audio) may hold the interface. */
+      libusb_detach_kernel_driver(usb_devh, info->interface_no);
+      rc = libusb_claim_interface(usb_devh, info->interface_no);
+    }
+    if (rc == 0) {
+      rc = libusb_set_interface_alt_setting(
+          usb_devh, info->interface_no, info->altsetting);
+    }
+    if (rc == 0) {
+      break;
+    }
+    if (attempt + 1 < 3) {
+      const struct timespec pause = {0, 50 * 1000 * 1000};
+      nanosleep(&pause, NULL);
+    }
   }
   if (rc != 0) {
     UAC_STATS_LOGW( "start: claim/altsetting failed rc=%d", rc);
@@ -525,9 +631,9 @@ uac_audio_t *uac_audio_start(
     return NULL;
   }
 
-  /* EP0 works without claiming the audio interface; try to raise the mic
-   * gain at the source before streaming starts. */
-  uac_try_max_volume(usb_devh);
+  /* EP0 works without claiming the audio interface; walk the AudioControl
+   * topology and raise every mic gain found before streaming starts. */
+  uac_configure_audio_controls(usb_devh);
 
   int submitted = 0;
   for (int i = 0; i < transfers_ready; i++) {

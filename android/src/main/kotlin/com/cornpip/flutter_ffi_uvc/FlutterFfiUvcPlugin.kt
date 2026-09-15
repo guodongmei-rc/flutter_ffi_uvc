@@ -12,6 +12,8 @@ import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
+import android.media.MediaCodecList
+import android.media.MediaFormat
 import android.media.MediaScannerConnection
 import android.os.Build
 import android.os.Environment
@@ -455,9 +457,9 @@ class FlutterFfiUvcPlugin :
                     result.error("unavailable", "Context not available", null)
                     return
                 }
-                // Passthrough: the active stream is already H.264/H.265, so the
-                // native layer writes the camera's own NAL stream to a temp
-                // file and stopVideoRecording remuxes it — no re-encoding.
+                // Passthrough (currently unused — Dart always re-encodes):
+                // the native layer writes the camera's own NAL stream to a
+                // temp file and stopVideoRecording remuxes it, no re-encode.
                 if (call.argument<Boolean>("passthrough") == true) {
                     val tempFile = File(context.cacheDir, "uvc_raw_${System.currentTimeMillis()}.bin")
                     val startResult = nativeRawRecStart(tempFile.absolutePath)
@@ -479,6 +481,15 @@ class FlutterFfiUvcPlugin :
                 }
                 val bitRate = call.argument<Number>("bitRate")?.toInt()
                 val frameRate = call.argument<Number>("frameRate")?.toInt() ?: 30
+                // The output codec follows the camera stream: H.265 stays
+                // H.265 when the device has an HEVC encoder, otherwise the
+                // recording falls back to H.264.
+                val videoMime =
+                    if (call.argument<String>("cameraFormat") == "H265" && hevcEncoderAvailable()) {
+                        MediaFormat.MIMETYPE_VIDEO_HEVC
+                    } else {
+                        MediaFormat.MIMETYPE_VIDEO_AVC
+                    }
                 val audioEncoder = if (call.argument<Boolean>("withAudio") ?: true) {
                     tryStartAudioCapture()?.let { AacAudioEncoder(it[0], it[1]) }
                 } else {
@@ -486,7 +497,7 @@ class FlutterFfiUvcPlugin :
                 }
                 try {
                     val recorder = VideoRecorder(
-                        context, width, height, bitRate, frameRate, audioEncoder,
+                        context, width, height, bitRate, frameRate, audioEncoder, videoMime,
                     )
                     val surface = recorder.start()
                     val attachResult = nativeAttachRecordingSurface(surface)
@@ -658,6 +669,15 @@ class FlutterFfiUvcPlugin :
             android.Manifest.permission.WRITE_EXTERNAL_STORAGE,
         ) == PackageManager.PERMISSION_GRANTED
     }
+
+    /** HEVC encoding is optional in the Android CDD; probe before selecting it. */
+    private fun hevcEncoderAvailable(): Boolean =
+        MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any { info ->
+            info.isEncoder &&
+                info.supportedTypes.any {
+                    it.equals(MediaFormat.MIMETYPE_VIDEO_HEVC, ignoreCase = true)
+                }
+        }
 
     /** Writes JPEG bytes into the device gallery. Returns uri/path of the entry. */
     private fun saveJpegToGallery(bytes: ByteArray): Map<String, String?> {

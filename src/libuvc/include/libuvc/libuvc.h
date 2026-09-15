@@ -487,6 +487,11 @@ typedef struct uvc_frame {
   void *metadata;
   /** Size of metadata buffer */
   size_t metadata_bytes;
+  /** Non-zero when the frame's data is incomplete: a USB transfer error or a
+   * missing EOF dropped payload bytes while the frame was being assembled.
+   * Decoders usually tolerate such frames; passthrough recordings of
+   * compressed streams must not include them. */
+  uint8_t data_corrupt;
 } uvc_frame_t;
 
 /** A callback function to handle incoming assembled UVC frames

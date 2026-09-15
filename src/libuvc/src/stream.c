@@ -706,6 +706,7 @@ void _uvc_swap_buffers(uvc_stream_handle_t *strmh) {
   /* swap the buffers */
   tmp_buf = strmh->holdbuf;
   strmh->hold_bytes = strmh->got_bytes;
+  strmh->hold_corrupt = strmh->outbuf_corrupt;
   strmh->holdbuf = strmh->outbuf;
   strmh->outbuf = tmp_buf;
   strmh->hold_last_scr = strmh->last_scr;
@@ -723,6 +724,7 @@ void _uvc_swap_buffers(uvc_stream_handle_t *strmh) {
 
   strmh->seq++;
   strmh->got_bytes = 0;
+  strmh->outbuf_corrupt = 0;
   strmh->meta_got_bytes = 0;
   strmh->last_scr = 0;
   strmh->pts = 0;
@@ -772,6 +774,7 @@ void _uvc_process_payload(uvc_stream_handle_t *strmh, uint8_t *payload, size_t p
 
     if (header_len > payload_len) {
       UVC_DEBUG("bogus packet: actual_len=%zd, header_len=%zd\n", payload_len, header_len);
+      strmh->outbuf_corrupt = 1;
       return;
     }
 
@@ -791,13 +794,19 @@ void _uvc_process_payload(uvc_stream_handle_t *strmh, uint8_t *payload, size_t p
 
     if (header_info & 0x40) {
       UVC_DEBUG("bad packet: error bit set");
+      /* The payload bytes are lost but the frame keeps assembling; flag it so
+       * consumers (e.g. passthrough recording) can discard the incomplete
+       * frame instead of trusting its data. */
+      strmh->outbuf_corrupt = 1;
       return;
     }
 
     if (strmh->fid != (header_info & 1) && strmh->got_bytes != 0) {
       /* The frame ID bit was flipped, but we have image data sitting
          around from prior transfers. This means the camera didn't send
-         an EOF for the last transfer of the previous frame. */
+         an EOF for the last transfer of the previous frame: the frame
+         being published is incomplete. */
+      strmh->outbuf_corrupt = 1;
       _uvc_swap_buffers(strmh);
     }
 
@@ -878,6 +887,10 @@ void LIBUSB_CALL _uvc_stream_callback(struct libusb_transfer *transfer) {
 
         if (pkt->status != 0) {
           UVC_DEBUG("bad packet (isochronous transfer); status: %d", pkt->status);
+          /* The packet's payload bytes are lost while the frame keeps
+           * assembling; flag it so consumers can discard the incomplete
+           * frame. */
+          strmh->outbuf_corrupt = 1;
           continue;
         }
 
@@ -1560,6 +1573,7 @@ void _uvc_populate_frame(uvc_stream_handle_t *strmh) {
 
   frame->sequence = strmh->hold_seq;
   frame->capture_time_finished = strmh->capture_time_finished;
+  frame->data_corrupt = strmh->hold_corrupt;
 
   /* copy the image data from the hold buffer to the frame (unnecessary extra buf?) */
   if (frame->data_bytes < strmh->hold_bytes) {

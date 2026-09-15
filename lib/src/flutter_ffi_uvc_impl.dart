@@ -354,15 +354,17 @@ class _FlutterFfiUvcCamera implements UvcCamera {
     _ensureAndroid();
     await _requireGalleryPermission();
 
-    // H.264/H.265 streams are recorded passthrough: the native layer writes
-    // the camera's own NAL stream and the platform remuxes it, instead of
-    // re-encoding RGBA frames (which compressed formats don't produce).
+    // Every format is re-encoded by the platform recorder: camera frames are
+    // decoded and hardware-encoded fresh, so undetectable corruption in the
+    // camera's own stream can never leak into the recording (passthrough of
+    // H.264/H.265 streams was abandoned for that reason). The output codec
+    // follows the camera format — the platform keeps H.265 when the device
+    // has an HEVC encoder and falls back to H.264 otherwise.
     final String? formatName = _lastPreviewRequest?.mode.formatName;
-    final bool passthrough = formatName == 'H264' || formatName == 'H265';
 
     final int frameWidth;
     final int frameHeight;
-    if (passthrough) {
+    if (formatName == 'H264' || formatName == 'H265') {
       // Compressed formats never touch the RGBA staging path, so
       // uvc_frame_width/height stay 0; the decoder-rendered frame sequence
       // is the liveness signal instead.
@@ -404,7 +406,7 @@ class _FlutterFfiUvcCamera implements UvcCamera {
         'height': height,
         'bitRate': ?bitRate,
         'frameRate': effectiveFrameRate,
-        'passthrough': passthrough,
+        'cameraFormat': formatName,
         'withAudio': withAudio,
       },
     );

@@ -22,6 +22,11 @@ struct h26x_rawrec {
   uint64_t au_pts_us;
   int au_keyframe;
   uint32_t au_count;
+  uint32_t aus_dropped;
+  /* Set by h26x_rawrec_mark_corrupt (any thread), cleared by the writer
+   * thread once a complete keyframe AU is written. While set, the open AU
+   * is abandoned and completed non-keyframe AUs are discarded. */
+  volatile int drop_until_keyframe;
 };
 
 static size_t rawrec_start_code_at(const uint8_t *data, size_t bytes, size_t offset) {
@@ -57,6 +62,18 @@ static void rawrec_write_u64le(FILE *file, uint64_t value) {
 static void rawrec_flush_au(h26x_rawrec_t *rec) {
   if (rec->au_bytes == 0) {
     return;
+  }
+  if (rec->drop_until_keyframe) {
+    if (!rec->au_keyframe) {
+      /* Non-keyframe AUs reference the corrupt data; discard them. */
+      rec->aus_dropped += 1;
+      rec->au_bytes = 0;
+      rec->au_keyframe = 0;
+      return;
+    }
+    /* First complete keyframe AU after the corruption: self-contained
+     * again, resume recording. */
+    rec->drop_until_keyframe = 0;
   }
   rawrec_write_u64le(rec->file, rec->au_pts_us);
   rawrec_write_u32le(rec->file, (uint32_t)rec->au_bytes);
@@ -143,6 +160,14 @@ void h26x_rawrec_write_nal(
     uint64_t pts_us) {
   if (rec == NULL || data == NULL || bytes == 0) {
     return;
+  }
+
+  /* The source stream was marked corrupt since the last write: the AU being
+   * assembled may span the corruption. Abandon it; rawrec_flush_au discards
+   * completed AUs until the next keyframe resumes the recording. */
+  if (rec->drop_until_keyframe && rec->au_bytes > 0) {
+    rec->au_bytes = 0;
+    rec->au_keyframe = 0;
   }
 
   size_t offset = 0;
@@ -252,8 +277,19 @@ uint32_t h26x_rawrec_stop(h26x_rawrec_t *rec) {
   rawrec_flush_au(rec);
   fclose(rec->file);
   const uint32_t count = rec->au_count;
-  UVC_LOGI(RAWREC_LOG_TAG, "recording stopped aus=%u", count);
+  UVC_LOGI(
+      RAWREC_LOG_TAG,
+      "recording stopped aus=%u dropped_corrupt=%u",
+      count,
+      rec->aus_dropped);
   free(rec->au);
   free(rec);
   return count;
+}
+
+void h26x_rawrec_mark_corrupt(h26x_rawrec_t *rec) {
+  if (rec == NULL) {
+    return;
+  }
+  rec->drop_until_keyframe = 1;
 }

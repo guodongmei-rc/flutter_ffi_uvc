@@ -21,11 +21,13 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * Hardware H.264 recorder fed by the native layer.
+ * Hardware H.264/H.265 recorder fed by the native layer.
  *
  * [start] returns the encoder input [Surface]; the caller attaches it to the
  * native frame pipeline, which renders every preview frame into it. Encoded
  * output is muxed into an MP4 published to the device gallery (MediaStore).
+ * [mimeType] selects the encoder ([MediaFormat.MIMETYPE_VIDEO_AVC] or
+ * [MediaFormat.MIMETYPE_VIDEO_HEVC]); the caller probes availability first.
  *
  * When [audioEncoder] is given, an AAC audio track (PCM from the camera's
  * UAC interface, see AacAudioEncoder) is muxed alongside; the muxer then
@@ -40,10 +42,10 @@ internal class VideoRecorder(
     bitRate: Int?,
     private val frameRate: Int,
     private val audioEncoder: AacAudioEncoder? = null,
+    private val mimeType: String = MediaFormat.MIMETYPE_VIDEO_AVC,
 ) {
     companion object {
         private const val TAG = "flutter_ffi_uvc"
-        private const val MIME_TYPE = MediaFormat.MIMETYPE_VIDEO_AVC
         private const val DRAIN_TIMEOUT_US = 10_000L
         private const val STOP_JOIN_TIMEOUT_MS = 3_000L
     }
@@ -88,7 +90,7 @@ internal class VideoRecorder(
     fun start(): Surface {
         require(width > 0 && height > 0) { "Invalid recording size ${width}x$height" }
         require(width % 2 == 0 && height % 2 == 0) {
-            "H.264 encoding requires even dimensions, got ${width}x$height"
+            "Video encoding requires even dimensions, got ${width}x$height"
         }
 
         try {
@@ -98,7 +100,7 @@ internal class VideoRecorder(
             audioStarted = startAudioEncoder()
             tracksExpected = if (audioStarted) 2 else 1
 
-            val format = MediaFormat.createVideoFormat(MIME_TYPE, width, height).apply {
+            val format = MediaFormat.createVideoFormat(mimeType, width, height).apply {
                 setInteger(
                     MediaFormat.KEY_COLOR_FORMAT,
                     MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface,
@@ -107,7 +109,7 @@ internal class VideoRecorder(
                 setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             }
-            val encoder = MediaCodec.createEncoderByType(MIME_TYPE)
+            val encoder = MediaCodec.createEncoderByType(mimeType)
             encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             val surface = encoder.createInputSurface()
             encoder.start()

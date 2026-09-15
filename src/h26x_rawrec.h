@@ -46,6 +46,13 @@ void h26x_rawrec_write_nal(
  * freed. */
 uint32_t h26x_rawrec_stop(h26x_rawrec_t *rec);
 
+/* Marks the source stream corrupt: a camera frame was lost or arrived with
+ * missing payload bytes. The access unit currently being assembled may be
+ * incomplete and every access unit up to the next keyframe references
+ * corrupt data, so the recorder discards all of them and resumes at the
+ * first complete keyframe AU. Thread-safe against h26x_rawrec_write_nal. */
+void h26x_rawrec_mark_corrupt(h26x_rawrec_t *rec);
+
 #ifdef __cplusplus
 }
 #endif

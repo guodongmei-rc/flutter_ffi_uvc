@@ -108,6 +108,14 @@ typedef struct {
   // compressed-video frame of a session, destroyed on stop/close. Renders
   // directly into preview_window.
   h26x_decoder_t *h26x_decoder;
+#if defined(__ANDROID__)
+  // Second decoder instance feeding the recording window for H.264/H.265
+  // streams: compressed frames bypass the RGBA staging path, so the
+  // re-encode recorder can only receive them through a decoder that renders
+  // straight into the recording surface. Created lazily while a recording
+  // window is attached, destroyed with it.
+  h26x_decoder_t *h26x_rec_decoder;
+#endif
   // Passthrough recorder for H.264/H.265 streams; active while a raw
   // recording session is in progress, auto-stopped on stop/close.
   h26x_rawrec_t *h26x_rawrec;
@@ -215,13 +223,16 @@ static int rec_writer_start(h26x_rawrec_t *rawrec) {
 }
 
 // Enqueues a copy of one compressed frame. Returns 0 on success; on queue
-// overflow the frame is dropped (and logged) — the only remaining loss
-// path, reachable only when storage stalls for ~1s straight.
+// overflow the frame is dropped (and logged) and the rawrec is marked
+// corrupt so the recording discards AUs until the next keyframe.
 static int rec_writer_push(const uint8_t *data, size_t bytes, uint64_t pts_us) {
   pthread_mutex_lock(&g_rec_writer.mutex);
   if (!g_rec_writer.thread_started ||
       g_rec_writer.count == REC_WRITER_QUEUE_CAPACITY) {
     g_rec_writer.dropped_frames += 1;
+    if (g_rec_writer.rawrec != NULL) {
+      h26x_rawrec_mark_corrupt(g_rec_writer.rawrec);
+    }
     if ((g_rec_writer.dropped_frames & 0x3f) == 1) {
       UVC_LOGW(
           REC_WRITER_LOG_TAG,
@@ -234,6 +245,9 @@ static int rec_writer_push(const uint8_t *data, size_t bytes, uint64_t pts_us) {
   uint8_t *copy = malloc(bytes);
   if (copy == NULL) {
     g_rec_writer.dropped_frames += 1;
+    if (g_rec_writer.rawrec != NULL) {
+      h26x_rawrec_mark_corrupt(g_rec_writer.rawrec);
+    }
     pthread_mutex_unlock(&g_rec_writer.mutex);
     return -1;
   }
@@ -574,6 +588,11 @@ static void release_preview_window_locked(void) {
 }
 
 static void release_recording_window_locked(void) {
+  /* The rec decoder is NOT destroyed here: frame callbacks feed it outside
+   * the state mutex, so destroying it on this thread could free the codec
+   * mid-feed. It is destroyed only after callbacks are drained
+   * (finish_stop_preview_locked / close_device_resources_locked); a new
+   * recording window is adopted by the callback thread via reconfigure. */
   if (g_uvc_state.recording_window == NULL) {
     return;
   }
@@ -681,6 +700,12 @@ static void finish_stop_preview_locked(void) {
     h26x_decoder_destroy(g_uvc_state.h26x_decoder);
     g_uvc_state.h26x_decoder = NULL;
   }
+#if defined(__ANDROID__)
+  if (g_uvc_state.h26x_rec_decoder != NULL) {
+    h26x_decoder_destroy(g_uvc_state.h26x_rec_decoder);
+    g_uvc_state.h26x_rec_decoder = NULL;
+  }
+#endif
   g_uvc_state.stopping_preview = 0;
 }
 
@@ -703,6 +728,10 @@ static void close_device_resources_locked(void) {
     g_uvc_state.h26x_decoder = NULL;
   }
 #if defined(__ANDROID__)
+  if (g_uvc_state.h26x_rec_decoder != NULL) {
+    h26x_decoder_destroy(g_uvc_state.h26x_rec_decoder);
+    g_uvc_state.h26x_rec_decoder = NULL;
+  }
   release_preview_window_locked();
   release_recording_window_locked();
 #endif
@@ -919,6 +948,9 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
         g_uvc_state.stats.last_source_sequence,
         frame->sequence,
         frame->sequence - g_uvc_state.stats.last_source_sequence - 1);
+    if (g_uvc_state.h26x_rawrec != NULL) {
+      h26x_rawrec_mark_corrupt(g_uvc_state.h26x_rawrec);
+    }
   }
   g_uvc_state.stats.last_source_sequence = frame->sequence;
   g_uvc_state.stats.has_last_source_sequence = 1;
@@ -946,18 +978,40 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
     }
     // Passthrough recording: queue a copy of the raw NAL stream for the
     // writer thread. The copy keeps frame->data lifetime simple and keeps
-    // fwrite stalls off this callback thread (a stall here would cost whole
-    // compressed frames and corrupt the recording until the next IDR).
+    // fwrite stalls off this callback thread. Frames with lost payload bytes
+    // (data_corrupt) are never recorded: they would poison every P-frame
+    // until the next IDR, so the rawrec drops that span instead.
     if (g_uvc_state.h26x_rawrec != NULL) {
-      rec_writer_push(
-          (const uint8_t *)frame->data,
-          frame->data_bytes,
-          callback_monotonic_ns / 1000ull);
+      if (frame->data_corrupt) {
+        h26x_rawrec_mark_corrupt(g_uvc_state.h26x_rawrec);
+      } else {
+        rec_writer_push(
+            (const uint8_t *)frame->data,
+            frame->data_bytes,
+            callback_monotonic_ns / 1000ull);
+      }
     }
 #if defined(__ANDROID__)
     ANativeWindow *window = g_uvc_state.preview_window;
     if (window != NULL) {
       ANativeWindow_acquire(window);
+    }
+    // Re-encode recording path: compressed frames bypass the RGBA staging
+    // path, so a second decoder instance renders them into the recording
+    // surface (the video encoder's input) directly.
+    ANativeWindow *rec_window = g_uvc_state.recording_window;
+    h26x_decoder_t *rec_decoder = NULL;
+    if (rec_window != NULL) {
+      ANativeWindow_acquire(rec_window);
+      if (g_uvc_state.h26x_rec_decoder == NULL) {
+        g_uvc_state.h26x_rec_decoder = h26x_decoder_create(
+            frame->frame_format == UVC_FRAME_FORMAT_H265
+                ? H26X_CODEC_H265
+                : H26X_CODEC_H264,
+            (int)frame->width,
+            (int)frame->height);
+      }
+      rec_decoder = g_uvc_state.h26x_rec_decoder;
     }
     if (g_uvc_state.h26x_decoder == NULL) {
       g_uvc_state.h26x_decoder = h26x_decoder_create(
@@ -981,6 +1035,23 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
     }
     if (window != NULL) {
       ANativeWindow_release(window);
+    }
+    if (rec_decoder != NULL) {
+      // Recording never breaks the preview: a recording-decoder failure only
+      // drops that decoder; the next frame lazily creates a fresh one.
+      if (h26x_decoder_feed(
+              rec_decoder,
+              rec_window,
+              (const uint8_t *)frame->data,
+              frame->data_bytes) == H26X_FEED_ERROR) {
+        pthread_mutex_lock(&g_uvc_state.mutex);
+        if (g_uvc_state.h26x_rec_decoder == rec_decoder) {
+          h26x_decoder_destroy(g_uvc_state.h26x_rec_decoder);
+          g_uvc_state.h26x_rec_decoder = NULL;
+        }
+        pthread_mutex_unlock(&g_uvc_state.mutex);
+      }
+      ANativeWindow_release(rec_window);
     }
 
     pthread_mutex_lock(&g_uvc_state.mutex);

@@ -36,6 +36,8 @@ internal object RawVideoMuxer {
 
     private class AudioSample(val ptsUs: Long, val payload: ByteArray)
 
+    private class VideoSample(val ptsUs: Long, val payload: ByteArray, val keyframe: Boolean)
+
     private class AudioHeader(
         val file: RandomAccessFile,
         val sampleRate: Int,
@@ -89,12 +91,13 @@ internal object RawVideoMuxer {
 
     /**
      * Audio sample PTS on the normalized video timeline: absolute monotonic
-     * (base + relative) minus the first video frame's PTS, clamped to 0 for
-     * audio that predates the first frame.
+     * (base + relative) minus the first video frame's PTS. Negative for audio
+     * captured before the first video frame — callers drop those samples
+     * instead of clamping them, which would pile them all at PTS 0.
      */
     private fun audioPtsUs(header: AudioHeader?, sample: AudioSample, videoBaseUs: Long): Long {
         val base = header?.baseUs ?: 0L
-        return (base + sample.ptsUs - videoBaseUs).coerceAtLeast(0L)
+        return base + sample.ptsUs - videoBaseUs
     }
 
     /**
@@ -194,30 +197,29 @@ internal object RawVideoMuxer {
 
                     val info = MediaCodec.BufferInfo()
                     var nextAudio = readAudioSample(audioHeader)
-                    // Video PTS in the temp file are absolute monotonic µs;
-                    // normalize the track so the first frame sits at 0, and
-                    // shift audio (base_us + relative pts) onto the same zero
-                    // so the two tracks play in sync.
+                    // Video PTS in the temp file are absolute monotonic µs.
+                    // The track starts at the first keyframe: access units
+                    // recorded before it joined the stream mid-GOP and are
+                    // undecodable, so they are dropped and the first
+                    // keyframe's PTS becomes the zero point. Audio predating
+                    // that zero point is dropped rather than clamped, which
+                    // would pile every early sample at PTS 0.
                     var videoBaseUs = -1L
-                    while (true) {
-                        val ptsUs = raf.readLongLE() ?: break
-                        val payloadLen = raf.readIntLE() ?: break
-                        val flags = raf.read()
-                        if (payloadLen <= 0 || payloadLen > 64 * 1024 * 1024) break
-                        val payload = ByteArray(payloadLen)
-                        raf.readFully(payload)
-                        if (videoBaseUs < 0) videoBaseUs = ptsUs
-                        // Flush every audio sample up to this video PTS first
-                        // so the two tracks stay interleaved in time.
-                        while (nextAudio != null &&
-                            audioPtsUs(audioHeader, nextAudio!!, videoBaseUs) <= ptsUs - videoBaseUs
-                        ) {
-                            info.set(
-                                0,
-                                nextAudio!!.payload.size,
-                                audioPtsUs(audioHeader, nextAudio!!, videoBaseUs),
-                                0,
-                            )
+                    var pendingVideo: MutableList<VideoSample>? = mutableListOf()
+
+                    // Flushes every audio sample up to this video PTS first so
+                    // the two tracks stay interleaved in time, then writes the
+                    // video sample itself.
+                    fun writeSample(sample: VideoSample) {
+                        while (nextAudio != null) {
+                            val audioPts = audioPtsUs(audioHeader, nextAudio!!, videoBaseUs)
+                            if (audioPts < 0) {
+                                // Captured before the first video frame; drop.
+                                nextAudio = readAudioSample(audioHeader)
+                                continue
+                            }
+                            if (audioPts > sample.ptsUs - videoBaseUs) break
+                            info.set(0, nextAudio!!.payload.size, audioPts, 0)
                             muxer.writeSampleData(
                                 audioTrackIndex,
                                 ByteBuffer.wrap(nextAudio!!.payload),
@@ -228,31 +230,52 @@ internal object RawVideoMuxer {
                         }
                         info.set(
                             0,
-                            payloadLen,
-                            ptsUs - videoBaseUs,
-                            if (flags and FLAG_KEYFRAME != 0) {
-                                MediaCodec.BUFFER_FLAG_KEY_FRAME
-                            } else {
-                                0
-                            },
+                            sample.payload.size,
+                            sample.ptsUs - videoBaseUs,
+                            if (sample.keyframe) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0,
                         )
-                        muxer.writeSampleData(trackIndex, ByteBuffer.wrap(payload), info)
+                        muxer.writeSampleData(trackIndex, ByteBuffer.wrap(sample.payload), info)
                         sampleCount += 1
+                    }
+
+                    while (true) {
+                        val ptsUs = raf.readLongLE() ?: break
+                        val payloadLen = raf.readIntLE() ?: break
+                        val flags = raf.read()
+                        if (payloadLen <= 0 || payloadLen > 64 * 1024 * 1024) break
+                        val payload = ByteArray(payloadLen)
+                        raf.readFully(payload)
+                        val sample = VideoSample(ptsUs, payload, flags and FLAG_KEYFRAME != 0)
+                        if (videoBaseUs < 0) {
+                            if (sample.keyframe) {
+                                videoBaseUs = sample.ptsUs
+                                pendingVideo = null
+                                writeSample(sample)
+                            } else {
+                                // Buffered only as a fallback for a recording
+                                // without any keyframe; normally discarded.
+                                pendingVideo!!.add(sample)
+                            }
+                            continue
+                        }
+                        writeSample(sample)
+                    }
+                    if (videoBaseUs < 0 && !pendingVideo.isNullOrEmpty()) {
+                        videoBaseUs = pendingVideo!![0].ptsUs
+                        for (sample in pendingVideo!!) writeSample(sample)
                     }
                     // Audio tail past the last video frame.
                     while (nextAudio != null) {
-                        info.set(
-                            0,
-                            nextAudio!!.payload.size,
-                            audioPtsUs(audioHeader, nextAudio!!, videoBaseUs),
-                            0,
-                        )
-                        muxer.writeSampleData(
-                            audioTrackIndex,
-                            ByteBuffer.wrap(nextAudio!!.payload),
-                            info,
-                        )
-                        audioSampleCount += 1
+                        val audioPts = audioPtsUs(audioHeader, nextAudio!!, videoBaseUs)
+                        if (audioPts >= 0) {
+                            info.set(0, nextAudio!!.payload.size, audioPts, 0)
+                            muxer.writeSampleData(
+                                audioTrackIndex,
+                                ByteBuffer.wrap(nextAudio!!.payload),
+                                info,
+                            )
+                            audioSampleCount += 1
+                        }
                         nextAudio = readAudioSample(audioHeader)
                     }
                     require(sampleCount > 0) { "No access units in raw recording" }

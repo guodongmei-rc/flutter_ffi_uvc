@@ -19,11 +19,14 @@ internal class AacAudioEncoder(
     private val sampleRate: Int,
     private val channelCount: Int,
     /**
-     * Linear gain applied to the PCM before encoding. Camera mics often run
-     * at a very low level (observed peaks of ~100 on a 32767 full scale), so
-     * the default boosts 8x with saturation.
+     * Fixed linear gain applied to the PCM before encoding, or 0 (the
+     * default) for automatic gain control. Camera mics often run at a very
+     * low level (observed peaks of ~100 on a 32767 full scale) and many
+     * expose no UAC volume control to raise it at the source, so the AGC
+     * amplifies active speech up to [AGC_MAX_GAIN] and relaxes toward
+     * [AGC_MIN_GAIN] during silence to avoid amplifying pure noise floor.
      */
-    private val pcmGain: Float = 8f,
+    private val pcmGain: Float = 0f,
 ) {
     companion object {
         private const val TAG = "flutter_ffi_uvc"
@@ -32,6 +35,13 @@ internal class AacAudioEncoder(
         private const val READ_TIMEOUT_MS = 200
         private const val QUEUE_TIMEOUT_US = 10_000L
         private const val JOIN_TIMEOUT_MS = 3_000L
+
+        private const val AGC_TARGET_PEAK = 12000f  // ≈ -8.7 dBFS
+        private const val AGC_MAX_GAIN = 32f
+        private const val AGC_MIN_GAIN = 2f
+        private const val AGC_NOISE_FLOOR = 350
+        private const val AGC_RELEASE = 0.05f  // per ~21ms chunk toward target
+        private const val AGC_SILENCE_DECAY = 0.995f  // per chunk while silent
     }
 
     /** Called on the drain thread when the codec output format is known. */
@@ -90,17 +100,46 @@ internal class AacAudioEncoder(
 
     private fun nowUs(): Long = (System.nanoTime() - startNanos) / 1_000
 
-    /** Applies [pcmGain] to little-endian 16-bit PCM in place, saturating. */
+    /** Applies the effective gain to little-endian 16-bit PCM in place, saturating. */
     private fun applyGain(pcm: ByteBuffer, bytes: Int) {
-        if (pcmGain == 1f) return
         pcm.order(ByteOrder.LITTLE_ENDIAN)
+        val gain = if (pcmGain > 0f) pcmGain else updateAgcGain(pcm, bytes)
         var i = 0
         while (i + 1 < bytes) {
             val s = pcm.getShort(i)
-            val amplified = (s * pcmGain).toInt().coerceIn(-32768, 32767)
+            val amplified = (s * gain).toInt().coerceIn(-32768, 32767)
             pcm.putShort(i, amplified.toShort())
             i += 2
         }
+    }
+
+    // AGC state for the default (pcmGain == 0) mode.
+    private var agcGain = 8f
+
+    /**
+     * Adapts [agcGain] from this chunk's peak: fast attack when speech would
+     * clip, slow release upward, and a slow decay toward [AGC_MIN_GAIN] while
+     * the input sits at the noise floor so silence stays quiet.
+     */
+    private fun updateAgcGain(pcm: ByteBuffer, bytes: Int): Float {
+        var peak = 0
+        var i = 0
+        while (i + 1 < bytes) {
+            val a = pcm.getShort(i).toInt().let { if (it < 0) -it else it }
+            if (a > peak) peak = a
+            i += 2
+        }
+        if (peak > AGC_NOISE_FLOOR) {
+            val desired = (AGC_TARGET_PEAK / peak).coerceIn(AGC_MIN_GAIN, AGC_MAX_GAIN)
+            agcGain = if (desired < agcGain) {
+                desired // attack immediately: clipping sounds worse than a dip
+            } else {
+                agcGain + (desired - agcGain) * AGC_RELEASE
+            }
+        } else {
+            agcGain = (agcGain * AGC_SILENCE_DECAY).coerceAtLeast(AGC_MIN_GAIN)
+        }
+        return agcGain
     }
 
     private fun feedLoop(encoder: MediaCodec) {

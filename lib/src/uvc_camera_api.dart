@@ -1366,8 +1366,14 @@ abstract interface class UvcCamera {
   /// [PlatformException] if saving to the gallery fails.
   Future<UvcGalleryMedia> takePicture({int quality = 90});
 
-  /// Starts recording the preview stream as an H.264/MP4 video destined for
+  /// Starts recording the preview stream as an MP4 video destined for
   /// the device gallery. Android only.
+  ///
+  /// Every camera format is decoded and re-encoded by the hardware encoder,
+  /// so corruption in the camera's own bitstream can never leak into the
+  /// recording. The output codec follows the camera format: an H.265 stream
+  /// is recorded as H.265 when the device has an HEVC encoder, otherwise the
+  /// recording falls back to H.264; all other formats are recorded as H.264.
   ///
   /// Gallery permission is re-checked (and requested if needed) on every call;
   /// if it is not granted the recording does not start and a [UvcException]
