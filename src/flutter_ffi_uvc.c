@@ -25,6 +25,7 @@
 #include "h26x_rawrec.h"
 
 #if defined(__ANDROID__)
+#include "imu_capture.h"
 #include "uac_audio.h"
 #endif
 
@@ -124,6 +125,10 @@ typedef struct {
   // stopped via JNI from the platform recorder. Stopped (never just leaked)
   // before the USB device handle is closed.
   uac_audio_t *audio;
+  // Vendor-specific Bulk IN IMU (gyroscope) capture; started and stopped
+  // manually via uvc_imu_start/uvc_imu_stop. Stopped before the USB device
+  // handle is closed.
+  imu_capture_t *imu;
 #endif
   int preview_rotation;  // 0, 90, 180, 270 (clockwise)
   int preview_flip_h;    // mirror left-right
@@ -721,6 +726,13 @@ static void close_device_resources_locked(void) {
     // the audio session's own mutex, never g_uvc_state.mutex.
     uac_audio_stop(g_uvc_state.audio);
     g_uvc_state.audio = NULL;
+  }
+  if (g_uvc_state.imu != NULL) {
+    // Same ordering for the IMU bulk capture: it must be stopped (and its
+    // interface released) before uvc_close frees the libusb handle. Its
+    // callbacks only take the IMU session's own mutex.
+    imu_capture_stop(g_uvc_state.imu);
+    g_uvc_state.imu = NULL;
   }
 #endif
   if (g_uvc_state.h26x_decoder != NULL) {
@@ -2146,6 +2158,73 @@ Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_stop(
   }
   pthread_mutex_unlock(&g_uvc_state.mutex);
   return UVC_SUCCESS;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// IMU gyroscope capture (uvc_imu_start/stop). Android-only: the vendor-
+// specific Bulk IN interface is read with libusb async transfers serviced by
+// the libuvc event thread. Samples are parsed and printed to logcat; no data
+// is delivered to Dart yet.
+// ---------------------------------------------------------------------------
+
+#if defined(__ANDROID__)
+FFI_PLUGIN_EXPORT int uvc_imu_start(void) {
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  int result = UVC_SUCCESS;
+  if (g_uvc_state.imu != NULL) {
+    // Already running: treat as success, matching the manual start/stop
+    // contract.
+  } else if (g_uvc_state.devh == NULL) {
+    set_last_error("Camera is not open");
+    result = UVC_ERROR_NO_DEVICE;
+  } else {
+    imu_capture_info_t info;
+    if (imu_capture_probe(g_uvc_state.devh->usb_devh, &info) != 0) {
+      set_last_error("No IMU Bulk IN interface found on this device");
+      result = UVC_ERROR_INVALID_DEVICE;
+    } else {
+      g_uvc_state.imu = imu_capture_start(g_uvc_state.devh->usb_devh, &info);
+      if (g_uvc_state.imu == NULL) {
+        set_last_error("Failed to start IMU capture");
+        result = UVC_ERROR_IO;
+      }
+    }
+  }
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+  if (result == UVC_SUCCESS) {
+    clear_last_error();
+  }
+  return result;
+}
+
+FFI_PLUGIN_EXPORT void uvc_imu_stop(void) {
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  if (g_uvc_state.imu != NULL) {
+    // Blocks until bulk callbacks drain; they only take the IMU session's
+    // own mutex, never g_uvc_state.mutex.
+    imu_capture_stop(g_uvc_state.imu);
+    g_uvc_state.imu = NULL;
+  }
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+}
+
+FFI_PLUGIN_EXPORT int uvc_imu_is_running(void) {
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  const int running = imu_capture_is_running(g_uvc_state.imu);
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+  return running;
+}
+#else
+FFI_PLUGIN_EXPORT int uvc_imu_start(void) {
+  set_last_error("IMU capture is only supported on Android");
+  return UVC_ERROR_OTHER;
+}
+
+FFI_PLUGIN_EXPORT void uvc_imu_stop(void) {}
+
+FFI_PLUGIN_EXPORT int uvc_imu_is_running(void) {
+  return 0;
 }
 #endif
 

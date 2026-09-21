@@ -80,6 +80,8 @@ add_library(flutter_ffi_uvc SHARED
 # UAC microphone capture for video recording (isochronous PCM over libusb).
 if(ANDROID)
   target_sources(flutter_ffi_uvc PRIVATE "uac_audio.c")
+  # IMU gyroscope capture (vendor-specific Bulk IN over libusb).
+  target_sources(flutter_ffi_uvc PRIVATE "imu_capture.c")
 endif()
 
 set_target_properties(flutter_ffi_uvc PROPERTIES

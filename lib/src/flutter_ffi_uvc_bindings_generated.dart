@@ -357,6 +357,42 @@ class FlutterFfiUvcBindings {
   late final _uvc_set_log_level = _uvc_set_log_levelPtr
       .asFunction<void Function(int)>();
 
+  /// IMU gyroscope capture. Android only.
+  ///
+  /// Some cameras expose gyroscope/accelerometer data as a vendor-specific
+  /// (class 0xFF) USB interface with a Bulk IN endpoint next to the video
+  /// interfaces. uvc_imu_start probes for that interface on the opened device
+  /// and starts capturing; received Gyroflow-framed IMU samples are currently
+  /// only printed to logcat, not delivered to Dart.
+  ///
+  /// uvc_imu_start returns 0 on success (including when capture is already
+  /// running), or a negative error code (see uvc_last_error) when no device is
+  /// open, no IMU interface exists, or the capture fails to start.
+  int uvc_imu_start() {
+    return _uvc_imu_start();
+  }
+
+  late final _uvc_imu_startPtr =
+      _lookup<ffi.NativeFunction<ffi.Int Function()>>('uvc_imu_start');
+  late final _uvc_imu_start = _uvc_imu_startPtr.asFunction<int Function()>();
+
+  void uvc_imu_stop() {
+    return _uvc_imu_stop();
+  }
+
+  late final _uvc_imu_stopPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function()>>('uvc_imu_stop');
+  late final _uvc_imu_stop = _uvc_imu_stopPtr.asFunction<void Function()>();
+
+  int uvc_imu_is_running() {
+    return _uvc_imu_is_running();
+  }
+
+  late final _uvc_imu_is_runningPtr =
+      _lookup<ffi.NativeFunction<ffi.Int Function()>>('uvc_imu_is_running');
+  late final _uvc_imu_is_running = _uvc_imu_is_runningPtr
+      .asFunction<int Function()>();
+
   /// Preview transform: rotation is 0, 90, 180, or 270 (clockwise degrees).
   /// flip_h mirrors the output left-right; flip_v mirrors it top-bottom.
   /// Transforms are applied during preview blit to the attached Flutter Texture

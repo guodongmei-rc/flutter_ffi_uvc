@@ -85,6 +85,21 @@ FFI_PLUGIN_EXPORT int uvc_get_supported_modes_json(uint8_t *buffer, int buffer_l
 FFI_PLUGIN_EXPORT const char *uvc_last_error(void);
 FFI_PLUGIN_EXPORT void uvc_set_log_level(int level);
 
+// IMU gyroscope capture. Android only.
+//
+// Some cameras expose gyroscope/accelerometer data as a vendor-specific
+// (class 0xFF) USB interface with a Bulk IN endpoint next to the video
+// interfaces. uvc_imu_start probes for that interface on the opened device
+// and starts capturing; received Gyroflow-framed IMU samples are currently
+// only printed to logcat, not delivered to Dart.
+//
+// uvc_imu_start returns 0 on success (including when capture is already
+// running), or a negative error code (see uvc_last_error) when no device is
+// open, no IMU interface exists, or the capture fails to start.
+FFI_PLUGIN_EXPORT int uvc_imu_start(void);
+FFI_PLUGIN_EXPORT void uvc_imu_stop(void);
+FFI_PLUGIN_EXPORT int uvc_imu_is_running(void);
+
 // Preview transform: rotation is 0, 90, 180, or 270 (clockwise degrees).
 // flip_h mirrors the output left-right; flip_v mirrors it top-bottom.
 // Transforms are applied during preview blit to the attached Flutter Texture

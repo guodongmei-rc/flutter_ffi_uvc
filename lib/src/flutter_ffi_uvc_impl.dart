@@ -439,6 +439,24 @@ class _FlutterFfiUvcCamera implements UvcCamera {
     return UvcAudioInfo.fromMap(info);
   }
 
+  @override
+  int startImuCapture() {
+    _ensureAndroid();
+    return _bindings.uvc_imu_start();
+  }
+
+  @override
+  void stopImuCapture() {
+    _ensureAndroid();
+    _bindings.uvc_imu_stop();
+  }
+
+  @override
+  bool get isImuCaptureRunning {
+    _ensureAndroid();
+    return _bindings.uvc_imu_is_running() != 0;
+  }
+
   bool _videoRecording = false;
 
   @override

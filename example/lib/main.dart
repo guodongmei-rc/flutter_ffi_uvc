@@ -62,6 +62,7 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
   bool _savingPhoto = false;
   bool _saveToGallery = true;
   bool _recordingVideo = false;
+  bool _imuCapturing = false;
   bool _recordAudio = true;
   bool _transformControlsExpanded = false;
   bool _manualFocusControlsVisible = false;
@@ -310,6 +311,9 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
         _openingDevice = false;
         _previewFrozen = false;
         _manualFocusControlsVisible = false;
+        // Reopening closes the previous native session first, which stops
+        // any IMU capture that was running on it.
+        _imuCapturing = false;
         _status = statusMessage;
       });
       if (startedMode != null) {
@@ -353,6 +357,8 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
         _previewFrozen = false;
         _transformControlsExpanded = false;
         _manualFocusControlsVisible = false;
+        // The native close stops the IMU capture; drop the stale UI state.
+        _imuCapturing = false;
         _openingDevice = false;
         _status = 'Device disconnected.';
         _previewFps = 0;
@@ -967,6 +973,44 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
     }
   }
 
+  void _toggleImuCapture() {
+    if (_imuCapturing) {
+      _camera.stopImuCapture();
+      setState(() {
+        _imuCapturing = _camera.isImuCaptureRunning;
+        _status = 'IMU capture stopped.';
+      });
+      _log('IMU capture stopped');
+      return;
+    }
+
+    final int result = _camera.startImuCapture();
+    if (result < 0) {
+      final String error = _camera.lastError;
+      final String message =
+          'Failed to start IMU capture: '
+          '${error.isNotEmpty ? error : 'error $result'}';
+      _setStatus(message);
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: Text(message),
+            backgroundColor: Colors.red.shade800,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      return;
+    }
+    setState(() {
+      _imuCapturing = true;
+      _status =
+          'IMU capture running — samples are printed to logcat '
+          '(tag flutter_ffi_uvc).';
+    });
+    _log('IMU capture started');
+  }
+
   Future<void> _toggleVideoRecording() async {
     if (_recordingVideo) {
       try {
@@ -1397,6 +1441,30 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
                                 _recordingVideo ? Icons.stop : Icons.videocam,
                                 size: 24,
                               ),
+                            ),
+                          ),
+                          const SizedBox(width: 16),
+                          FilledButton(
+                            onPressed: _selectedDevice == null
+                                ? null
+                                : _toggleImuCapture,
+                            style: FilledButton.styleFrom(
+                              backgroundColor: _imuCapturing
+                                  ? brandGreen
+                                  : Colors.white.withValues(alpha: 0.85),
+                              foregroundColor: _imuCapturing
+                                  ? Colors.white
+                                  : Colors.black87,
+                              minimumSize: const Size(44, 44),
+                              padding: const EdgeInsets.all(10),
+                              shape: const CircleBorder(),
+                            ),
+                            child: Tooltip(
+                              message: _imuCapturing
+                                  ? 'Stop IMU gyro logging'
+                                  : 'Start IMU gyro logging '
+                                        '(logcat tag: flutter_ffi_uvc)',
+                              child: const Icon(Icons.sensors, size: 24),
                             ),
                           ),
                         ],

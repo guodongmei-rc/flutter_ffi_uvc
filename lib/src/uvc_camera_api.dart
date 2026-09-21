@@ -1417,6 +1417,28 @@ abstract interface class UvcCamera {
   /// device; returns null when none is open.
   Future<UvcAudioInfo?> queryAudioInterface();
 
+  /// Starts capturing IMU gyroscope/accelerometer data. Android only.
+  ///
+  /// Some cameras expose IMU data as a vendor-specific USB interface with a
+  /// Bulk IN endpoint next to the video interfaces. When such an interface
+  /// exists, received samples are currently only printed to logcat (tag
+  /// `flutter_ffi_uvc`); no data is delivered to Dart yet.
+  ///
+  /// Requires an opened device. Returns 0 on success (including when capture
+  /// is already running), or a negative error code when no device is open,
+  /// the device has no IMU interface, or the capture fails to start — see
+  /// [lastError] for details. The capture is stopped automatically when the
+  /// device is closed.
+  int startImuCapture();
+
+  /// Stops the active IMU capture started by [startImuCapture].
+  ///
+  /// Does nothing when no capture is running.
+  void stopImuCapture();
+
+  /// Whether an IMU capture is currently running.
+  bool get isImuCaptureRunning;
+
   /// Returns all controls supported by the currently opened device.
   List<UvcCameraControl> supportedControls();
 
