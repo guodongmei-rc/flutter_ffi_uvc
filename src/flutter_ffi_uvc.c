@@ -3087,6 +3087,92 @@ FFI_PLUGIN_EXPORT int uvc_ctrl_set(int ctrl_id, int32_t value) {
   return result;
 }
 
+// Resolves w_index == -1 to the bInterfaceNumber of the first vendor-specific
+// (class 0xFF) interface in the active configuration. Returns the interface
+// number on success, negative on failure.
+static int vendor_cmd_detect_interface(libusb_device_handle *usb_devh) {
+  libusb_device *dev = libusb_get_device(usb_devh);
+  struct libusb_config_descriptor *config = NULL;
+  if (libusb_get_active_config_descriptor(dev, &config) != 0 &&
+      libusb_get_config_descriptor(dev, 0, &config) != 0) {
+    set_last_error("uvc_vendor_cmd: cannot read config descriptor");
+    return -1;
+  }
+
+  int interface_number = -1;
+  for (int i = 0; i < config->bNumInterfaces && interface_number < 0; i++) {
+    const struct libusb_interface *iface = &config->interface[i];
+    for (int a = 0; a < iface->num_altsetting; a++) {
+      const struct libusb_interface_descriptor *alt = &iface->altsetting[a];
+      if (alt->bInterfaceClass == 0xFF) {
+        interface_number = alt->bInterfaceNumber;
+        break;
+      }
+    }
+  }
+  libusb_free_config_descriptor(config);
+
+  if (interface_number < 0) {
+    set_last_error("uvc_vendor_cmd: no vendor-specific (0xFF) interface found");
+  }
+  return interface_number;
+}
+
+FFI_PLUGIN_EXPORT int uvc_vendor_cmd(
+    int request_type,
+    int request,
+    int w_value,
+    int w_index,
+    const uint8_t *payload,
+    int payload_len) {
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  uvc_device_handle_t *devh = g_uvc_state.devh;
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+
+  if (devh == NULL) {
+    set_last_error("Camera is not open");
+    return UVC_ERROR_NO_DEVICE;
+  }
+
+  libusb_device_handle *usb_devh = devh->usb_devh;
+  if (usb_devh == NULL) {
+    set_last_error("Camera is not open");
+    return UVC_ERROR_NO_DEVICE;
+  }
+
+  int resolved_index = w_index;
+  if (resolved_index < 0) {
+    resolved_index = vendor_cmd_detect_interface(usb_devh);
+    if (resolved_index < 0) {
+      return UVC_ERROR_NO_DEVICE;
+    }
+  }
+
+  if (payload_len < 0 || (payload_len > 0 && payload == NULL)) {
+    set_last_error("uvc_vendor_cmd: invalid payload");
+    return UVC_ERROR_INVALID_PARAM;
+  }
+
+  const int transferred = libusb_control_transfer(
+      usb_devh,
+      (uint8_t)request_type,
+      (uint8_t)request,
+      (uint16_t)w_value,
+      (uint16_t)resolved_index,
+      (unsigned char *)payload,
+      (uint16_t)payload_len,
+      300);
+  if (transferred < 0) {
+    set_last_error(
+        "uvc_vendor_cmd failed req_type=0x%02x req=0x%02x value=%d index=%d len=%d err=%d",
+        request_type, request, w_value, resolved_index, payload_len, transferred);
+    UVC_LOGW("UVC_NATIVE",
+             "uvc_vendor_cmd failed req_type=0x%02x req=0x%02x value=%d index=%d len=%d err=%d",
+             request_type, request, w_value, resolved_index, payload_len, transferred);
+  }
+  return transferred;
+}
+
 static int with_open_device(uvc_device_handle_t **out_devh) {
   pthread_mutex_lock(&g_uvc_state.mutex);
   uvc_device_handle_t *devh = g_uvc_state.devh;

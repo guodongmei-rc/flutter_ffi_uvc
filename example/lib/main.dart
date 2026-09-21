@@ -8,6 +8,7 @@ import 'package:flutter_ffi_uvc/flutter_ffi_uvc.dart';
 import 'app_theme.dart';
 import 'widgets/controls_panel.dart';
 import 'widgets/stream_stats_card.dart';
+import 'widgets/vendor_command_sheet.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -1143,6 +1144,20 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
     );
   }
 
+  void _showVendorCommandSheet() {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (BuildContext context) {
+        return VendorCommandSheet(camera: _camera);
+      },
+    );
+  }
+
   void _onStreamError(UvcStreamError error) {
     _log('Stream error: ${error.message}');
     _status = 'Stream error: ${error.message}';
@@ -1710,6 +1725,20 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
                                           unawaited(_switchMode(mode));
                                         },
                                 ),
+                              ),
+                            if (_cameraModes.isNotEmpty)
+                              ListTile(
+                                contentPadding: const EdgeInsets.symmetric(
+                                  horizontal: 12,
+                                ),
+                                leading: const Icon(Icons.terminal),
+                                title: const Text('Vendor command'),
+                                subtitle: const Text(
+                                  'Send custom EP0 vendor command',
+                                ),
+                                onTap: _openingDevice
+                                    ? null
+                                    : _showVendorCommandSheet,
                               ),
                             if (_selectedDevice != null &&
                                 (_selectedMode != null ||

@@ -155,6 +155,19 @@ FFI_PLUGIN_EXPORT int32_t uvc_ctrl_get(int ctrl_id);
 // Sets a control value. Returns 0 (UVC_SUCCESS) on success, negative on error.
 FFI_PLUGIN_EXPORT int uvc_ctrl_set(int ctrl_id, int32_t value);
 
+// Sends a generic vendor-type EP0 control transfer on the opened device.
+// request_type: 0x41 = OUT/Vendor/Interface, 0xC1 = IN/Vendor/Interface.
+// w_index: -1 = auto-detect the first class-0xFF (vendor-specific) interface.
+// payload: OUT data to send; receive buffer for IN transfers.
+// Returns >=0 bytes transferred; <0 error (negative libusb error or internal).
+FFI_PLUGIN_EXPORT int uvc_vendor_cmd(
+    int request_type,
+    int request,
+    int w_value,
+    int w_index,
+    const uint8_t *payload,
+    int payload_len);
+
 // Compound controls that cannot be represented as a single integer value.
 FFI_PLUGIN_EXPORT int uvc_get_white_balance_component_json(uint8_t *buffer, int buffer_length);
 FFI_PLUGIN_EXPORT int uvc_set_white_balance_component_values(uint16_t blue, uint16_t red);

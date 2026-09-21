@@ -1454,6 +1454,38 @@ abstract interface class UvcCamera {
   /// Sets a specific UVC control value.
   int setControl(UvcControlId controlId, int value);
 
+  /// Sends a vendor-type EP0 control transfer to the opened device.
+  ///
+  /// This targets the device with request type 0x41 (host-to-device, vendor,
+  /// interface). [command] is the bRequest byte, [wValue] the wValue field and
+  /// [payload] the raw bytes sent in the data stage (may be empty). When
+  /// [wIndex] is null, the first vendor-specific (class 0xFF) interface of the
+  /// active configuration is used as wIndex.
+  ///
+  /// Returns the number of bytes transferred. Throws [UvcException] when the
+  /// device is not open or the transfer fails — see [lastError] for details.
+  int sendVendorCommand({
+    required int command,
+    int wValue = 0,
+    int? wIndex,
+    List<int> payload = const [],
+  });
+
+  /// Queries the opened device with a vendor-type EP0 control transfer.
+  ///
+  /// Same as [sendVendorCommand] but with request type 0xC1
+  /// (device-to-host, vendor, interface): receives [length] bytes in the data
+  /// stage and returns them.
+  ///
+  /// Throws [UvcException] when the device is not open or the transfer
+  /// fails — see [lastError] for details.
+  List<int> queryVendorCommand({
+    required int command,
+    int wValue = 0,
+    int? wIndex,
+    required int length,
+  });
+
   UvcWhiteBalanceComponent? getWhiteBalanceComponent();
   int setWhiteBalanceComponent(UvcWhiteBalanceComponent value);
   UvcFocusRelativeControl? getFocusRelativeControl();

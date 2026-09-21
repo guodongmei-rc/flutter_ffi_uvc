@@ -957,6 +957,99 @@ class _FlutterFfiUvcCamera implements UvcCamera {
   int setControl(UvcControlId controlId, int value) =>
       _bindings.uvc_ctrl_set(controlId.nativeValue, value);
 
+  static void _validateVendorCommandArgs(int command, int wValue, int? wIndex) {
+    if (command < 0 || command > 0xFF) {
+      throw ArgumentError.value(command, 'command', 'must be 0-0xFF');
+    }
+    if (wValue < 0 || wValue > 0xFFFF) {
+      throw ArgumentError.value(wValue, 'wValue', 'must be 0-0xFFFF');
+    }
+    if (wIndex != null && (wIndex < 0 || wIndex > 0xFFFF)) {
+      throw ArgumentError.value(wIndex, 'wIndex', 'must be 0-0xFFFF');
+    }
+  }
+
+  @override
+  int sendVendorCommand({
+    required int command,
+    int wValue = 0,
+    int? wIndex,
+    List<int> payload = const [],
+  }) {
+    _validateVendorCommandArgs(command, wValue, wIndex);
+    for (final int byte in payload) {
+      if (byte < 0 || byte > 0xFF) {
+        throw ArgumentError.value(byte, 'payload', 'bytes must be 0-255');
+      }
+    }
+    _ensureAndroid();
+
+    final Pointer<Uint8> nativePayload = payload.isEmpty
+        ? nullptr
+        : calloc<Uint8>(payload.length);
+    try {
+      if (payload.isNotEmpty) {
+        nativePayload.asTypedList(payload.length).setAll(0, payload);
+      }
+      final int result = _bindings.uvc_vendor_cmd(
+        0x41,
+        command,
+        wValue,
+        wIndex ?? -1,
+        nativePayload,
+        payload.length,
+      );
+      if (result < 0) {
+        final String error = lastError;
+        throw UvcException.fromNativeCode(
+          result,
+          message: error.isNotEmpty ? error : 'Vendor command failed',
+        );
+      }
+      return result;
+    } finally {
+      if (nativePayload != nullptr) {
+        calloc.free(nativePayload);
+      }
+    }
+  }
+
+  @override
+  List<int> queryVendorCommand({
+    required int command,
+    int wValue = 0,
+    int? wIndex,
+    required int length,
+  }) {
+    _validateVendorCommandArgs(command, wValue, wIndex);
+    if (length < 1 || length > 0xFFFF) {
+      throw ArgumentError.value(length, 'length', 'must be 1-0xFFFF');
+    }
+    _ensureAndroid();
+
+    final Pointer<Uint8> nativeBuffer = calloc<Uint8>(length);
+    try {
+      final int result = _bindings.uvc_vendor_cmd(
+        0xC1,
+        command,
+        wValue,
+        wIndex ?? -1,
+        nativeBuffer,
+        length,
+      );
+      if (result < 0) {
+        final String error = lastError;
+        throw UvcException.fromNativeCode(
+          result,
+          message: error.isNotEmpty ? error : 'Vendor command failed',
+        );
+      }
+      return Uint8List.fromList(nativeBuffer.asTypedList(result));
+    } finally {
+      calloc.free(nativeBuffer);
+    }
+  }
+
   @override
   UvcWhiteBalanceComponent? getWhiteBalanceComponent() => _readJsonObject(
     _bindings.uvc_get_white_balance_component_json,

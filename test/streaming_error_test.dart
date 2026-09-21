@@ -126,6 +126,22 @@ class _FakeCamera implements UvcCamera {
   @override
   int setControl(UvcControlId controlId, int value) => -1;
   @override
+  int sendVendorCommand({
+    required int command,
+    int wValue = 0,
+    int? wIndex,
+    List<int> payload = const [],
+  }) =>
+      -1;
+  @override
+  List<int> queryVendorCommand({
+    required int command,
+    int wValue = 0,
+    int? wIndex,
+    required int length,
+  }) =>
+      const [];
+  @override
   UvcWhiteBalanceComponent? getWhiteBalanceComponent() => null;
   @override
   int setWhiteBalanceComponent(UvcWhiteBalanceComponent value) => -1;

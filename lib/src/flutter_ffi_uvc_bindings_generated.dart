@@ -458,6 +458,47 @@ class FlutterFfiUvcBindings {
   late final _uvc_ctrl_set = _uvc_ctrl_setPtr
       .asFunction<int Function(int, int)>();
 
+  /// Sends a generic vendor-type EP0 control transfer on the opened device.
+  /// request_type: 0x41 = OUT/Vendor/Interface, 0xC1 = IN/Vendor/Interface.
+  /// w_index: -1 = auto-detect the first class-0xFF (vendor-specific) interface.
+  /// payload: OUT data to send; receive buffer for IN transfers.
+  /// Returns >=0 bytes transferred; <0 error (negative libusb error or internal).
+  int uvc_vendor_cmd(
+    int request_type,
+    int request,
+    int w_value,
+    int w_index,
+    ffi.Pointer<ffi.Uint8> payload,
+    int payload_len,
+  ) {
+    return _uvc_vendor_cmd(
+      request_type,
+      request,
+      w_value,
+      w_index,
+      payload,
+      payload_len,
+    );
+  }
+
+  late final _uvc_vendor_cmdPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Int Function(
+            ffi.Int,
+            ffi.Int,
+            ffi.Int,
+            ffi.Int,
+            ffi.Pointer<ffi.Uint8>,
+            ffi.Int,
+          )
+        >
+      >('uvc_vendor_cmd');
+  late final _uvc_vendor_cmd = _uvc_vendor_cmdPtr
+      .asFunction<
+        int Function(int, int, int, int, ffi.Pointer<ffi.Uint8>, int)
+      >();
+
   /// Compound controls that cannot be represented as a single integer value.
   int uvc_get_white_balance_component_json(
     ffi.Pointer<ffi.Uint8> buffer,
