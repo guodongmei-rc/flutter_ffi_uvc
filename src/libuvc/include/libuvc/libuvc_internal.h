@@ -253,6 +253,12 @@ struct uvc_stream_handle {
   /* Set when the frame being assembled in outbuf lost payload bytes (USB
    * transfer error bit or a missing EOF): the delivered frame is incomplete. */
   uint8_t outbuf_corrupt, hold_corrupt;
+  /* Isochronous packet health counters: tell host-side loss (bad packet
+   * status) apart from device-side short/empty packets. Reset on stream
+   * start, logged periodically from the transfer callback. */
+  size_t iso_endpoint_bytes_per_packet;
+  uint64_t iso_xfer_total, iso_xfer_bad;
+  uint64_t iso_pk_total, iso_pk_bad, iso_pk_short, iso_pk_zero;
   uint8_t *outbuf, *holdbuf;
   pthread_mutex_t cb_mutex;
   pthread_cond_t cb_cond;

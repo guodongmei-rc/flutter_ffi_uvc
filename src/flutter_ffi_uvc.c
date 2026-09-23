@@ -26,6 +26,7 @@
 
 #if defined(__ANDROID__)
 #include "uac_audio.h"
+#include "gl_blit.h"
 #endif
 
 int g_uvc_native_log_level = UVC_LOG_LEVEL_DEFAULT;
@@ -65,6 +66,9 @@ typedef struct {
   pthread_cond_t callback_cond;
   uvc_context_t *ctx;
   uvc_device_handle_t *devh;
+  // Fd the device was opened with, kept so a stalled stream can be recovered
+  // with a port-level reset without closing the handle first. -1 when closed.
+  int device_fd;
   uvc_frame_t *rgb_frame;
   uint8_t *latest_rgba;
   size_t latest_rgba_bytes;
@@ -103,6 +107,11 @@ typedef struct {
 #if defined(__ANDROID__)
   ANativeWindow *preview_window;
   ANativeWindow *recording_window;
+  // GPU blit renderer (gl_blit.c): lazily created on the frame callback
+  // thread on first render, destroyed after callbacks drain. gl_blit_failed
+  // sticks once creation failed so the CPU blit fallback stays active.
+  gl_blit_t *gl_blit;
+  int gl_blit_failed;
 #endif
   // Hardware decoder for H.264/H.265 streams; created lazily on the first
   // compressed-video frame of a session, destroyed on stop/close. Renders
@@ -134,6 +143,7 @@ typedef struct {
 static ffi_uvc_state_t g_uvc_state = {
     .mutex = PTHREAD_MUTEX_INITIALIZER,
     .callback_cond = PTHREAD_COND_INITIALIZER,
+    .device_fd = -1,
 };
 
 // ---------------------------------------------------------------------------
@@ -681,6 +691,15 @@ static int begin_stop_preview_locked(uvc_device_handle_t **devh_to_stop) {
 static void finish_stop_preview_locked(void) {
   wait_for_callbacks_locked();
   reset_frame_buffer_locked();
+#if defined(__ANDROID__)
+  if (g_uvc_state.gl_blit != NULL) {
+    // Safe here: callbacks are drained and the render thread has exited, so
+    // the EGL context is no longer current anywhere.
+    gl_blit_destroy(g_uvc_state.gl_blit);
+    g_uvc_state.gl_blit = NULL;
+  }
+  g_uvc_state.gl_blit_failed = 0;
+#endif
   if (g_uvc_state.h26x_rawrec != NULL) {
     // Keep the temp file; the platform layer finalizes (remuxes) it later.
     rec_writer_stop();
@@ -747,6 +766,7 @@ static void close_device_resources_locked(void) {
     uvc_close(g_uvc_state.devh);
     g_uvc_state.devh = NULL;
   }
+  g_uvc_state.device_fd = -1;
 
   if (g_uvc_state.ctx != NULL) {
     UVC_LOGD("UVC_NATIVE", "close_device_resources_locked exiting uvc context ctx=%p", (void *)g_uvc_state.ctx);
@@ -1295,16 +1315,62 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
 #if defined(__ANDROID__)
   int preview_failed = 0;
   int recording_failed = 0;
+  ANativeWindow *windows[2];
+  int window_index[2];
+  int n_windows = 0;
   if (preview_window != NULL) {
-    preview_failed = !render_rgba_to_window(
-        preview_window, render_rgba, width, height,
-        render_rot, render_fh, render_fv);
+    window_index[n_windows] = 0;
+    windows[n_windows++] = preview_window;
+  }
+  if (recording_window != NULL) {
+    window_index[n_windows] = 1;
+    windows[n_windows++] = recording_window;
+  }
+  if (n_windows > 0) {
+    if (g_uvc_state.gl_blit == NULL && !g_uvc_state.gl_blit_failed) {
+      g_uvc_state.gl_blit = gl_blit_create();
+      if (g_uvc_state.gl_blit == NULL) {
+        g_uvc_state.gl_blit_failed = 1;
+      }
+    }
+    if (g_uvc_state.gl_blit != NULL) {
+      // GPU path: one texture upload, rotation/flip in texture coordinates.
+      const int fail_mask = gl_blit_render(
+          g_uvc_state.gl_blit,
+          render_rgba,
+          width,
+          height,
+          render_rot,
+          render_fh,
+          render_fv,
+          windows,
+          n_windows);
+      for (int i = 0; i < n_windows; i++) {
+        if ((fail_mask >> i) & 1) {
+          if (window_index[i] == 0) {
+            preview_failed = 1;
+          } else {
+            recording_failed = 1;
+          }
+        }
+      }
+    } else {
+      if (preview_window != NULL) {
+        preview_failed = !render_rgba_to_window(
+            preview_window, render_rgba, width, height,
+            render_rot, render_fh, render_fv);
+      }
+      if (recording_window != NULL) {
+        recording_failed = !render_rgba_to_window(
+            recording_window, render_rgba, width, height,
+            render_rot, render_fh, render_fv);
+      }
+    }
+  }
+  if (preview_window != NULL) {
     ANativeWindow_release(preview_window);
   }
   if (recording_window != NULL) {
-    recording_failed = !render_rgba_to_window(
-        recording_window, render_rgba, width, height,
-        render_rot, render_fh, render_fv);
     ANativeWindow_release(recording_window);
   }
 #else
@@ -1430,6 +1496,33 @@ static void reset_usb_device_by_fd(int fd) {
   usleep(500 * 1000);
 }
 
+FFI_PLUGIN_EXPORT int uvc_recover_stream_interfaces(void) {
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  if (g_uvc_state.devh == NULL) {
+    pthread_mutex_unlock(&g_uvc_state.mutex);
+    set_last_error("uvc_recover_stream_interfaces: no open device");
+    return UVC_ERROR_NO_DEVICE;
+  }
+  UVC_LOGI("UVC_NATIVE", "uvc_recover_stream_interfaces: resetting streaming interfaces");
+  reset_streaming_interfaces_locked(g_uvc_state.devh);
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+  return UVC_SUCCESS;
+}
+
+FFI_PLUGIN_EXPORT int uvc_reset_device_port(void) {
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  const int fd = g_uvc_state.device_fd;
+  if (fd < 0) {
+    pthread_mutex_unlock(&g_uvc_state.mutex);
+    set_last_error("uvc_reset_device_port: no open device");
+    return UVC_ERROR_NO_DEVICE;
+  }
+  UVC_LOGI("UVC_NATIVE", "uvc_reset_device_port: port-level reset fd=%d", fd);
+  reset_usb_device_by_fd(fd);
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+  return UVC_SUCCESS;
+}
+
 FFI_PLUGIN_EXPORT int uvc_open_fd(int fd) {
   if (fd < 0) {
     set_last_error("Invalid file descriptor: %d", fd);
@@ -1474,6 +1567,7 @@ FFI_PLUGIN_EXPORT int uvc_open_fd(int fd) {
     pthread_mutex_unlock(&g_uvc_state.mutex);
     return result;
   }
+  g_uvc_state.device_fd = fd;
 
   // A previous process may have died mid-stream, leaving the camera in a
   // stale streaming state. Reset the streaming interfaces before use.

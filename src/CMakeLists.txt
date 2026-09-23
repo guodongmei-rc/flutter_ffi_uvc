@@ -79,7 +79,7 @@ add_library(flutter_ffi_uvc SHARED
 
 # UAC microphone capture for video recording (isochronous PCM over libusb).
 if(ANDROID)
-  target_sources(flutter_ffi_uvc PRIVATE "uac_audio.c")
+  target_sources(flutter_ffi_uvc PRIVATE "uac_audio.c" "gl_blit.c")
 endif()
 
 set_target_properties(flutter_ffi_uvc PROPERTIES
@@ -102,7 +102,8 @@ if (ANDROID)
   # Support Android 15 16k page size
   target_link_options(flutter_ffi_uvc PRIVATE "-Wl,-z,max-page-size=16384")
   # mediandk: AMediaCodec for the H.264/H.265 hardware decoder.
-  target_link_libraries(flutter_ffi_uvc PRIVATE android log mediandk)
+  # EGL/GLESv2: GPU blit of decoded frames into preview/recording surfaces.
+  target_link_libraries(flutter_ffi_uvc PRIVATE android log mediandk EGL GLESv2)
 endif()
 
 # JPEG capture support (uvc_capture_jpeg) for non-MJPEG streams. Without

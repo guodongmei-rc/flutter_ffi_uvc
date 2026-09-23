@@ -723,6 +723,15 @@ class _FlutterFfiUvcCamera implements UvcCamera {
         _restartAttempts += 1;
         final int attempt = _restartAttempts;
         _stopPreviewNative();
+        // Escalate recovery strength per attempt: the first retry is a plain
+        // software restart; later attempts first force the device back to a
+        // known state, because firmware left in a broken streaming state
+        // answers negotiation but never sends frames again.
+        if (attempt == 2) {
+          _bindings.uvc_recover_stream_interfaces();
+        } else if (attempt >= 3) {
+          _bindings.uvc_reset_device_port();
+        }
         final UvcPreviewStartResult result = await _startPreviewInternal(
           request.mode,
           policy: request.policy,

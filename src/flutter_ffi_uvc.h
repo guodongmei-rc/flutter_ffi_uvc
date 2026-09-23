@@ -31,6 +31,12 @@ FFI_PLUGIN_EXPORT int sum(int a, int b);
 FFI_PLUGIN_EXPORT int sum_long_running(int a, int b);
 
 FFI_PLUGIN_EXPORT int uvc_open_fd(int fd);
+// Stall recovery helpers: interface-level reset returns every VideoStreaming
+// interface to alt setting 0 and clears endpoint halts; port-level reset
+// re-enumerates the whole device. Both require an open device and return a
+// uvc_error_t code (UVC_SUCCESS on success).
+FFI_PLUGIN_EXPORT int uvc_recover_stream_interfaces(void);
+FFI_PLUGIN_EXPORT int uvc_reset_device_port(void);
 typedef void (*uvc_frame_listener_t)(int64_t sequence);
 
 FFI_PLUGIN_EXPORT int uvc_start_preview(

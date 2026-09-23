@@ -59,6 +59,30 @@ class FlutterFfiUvcBindings {
       _lookup<ffi.NativeFunction<ffi.Int Function(ffi.Int)>>('uvc_open_fd');
   late final _uvc_open_fd = _uvc_open_fdPtr.asFunction<int Function(int)>();
 
+  /// Stall recovery helpers: interface-level reset returns every VideoStreaming
+  /// interface to alt setting 0 and clears endpoint halts; port-level reset
+  /// re-enumerates the whole device. Both require an open device and return a
+  /// uvc_error_t code (UVC_SUCCESS on success).
+  int uvc_recover_stream_interfaces() {
+    return _uvc_recover_stream_interfaces();
+  }
+
+  late final _uvc_recover_stream_interfacesPtr =
+      _lookup<ffi.NativeFunction<ffi.Int Function()>>(
+        'uvc_recover_stream_interfaces',
+      );
+  late final _uvc_recover_stream_interfaces = _uvc_recover_stream_interfacesPtr
+      .asFunction<int Function()>();
+
+  int uvc_reset_device_port() {
+    return _uvc_reset_device_port();
+  }
+
+  late final _uvc_reset_device_portPtr =
+      _lookup<ffi.NativeFunction<ffi.Int Function()>>('uvc_reset_device_port');
+  late final _uvc_reset_device_port = _uvc_reset_device_portPtr
+      .asFunction<int Function()>();
+
   int uvc_start_preview(int frame_format, int width, int height, int fps) {
     return _uvc_start_preview(frame_format, width, height, fps);
   }

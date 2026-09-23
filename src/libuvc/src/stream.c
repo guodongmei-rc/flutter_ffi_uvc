@@ -41,7 +41,10 @@
 #include "libuvc/uvc_log.h"
 
 #if defined(__ANDROID__)
-#define LIBUVC_MAX_ISO_TRANSFER_SIZE 49152u
+// Wider per-transfer window so the host can tolerate longer scheduling
+// delays without dropping isochronous packets (there is no retransmit for
+// ISOC). Submit-time failures still fall back to halved packet counts.
+#define LIBUVC_MAX_ISO_TRANSFER_SIZE 131072u
 #endif
 #include "errno.h"
 
@@ -879,13 +882,16 @@ void LIBUSB_CALL _uvc_stream_callback(struct libusb_transfer *transfer) {
       /* This is an isochronous mode transfer, so each packet has a payload transfer */
       int packet_id;
 
+      strmh->iso_xfer_total++;
       for (packet_id = 0; packet_id < transfer->num_iso_packets; ++packet_id) {
         uint8_t *pktbuf;
         struct libusb_iso_packet_descriptor *pkt;
 
         pkt = transfer->iso_packet_desc + packet_id;
+        strmh->iso_pk_total++;
 
         if (pkt->status != 0) {
+          strmh->iso_pk_bad++;
           UVC_DEBUG("bad packet (isochronous transfer); status: %d", pkt->status);
           /* The packet's payload bytes are lost while the frame keeps
            * assembling; flag it so consumers can discard the incomplete
@@ -894,10 +900,42 @@ void LIBUSB_CALL _uvc_stream_callback(struct libusb_transfer *transfer) {
           continue;
         }
 
+        if (pkt->actual_length == 0) {
+          strmh->iso_pk_zero++;
+        } else if (strmh->iso_endpoint_bytes_per_packet != 0 &&
+                   (size_t)pkt->actual_length < strmh->iso_endpoint_bytes_per_packet) {
+          strmh->iso_pk_short++;
+        }
+
         pktbuf = libusb_get_iso_packet_buffer_simple(transfer, packet_id);
 
         _uvc_process_payload(strmh, pktbuf, pkt->actual_length);
 
+      }
+
+      if (strmh->iso_xfer_total % 120 == 0) {
+#if defined(__ANDROID__)
+        __android_log_print(
+            ANDROID_LOG_INFO,
+            "flutter_ffi_uvc",
+            "@@@@UVC_STREAM/I iso stats: xfer=%llu bad_xfer=%llu pk=%llu bad=%llu short=%llu zero=%llu",
+            (unsigned long long)strmh->iso_xfer_total,
+            (unsigned long long)strmh->iso_xfer_bad,
+            (unsigned long long)strmh->iso_pk_total,
+            (unsigned long long)strmh->iso_pk_bad,
+            (unsigned long long)strmh->iso_pk_short,
+            (unsigned long long)strmh->iso_pk_zero);
+#else
+        UVC_LOGI(
+            "UVC_STREAM",
+            "iso stats: xfer=%llu bad_xfer=%llu pk=%llu bad=%llu short=%llu zero=%llu",
+            (unsigned long long)strmh->iso_xfer_total,
+            (unsigned long long)strmh->iso_xfer_bad,
+            (unsigned long long)strmh->iso_pk_total,
+            (unsigned long long)strmh->iso_pk_bad,
+            (unsigned long long)strmh->iso_pk_short,
+            (unsigned long long)strmh->iso_pk_zero);
+#endif
       }
     }
     break;
@@ -905,6 +943,7 @@ void LIBUSB_CALL _uvc_stream_callback(struct libusb_transfer *transfer) {
   case LIBUSB_TRANSFER_ERROR:
   case LIBUSB_TRANSFER_NO_DEVICE: {
     int i;
+    strmh->iso_xfer_bad++;
     UVC_DEBUG("not retrying transfer, status = %d", transfer->status);
     pthread_mutex_lock(&strmh->cb_mutex);
 
@@ -932,6 +971,7 @@ void LIBUSB_CALL _uvc_stream_callback(struct libusb_transfer *transfer) {
   case LIBUSB_TRANSFER_TIMED_OUT:
   case LIBUSB_TRANSFER_STALL:
   case LIBUSB_TRANSFER_OVERFLOW:
+    strmh->iso_xfer_bad++;
     UVC_DEBUG("retrying transfer, status = %d", transfer->status);
     break;
   }
@@ -1333,6 +1373,13 @@ uvc_error_t uvc_stream_start(
         }
         iso_packets_per_transfer = packets_per_transfer;
         iso_endpoint_bytes_per_packet = endpoint_bytes_per_packet;
+        strmh->iso_endpoint_bytes_per_packet = endpoint_bytes_per_packet;
+        strmh->iso_xfer_total = 0;
+        strmh->iso_xfer_bad = 0;
+        strmh->iso_pk_total = 0;
+        strmh->iso_pk_bad = 0;
+        strmh->iso_pk_short = 0;
+        strmh->iso_pk_zero = 0;
         break;
       }
     }

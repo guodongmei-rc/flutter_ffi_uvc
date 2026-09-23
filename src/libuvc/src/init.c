@@ -79,6 +79,10 @@ YUV stream from a UVC device such as a standard webcam.
 #include "libuvc/libuvc_internal.h"
 #include "libuvc/uvc_log.h"
 
+#if defined(__ANDROID__)
+#include <sys/resource.h>
+#endif
+
 #if !defined(LIBUSB_OPTION_NO_DEVICE_DISCOVERY)
 #define LIBUSB_OPTION_NO_DEVICE_DISCOVERY ((enum libusb_option)2)
 #endif
@@ -90,6 +94,24 @@ YUV stream from a UVC device such as a standard webcam.
  */
 void *_uvc_handle_events(void *arg) {
   uvc_context_t *ctx = (uvc_context_t *) arg;
+
+#if defined(__ANDROID__)
+  // Isochronous packets have no retransmit: if this thread misses its
+  // scheduling window the data is gone for good. Ask for a slightly raised
+  // priority; unprivileged processes may only reach a small negative nice,
+  // so probe downwards and accept the best the kernel allows.
+  static const int kNiceAttempts[] = {-4, -3, -2};
+  for (size_t i = 0; i < sizeof(kNiceAttempts) / sizeof(kNiceAttempts[0]); i++) {
+    if (setpriority(PRIO_PROCESS, 0, kNiceAttempts[i]) == 0) {
+      __android_log_print(
+          ANDROID_LOG_INFO,
+          "flutter_ffi_uvc",
+          "@@@@UVC_STREAM/I event handler thread nice=%d",
+          kNiceAttempts[i]);
+      break;
+    }
+  }
+#endif
 
   UVC_LOGD("UVC_STREAM", "event handler thread started ctx=%p own_usb_ctx=%d", ctx, ctx->own_usb_ctx);
 
