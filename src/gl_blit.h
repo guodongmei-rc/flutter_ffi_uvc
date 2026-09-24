@@ -10,32 +10,35 @@
 extern "C" {
 #endif
 
-/* GPU blit path: uploads a decoded RGBA frame as a GL texture once and draws
- * it to every attached ANativeWindow (Flutter preview surface, video encoder
- * input surface) with rotation/flip done in texture coordinates. This
- * replaces the per-pixel CPU blit (blit_rgba_transform) which costs ~8MB of
- * transformed writes per surface per frame and blocks on ANativeWindow_lock.
+/* GPU blit for the video-encoder input surface: uploads a decoded RGBA frame
+ * as a GL texture and draws it into the encoder's ANativeWindow with
+ * rotation/flip in texture coordinates, replacing the per-pixel CPU blit
+ * (blit_rgba_transform + ANativeWindow_lock, ~8MB transformed writes per
+ * frame) on the recording path.
  *
- * Threading: gl_blit_render must be called from a single thread (the frame
- * callback thread). gl_blit_destroy may run on any thread once rendering has
- * stopped (the render thread has exited). */
+ * Only ever used with the encoder surface, never with Flutter's
+ * SurfaceTexture (its producer API may already be CPU-bound, which EGL
+ * cannot attach to).
+ *
+ * Threading: all gl_blit_render calls run on the frame callback thread;
+ * gl_blit_destroy runs after that thread has exited. */
 typedef struct gl_blit gl_blit_t;
 
 gl_blit_t *gl_blit_create(void);
 void gl_blit_destroy(gl_blit_t *blit);
 
-/* Renders one frame to up to 4 windows. Returns a bitmask: bit i set means
- * window i failed (caller falls back or counts stats). */
+/* Renders one frame into window. Returns 1 on success, 0 on failure. Once a
+ * window has failed EGL setup it is marked unsupported and every later call
+ * fails immediately (caller keeps using the CPU blit for it). */
 int gl_blit_render(
     gl_blit_t *blit,
+    ANativeWindow *window,
     const uint8_t *rgba,
     int src_w,
     int src_h,
     int rot,
     int flip_h,
-    int flip_v,
-    ANativeWindow *const *windows,
-    int n_windows);
+    int flip_v);
 
 #ifdef __cplusplus
 }

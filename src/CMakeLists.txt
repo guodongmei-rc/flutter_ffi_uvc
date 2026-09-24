@@ -102,7 +102,7 @@ if (ANDROID)
   # Support Android 15 16k page size
   target_link_options(flutter_ffi_uvc PRIVATE "-Wl,-z,max-page-size=16384")
   # mediandk: AMediaCodec for the H.264/H.265 hardware decoder.
-  # EGL/GLESv2: GPU blit of decoded frames into preview/recording surfaces.
+  # EGL/GLESv2: GPU blit of decoded frames into the recording surface.
   target_link_libraries(flutter_ffi_uvc PRIVATE android log mediandk EGL GLESv2)
 endif()
 

@@ -1008,9 +1008,14 @@ class UvcStallDetectionConfig {
   /// recent [UvcCamera.startPreview] call.
   final bool autoRestart;
 
-  /// Maximum consecutive automatic restart attempts per stall episode.
+  /// Consecutive back-to-back automatic restart attempts per stall episode.
   ///
-  /// The attempt counter resets once frames are delivered again.
+  /// After these run out, recovery does not give up: further attempts keep
+  /// coming with a growing delay (2s, 5s, then 10s apart) until frames are
+  /// delivered again or the preview session changes, so a camera in a
+  /// prolonged bad state (power/thermal brown-out) recovers as a short
+  /// glitch instead of a permanently dead preview. The attempt counter
+  /// resets once frames are delivered again.
   final int maxRestartAttempts;
 }
 

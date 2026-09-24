@@ -719,17 +719,33 @@ class _FlutterFfiUvcCamera implements UvcCamera {
     _restartInProgress = true;
     final int epoch = _sessionEpoch;
     try {
-      while (_restartAttempts < config.maxRestartAttempts) {
+      // Keep retrying until the stream comes back or the user changes the
+      // session. The first maxRestartAttempts run back-to-back with
+      // escalating force; a camera in a prolonged bad state (e.g. power or
+      // thermal brown-out) can outlast that burst, so further attempts back
+      // off instead of giving up — a transient storm then looks like a short
+      // glitch instead of a permanently dead preview.
+      while (true) {
         _restartAttempts += 1;
         final int attempt = _restartAttempts;
+        if (attempt > config.maxRestartAttempts) {
+          final int extra = attempt - config.maxRestartAttempts;
+          final int backoffMs = extra <= 1
+              ? 2000
+              : extra == 2
+                  ? 5000
+                  : 10000;
+          await Future<void>.delayed(Duration(milliseconds: backoffMs));
+          if (_sessionEpoch != epoch || _stallConfig == null) return;
+        }
         _stopPreviewNative();
         // Escalate recovery strength per attempt: the first retry is a plain
         // software restart; later attempts first force the device back to a
         // known state, because firmware left in a broken streaming state
         // answers negotiation but never sends frames again.
-        if (attempt == 2) {
+        if (attempt == 2 || attempt % 5 == 4) {
           _bindings.uvc_recover_stream_interfaces();
-        } else if (attempt >= 3) {
+        } else if (attempt == 3 || attempt % 5 == 0) {
           _bindings.uvc_reset_device_port();
         }
         final UvcPreviewStartResult result = await _startPreviewInternal(

@@ -107,9 +107,10 @@ typedef struct {
 #if defined(__ANDROID__)
   ANativeWindow *preview_window;
   ANativeWindow *recording_window;
-  // GPU blit renderer (gl_blit.c): lazily created on the frame callback
-  // thread on first render, destroyed after callbacks drain. gl_blit_failed
-  // sticks once creation failed so the CPU blit fallback stays active.
+  // GPU blit for the recording (encoder input) surface only. Lazily created
+  // on the frame callback thread, destroyed after callbacks drain. The
+  // preview surface stays on the CPU blit: its SurfaceTexture producer may
+  // already be CPU-bound, which EGL cannot attach to.
   gl_blit_t *gl_blit;
   int gl_blit_failed;
 #endif
@@ -631,13 +632,15 @@ static int render_rgba_to_window(
   const int out_w = (rot == 90 || rot == 270) ? src_h : src_w;
   const int out_h = (rot == 90 || rot == 270) ? src_w : src_h;
 
-  if (ANativeWindow_setBuffersGeometry(
-          window,
-          out_w,
-          out_h,
-          WINDOW_FORMAT_RGBA_8888) != 0) {
-    return 0;
-  }
+  /* A failed geometry update is non-fatal: the window already carries a
+   * usable geometry from an earlier session (e.g. after a codec held the
+   * producer, some vendor builds reject setBuffersGeometry from here on).
+   * Locking and blitting still works with the existing geometry. */
+  (void)ANativeWindow_setBuffersGeometry(
+      window,
+      out_w,
+      out_h,
+      WINDOW_FORMAT_RGBA_8888);
 
   ANativeWindow_Buffer window_buffer;
   if (ANativeWindow_lock(window, &window_buffer, NULL) != 0) {
@@ -1315,62 +1318,48 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
 #if defined(__ANDROID__)
   int preview_failed = 0;
   int recording_failed = 0;
-  ANativeWindow *windows[2];
-  int window_index[2];
-  int n_windows = 0;
-  if (preview_window != NULL) {
-    window_index[n_windows] = 0;
-    windows[n_windows++] = preview_window;
-  }
-  if (recording_window != NULL) {
-    window_index[n_windows] = 1;
-    windows[n_windows++] = recording_window;
-  }
-  if (n_windows > 0) {
-    if (g_uvc_state.gl_blit == NULL && !g_uvc_state.gl_blit_failed) {
-      g_uvc_state.gl_blit = gl_blit_create();
-      if (g_uvc_state.gl_blit == NULL) {
-        g_uvc_state.gl_blit_failed = 1;
-      }
+  ANativeWindow *gl_windows[2] = {preview_window, recording_window};
+  int gl_results[2] = {0, 0};
+  const int any_window = preview_window != NULL || recording_window != NULL;
+  if (any_window && !g_uvc_state.gl_blit_failed && g_uvc_state.gl_blit == NULL) {
+    g_uvc_state.gl_blit = gl_blit_create();
+    if (g_uvc_state.gl_blit == NULL) {
+      g_uvc_state.gl_blit_failed = 1;
     }
-    if (g_uvc_state.gl_blit != NULL) {
-      // GPU path: one texture upload, rotation/flip in texture coordinates.
-      const int fail_mask = gl_blit_render(
-          g_uvc_state.gl_blit,
-          render_rgba,
-          width,
-          height,
-          render_rot,
-          render_fh,
-          render_fv,
-          windows,
-          n_windows);
-      for (int i = 0; i < n_windows; i++) {
-        if ((fail_mask >> i) & 1) {
-          if (window_index[i] == 0) {
-            preview_failed = 1;
-          } else {
-            recording_failed = 1;
-          }
-        }
-      }
-    } else {
-      if (preview_window != NULL) {
-        preview_failed = !render_rgba_to_window(
-            preview_window, render_rgba, width, height,
-            render_rot, render_fh, render_fv);
-      }
-      if (recording_window != NULL) {
-        recording_failed = !render_rgba_to_window(
-            recording_window, render_rgba, width, height,
-            render_rot, render_fh, render_fv);
+  }
+  // GPU blit for both surfaces (one texture upload each, rotation/flip in
+  // texture coordinates). A window that rejects EGL is marked inside the
+  // renderer and stays on the CPU blit — but note that once a window is fed
+  // through the CPU API, EGL can never attach to it later.
+  if (g_uvc_state.gl_blit != NULL) {
+    for (int i = 0; i < 2; i++) {
+      if (gl_windows[i] != NULL) {
+        gl_results[i] = gl_blit_render(
+            g_uvc_state.gl_blit,
+            gl_windows[i],
+            render_rgba,
+            width,
+            height,
+            render_rot,
+            render_fh,
+            render_fv);
       }
     }
   }
   if (preview_window != NULL) {
+    if (!gl_results[0]) {
+      preview_failed = !render_rgba_to_window(
+          preview_window, render_rgba, width, height,
+          render_rot, render_fh, render_fv);
+    }
     ANativeWindow_release(preview_window);
   }
   if (recording_window != NULL) {
+    if (!gl_results[1]) {
+      recording_failed = !render_rgba_to_window(
+          recording_window, render_rgba, width, height,
+          render_rot, render_fh, render_fv);
+    }
     ANativeWindow_release(recording_window);
   }
 #else

@@ -505,6 +505,12 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
             'Preview stalled: no frames for ${event.silence.inMilliseconds}ms'
             '${_stallAutoRecover ? ' — recovering...' : '.'}';
         background = Colors.orange.shade900;
+        if (_recordingVideo) {
+          // A dead stream must not keep the recorder running and writing a
+          // hollow gap: finalize the file now. Recording is intentionally
+          // NOT restarted when the preview recovers.
+          unawaited(_toggleVideoRecording());
+        }
       case UvcStallEventType.restartSucceeded:
         message =
             'Preview recovered after ${event.restartAttempt} restart '
@@ -656,15 +662,16 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
     Duration timeout = _startupProbeTimeout,
   }) async {
     _log('libuvc preview start attempt: ${mode.label} / Texture');
+    // Start every session on a brand-new SurfaceTexture. A reused BufferQueue
+    // carries stale slots across codec sessions (green flash on H.264/H.265),
+    // and once any producer API (CPU blit, MediaCodec) has claimed the queue,
+    // EGL can never attach to it again — which would silently drop the MJPEG
+    // path back to the high-power CPU blit. A fresh queue has neither problem.
+    await _disposePreviewTexture();
+    await _ensurePreviewTexture();
     final bool isCompressed =
         mode.formatName == 'H264' || mode.formatName == 'H265';
     if (isCompressed) {
-      // Start each compressed session on a brand-new SurfaceTexture. A
-      // reused BufferQueue carries stale slots across codec sessions; those
-      // never-rewritten slots are what surfaces as the green flash while the
-      // new codec ramps up. A fresh queue has no stale slots to display.
-      await _disposePreviewTexture();
-      await _ensurePreviewTexture();
       final int? textureId = _previewTextureId;
       if (textureId != null) {
         // MediaCodec must claim the producer side of the preview
