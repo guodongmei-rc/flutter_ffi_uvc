@@ -41,10 +41,14 @@ int uac_audio_probe(libusb_device_handle *usb_devh, uac_audio_info_t *out);
 
 /* Claims the probed interface, selects its altsetting and starts isoc
  * transfers into the ring buffer. Returns NULL on failure (fully cleaned
- * up; the caller is expected to fall back to video-only recording). */
+ * up; the caller is expected to fall back to video-only recording).
+ * video_streaming!=0 skips the log-only AudioControl probes (selector-unit
+ * GET_CUR) so the EP0 traffic added while the video stream is running stays
+ * limited to the transfers the mic actually needs (unmute, volume). */
 uac_audio_t *uac_audio_start(
     libusb_device_handle *usb_devh,
-    const uac_audio_info_t *info);
+    const uac_audio_info_t *info,
+    int video_streaming);
 
 /* Pins the session while a reader thread is inside uac_audio_read(). The
  * owner stops/frees sessions only while holding its state lock, so pairing

@@ -287,9 +287,14 @@ int uac_audio_probe(libusb_device_handle *usb_devh, uac_audio_info_t *out) {
  *    Unit — some firmwares expose only per-channel controls, and handling
  *    just the master channel leaves the mic silent;
  *  - logs the current input of every Selector Unit (a selector defaulting
- *    to an unconnected input captures only noise floor).
+ *    to an unconnected input captures only noise floor). That GET_CUR is
+ *    log-only, so it is skipped when video_streaming!=0: while the video
+ *    stream runs, every synchronous EP0 transfer holds the libusb events
+ *    lock and stalls video URB resubmission, so only the transfers the mic
+ *    needs (unmute / volume) are issued.
  * Failures are logged and ignored. */
-static void uac_configure_audio_controls(libusb_device_handle *usb_devh) {
+static void uac_configure_audio_controls(
+    libusb_device_handle *usb_devh, int video_streaming) {
   libusb_device *dev = libusb_get_device(usb_devh);
   struct libusb_config_descriptor *config = NULL;
   if (libusb_get_active_config_descriptor(dev, &config) != 0 &&
@@ -342,6 +347,14 @@ static void uac_configure_audio_controls(libusb_device_handle *usb_devh) {
         case UAC_ST_SELECTOR_UNIT:
           if (length >= 5) {
             const int unit_id = d[3];
+            if (video_streaming) {
+              /* Log-only probe; skipped while the video stream runs (see
+               * the function comment). */
+              UAC_STATS_LOGI(
+                  "ac: selector unit=%d inputs=%d current=skipped ifc=%d",
+                  unit_id, d[4], ifc);
+              break;
+            }
             uint8_t cur = 0;
             const int rc = libusb_control_transfer(
                 usb_devh, 0xa1, UAC_REQ_GET_CUR, 0,
@@ -544,7 +557,8 @@ static void LIBUSB_CALL uac_audio_transfer_cb(struct libusb_transfer *transfer) 
 
 uac_audio_t *uac_audio_start(
     libusb_device_handle *usb_devh,
-    const uac_audio_info_t *info) {
+    const uac_audio_info_t *info,
+    int video_streaming) {
   if (usb_devh == NULL || info == NULL || info->packet_size == 0) {
     return NULL;
   }
@@ -633,7 +647,7 @@ uac_audio_t *uac_audio_start(
 
   /* EP0 works without claiming the audio interface; walk the AudioControl
    * topology and raise every mic gain found before streaming starts. */
-  uac_configure_audio_controls(usb_devh);
+  uac_configure_audio_controls(usb_devh, video_streaming);
 
   int submitted = 0;
   for (int i = 0; i < transfers_ready; i++) {

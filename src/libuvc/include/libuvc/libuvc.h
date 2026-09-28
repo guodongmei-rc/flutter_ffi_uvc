@@ -89,6 +89,10 @@ enum uvc_frame_format {
   UVC_FRAME_FORMAT_P010,
   /** H.265/HEVC encoded images (frame-based format, UVC 1.5) */
   UVC_FRAME_FORMAT_H265,
+  /** 32-bit RGBX/RGBA: one byte each of red, green, blue and a pad/alpha
+   * byte, in that memory order. Conversion output only; cameras never
+   * stream it. */
+  UVC_FRAME_FORMAT_RGBX,
   /** Number of formats understood */
   UVC_FRAME_FORMAT_COUNT,
 };
@@ -808,6 +812,7 @@ uvc_error_t uvc_yuyv2uv(uvc_frame_t *in, uvc_frame_t *out);
 
 #ifdef LIBUVC_HAS_JPEG
 uvc_error_t uvc_mjpeg2rgb(uvc_frame_t *in, uvc_frame_t *out);
+uvc_error_t uvc_mjpeg2rgbx(uvc_frame_t *in, uvc_frame_t *out);
 uvc_error_t uvc_mjpeg2gray(uvc_frame_t *in, uvc_frame_t *out);
 #endif
 

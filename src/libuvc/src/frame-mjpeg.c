@@ -167,6 +167,15 @@ static uvc_error_t uvc_mjpeg_convert(uvc_frame_t *in, uvc_frame_t *out) {
 
   if (out->frame_format == UVC_FRAME_FORMAT_RGB)
     dinfo.out_color_space = JCS_RGB;
+  else if (out->frame_format == UVC_FRAME_FORMAT_RGBX)
+#if defined(LIBJPEG_TURBO_VERSION)
+    /* JCS_EXT_RGBA (not JCS_EXT_RGBX): the alpha byte is forced to 0xFF,
+     * matching the explicit alpha fill callers used to do by hand. The
+     * JCS_EXT_* color spaces only exist in libjpeg-turbo. */
+    dinfo.out_color_space = JCS_EXT_RGBA;
+#else
+    goto fail;
+#endif
   else if (out->frame_format == UVC_FRAME_FORMAT_GRAY8)
     dinfo.out_color_space = JCS_GRAYSCALE;
   else
@@ -237,6 +246,36 @@ uvc_error_t uvc_mjpeg2rgb(uvc_frame_t *in, uvc_frame_t *out) {
   out->height = in->height;
   out->frame_format = UVC_FRAME_FORMAT_RGB;
   out->step = in->width * 3;
+  out->sequence = in->sequence;
+  out->capture_time = in->capture_time;
+  out->capture_time_finished = in->capture_time_finished;
+  out->source = in->source;
+
+  return uvc_mjpeg_convert(in, out);
+}
+
+/** @brief Convert an MJPEG frame to RGBX (32-bit RGBA byte order)
+ * @ingroup frame
+ *
+ * Decodes directly to 4 bytes per pixel via libjpeg-turbo's JCS_EXT_RGBA,
+ * skipping the separate RGB -> RGBA repack. The alpha byte is 0xFF.
+ * Honors out->library_owns_data: with a caller-supplied buffer (flag 0)
+ * the decode goes straight into it when it is large enough.
+ *
+ * @param in MJPEG frame
+ * @param out RGBX frame
+ */
+uvc_error_t uvc_mjpeg2rgbx(uvc_frame_t *in, uvc_frame_t *out) {
+  if (in->frame_format != UVC_FRAME_FORMAT_MJPEG)
+    return UVC_ERROR_INVALID_PARAM;
+
+  if (uvc_ensure_frame_size(out, in->width * in->height * 4) < 0)
+    return UVC_ERROR_NO_MEM;
+
+  out->width = in->width;
+  out->height = in->height;
+  out->frame_format = UVC_FRAME_FORMAT_RGBX;
+  out->step = in->width * 4;
   out->sequence = in->sequence;
   out->capture_time = in->capture_time;
   out->capture_time_finished = in->capture_time_finished;

@@ -61,18 +61,53 @@ typedef struct {
   uint32_t gap_ring_next;
 } ffi_uvc_stream_stats_t;
 
+#if defined(__ANDROID__)
+// One render-thread target: a window plus its dedicated gl_blit instance.
+// window is an owned reference swapped under the state mutex; blit is
+// created/used/destroyed on the render thread only (EGL contexts are
+// thread-bound). blit_window tracks which window the instance was built
+// for — a surface recreate makes them differ and the instance is rebuilt.
+#define RENDER_TARGET_PREVIEW 0
+#define RENDER_TARGET_RECORDING 1
+#define RENDER_TARGET_COUNT 2
+typedef struct {
+  ANativeWindow *window;
+  gl_blit_t *blit;
+  ANativeWindow *blit_window;
+  int blit_failed;
+  const char *name;  // "preview" / "recording", for logs
+} render_target_t;
+#endif
+
 typedef struct {
   pthread_mutex_t mutex;
   pthread_cond_t callback_cond;
+  // Signalled on every published frame and on render-thread state changes;
+  // shared with the (Android-only) render thread, so it exists on all
+  // platforms to keep publish/reset code unconditional.
+  pthread_cond_t render_cond;
   uvc_context_t *ctx;
   uvc_device_handle_t *devh;
   // Fd the device was opened with, kept so a stalled stream can be recovered
   // with a port-level reset without closing the handle first. -1 when closed.
   int device_fd;
   uvc_frame_t *rgb_frame;
+  // RGBA frame buffer pool with copy-free ownership handoff:
+  //  - latest_rgba: published frame; read by Dart only under the mutex and
+  //    by the render thread only while it is ALSO the render thread's busy
+  //    buffer, so its contents stay stable without any copy;
+  //  - staging_rgba: decode target of the callback thread;
+  //  - render_busy_rgba: buffer the render thread is reading right now;
+  //  - spare_rgba: idle slot recycled from the render thread.
+  // The callback thread only ever writes staging_rgba, and staging is chosen
+  // to be neither latest nor busy, so no full-frame copy happens anywhere.
   uint8_t *latest_rgba;
   size_t latest_rgba_bytes;
   size_t latest_rgba_capacity;
+  uint8_t *render_busy_rgba;
+  size_t render_busy_capacity;
+  uint8_t *spare_rgba;
+  size_t spare_rgba_capacity;
   // Raw JPEG copy of the most recent MJPEG frame that decoded successfully,
   // kept so uvc_capture_jpeg can return it losslessly without a re-encode.
   uint8_t *latest_jpeg;
@@ -107,12 +142,17 @@ typedef struct {
 #if defined(__ANDROID__)
   ANativeWindow *preview_window;
   ANativeWindow *recording_window;
-  // GPU blit for the recording (encoder input) surface only. Lazily created
-  // on the frame callback thread, destroyed after callbacks drain. The
-  // preview surface stays on the CPU blit: its SurfaceTexture producer may
-  // already be CPU-bound, which EGL cannot attach to.
-  gl_blit_t *gl_blit;
-  int gl_blit_failed;
+  // Unified render thread: the ONLY thread that touches EGL/GL and window
+  // buffers for the RGBA path (preview AND recording). Two GPU threads
+  // uploading 8MB textures concurrently destabilized the Adreno stack
+  // (BLTLIB semaphore errors, multi-second GPU stalls). The callback thread
+  // never renders; it publishes a frame and broadcasts render_cond.
+  // Started lazily on the first surface attach, stopped on device close.
+  pthread_t render_thread;
+  int render_thread_started;
+  int render_thread_stop;
+  int64_t render_done_sequence;
+  render_target_t render_targets[2];  // [0] preview, [1] recording
 #endif
   // Hardware decoder for H.264/H.265 streams; created lazily on the first
   // compressed-video frame of a session, destroyed on stop/close. Renders
@@ -134,6 +174,12 @@ typedef struct {
   // stopped via JNI from the platform recorder. Stopped (never just leaked)
   // before the USB device handle is closed.
   uac_audio_t *audio;
+  // Non-zero while NativeAudio_start runs its slow USB setup (claim,
+  // SET_INTERFACE, AudioControl transfers) WITHOUT the state mutex — holding
+  // the mutex across it trylock-dropped every video frame and the sync
+  // control transfers stalled the libusb event thread. Device close waits
+  // for this to clear so the borrowed usb_devh cannot dangle.
+  int audio_starting;
 #endif
   int preview_rotation;  // 0, 90, 180, 270 (clockwise)
   int preview_flip_h;    // mirror left-right
@@ -144,6 +190,7 @@ typedef struct {
 static ffi_uvc_state_t g_uvc_state = {
     .mutex = PTHREAD_MUTEX_INITIALIZER,
     .callback_cond = PTHREAD_COND_INITIALIZER,
+    .render_cond = PTHREAD_COND_INITIALIZER,
     .device_fd = -1,
 };
 
@@ -349,6 +396,8 @@ static const char *frame_format_name(enum uvc_frame_format format) {
       return "MJPEG";
     case UVC_FRAME_FORMAT_RGB:
       return "RGB";
+    case UVC_FRAME_FORMAT_RGBX:
+      return "RGBX";
     case UVC_FRAME_FORMAT_BGR:
       return "BGR";
     case UVC_FRAME_FORMAT_UYVY:
@@ -451,6 +500,17 @@ static void reset_stream_stats_locked(void) {
 }
 
 static void reset_frame_buffer_locked(void) {
+#if defined(__ANDROID__)
+  // The render thread may still be reading its busy buffer; wait for it to
+  // go idle before freeing the pool. It cannot grab a new frame meanwhile:
+  // grabs are gated on previewing/stopping_preview, and every caller of
+  // this function runs after begin_stop_preview_locked (or after the render
+  // thread was stopped). The wait releases the mutex, so the render thread
+  // can complete its return critical section.
+  while (g_uvc_state.render_busy_rgba != NULL) {
+    pthread_cond_wait(&g_uvc_state.render_cond, &g_uvc_state.mutex);
+  }
+#endif
   free(g_uvc_state.latest_rgba);
   g_uvc_state.latest_rgba = NULL;
   g_uvc_state.latest_rgba_bytes = 0;
@@ -458,6 +518,10 @@ static void reset_frame_buffer_locked(void) {
   free(g_uvc_state.staging_rgba);
   g_uvc_state.staging_rgba = NULL;
   g_uvc_state.staging_rgba_capacity = 0;
+  free(g_uvc_state.spare_rgba);
+  g_uvc_state.spare_rgba = NULL;
+  g_uvc_state.spare_rgba_capacity = 0;
+  g_uvc_state.render_busy_capacity = 0;
   free(g_uvc_state.latest_jpeg);
   g_uvc_state.latest_jpeg = NULL;
   g_uvc_state.latest_jpeg_bytes = 0;
@@ -508,6 +572,39 @@ static int convert_rgb_frame_to_staging(void) {
   return 1;
 }
 
+// Decodes an MJPEG frame straight into the RGBA staging buffer via
+// uvc_mjpeg2rgbx (libjpeg-turbo JCS_EXT_RGBA output): no intermediate RGB
+// frame and no per-pixel scalar repack. Runs on the callback thread only,
+// outside the mutex. Returns UVC_SUCCESS, UVC_ERROR_NO_MEM when the staging
+// buffer cannot be grown, or the decoder error.
+static uvc_error_t decode_mjpeg_to_staging_rgba(
+    uvc_frame_t *frame, int width, int height) {
+#if defined(LIBUVC_HAS_JPEG)
+  const size_t required_bytes = (size_t)width * (size_t)height * 4;
+  if (!ensure_staging_rgba(required_bytes)) {
+    return UVC_ERROR_NO_MEM;
+  }
+
+  // Stack view over the staging buffer: library_owns_data=0 guarantees
+  // uvc_mjpeg2rgbx validates capacity instead of reallocating the buffer
+  // (which would leave g_uvc_state.staging_rgba dangling).
+  uvc_frame_t out;
+  memset(&out, 0, sizeof(out));
+  out.data = g_uvc_state.staging_rgba;
+  out.data_bytes = g_uvc_state.staging_rgba_capacity;
+  out.width = (uint32_t)width;
+  out.height = (uint32_t)height;
+  out.frame_format = UVC_FRAME_FORMAT_RGBX;
+  out.step = (size_t)width * 4;
+  return uvc_mjpeg2rgbx(frame, &out);
+#else
+  (void)frame;
+  (void)width;
+  (void)height;
+  return UVC_ERROR_NOT_SUPPORTED;
+#endif
+}
+
 static int copy_mjpeg_to_staging(const uvc_frame_t *frame) {
   if (frame->data_bytes == 0) {
     return 0;
@@ -526,16 +623,30 @@ static int copy_mjpeg_to_staging(const uvc_frame_t *frame) {
   return 1;
 }
 
-// Publishes the staged frame to the shared buffers with O(1) pointer swaps.
+// Publishes the staged frame with O(1) pointer moves — no copy anywhere:
+// the decoded buffer becomes the published frame, and the next decode
+// target is a buffer nobody else reads. Dart reads latest_rgba only under
+// this mutex; the render thread reads only render_busy_rgba. A buffer the
+// render thread still holds is never reused for decode — the spare slot
+// (recycled by the render thread) covers that case instead.
 static void publish_staging_frame_locked(
     int width, int height, int jpeg_staged, size_t jpeg_bytes) {
-  uint8_t *old_rgba = g_uvc_state.latest_rgba;
-  size_t old_rgba_capacity = g_uvc_state.latest_rgba_capacity;
+  uint8_t *old_published = g_uvc_state.latest_rgba;
+  const size_t old_published_capacity = g_uvc_state.latest_rgba_capacity;
+
   g_uvc_state.latest_rgba = g_uvc_state.staging_rgba;
   g_uvc_state.latest_rgba_capacity = g_uvc_state.staging_rgba_capacity;
   g_uvc_state.latest_rgba_bytes = (size_t)width * (size_t)height * 4;
-  g_uvc_state.staging_rgba = old_rgba;
-  g_uvc_state.staging_rgba_capacity = old_rgba_capacity;
+
+  if (old_published != NULL && old_published != g_uvc_state.render_busy_rgba) {
+    g_uvc_state.staging_rgba = old_published;
+    g_uvc_state.staging_rgba_capacity = old_published_capacity;
+  } else {
+    g_uvc_state.staging_rgba = g_uvc_state.spare_rgba;
+    g_uvc_state.staging_rgba_capacity = g_uvc_state.spare_rgba_capacity;
+    g_uvc_state.spare_rgba = NULL;
+    g_uvc_state.spare_rgba_capacity = 0;
+  }
 
   g_uvc_state.frame_width = width;
   g_uvc_state.frame_height = height;
@@ -553,6 +664,10 @@ static void publish_staging_frame_locked(
     g_uvc_state.latest_jpeg_height = height;
     g_uvc_state.latest_jpeg_sequence = g_uvc_state.latest_sequence;
   }
+
+  // Wake the render thread (and any reset waiters re-checking their
+  // predicate). Broadcast, not signal: several waiters share this cond.
+  pthread_cond_broadcast(&g_uvc_state.render_cond);
 }
 
 static void blit_rgba_transform(
@@ -655,6 +770,235 @@ static int render_rgba_to_window(
   ANativeWindow_unlockAndPost(window);
   return 1;
 }
+
+// ---------------------------------------------------------------------------
+// Unified render thread: the ONLY thread that touches EGL/GL and window
+// buffers for the RGBA path. Previously the callback thread rendered the
+// preview while a second thread rendered the recording surface — two GPU
+// threads uploading ~8MB textures concurrently destabilized the Adreno
+// stack (BLTLIB semaphore errors, multi-second GPU stalls that then froze
+// the callback thread behind eglSwapBuffers and tripped the stall watchdog).
+//
+// The callback thread never renders: publish_staging_frame_locked hands the
+// frame over by pointer (see the buffer-pool comment on ffi_uvc_state_t) and
+// broadcasts render_cond. This thread grabs the newest published buffer —
+// latest wins, frames published while it renders are dropped — then serves
+// every attached window in order: preview first, then the recording
+// (encoder input) surface. Encoder backpressure and GPU stalls block only
+// this thread; the frame sequence keeps advancing either way. Each window
+// gets its own gl_blit instance, all driven from this one thread.
+// ---------------------------------------------------------------------------
+
+// Renders one frame to a target, GPU first with a CPU-blit fallback, timing
+// every call: a single render (which includes eglSwapBuffers, the known
+// backpressure/stall point) taking more than 100ms is logged, to confirm or
+// rule out GPU stalls in the field. Runs on the render thread, no locks.
+static void render_frame_to_target(
+    render_target_t *target,
+    ANativeWindow *window,
+    const uint8_t *rgba,
+    int width,
+    int height,
+    int rot,
+    int flip_h,
+    int flip_v) {
+  if (target->blit != NULL && target->blit_window != window) {
+    // The surface was recreated (new ANativeWindow pointer): the old
+    // instance's EGL surfaces belong to the old window. Rebuild — also
+    // keeps the instance's bounded window-slot table from filling up.
+    gl_blit_destroy(target->blit);
+    target->blit = NULL;
+    target->blit_window = NULL;
+    target->blit_failed = 0;
+  }
+
+  int rendered = 0;
+  if (!target->blit_failed && target->blit == NULL) {
+    target->blit = gl_blit_create();
+    if (target->blit == NULL) {
+      target->blit_failed = 1;
+    } else {
+      target->blit_window = window;
+    }
+  }
+  if (target->blit != NULL) {
+    const uint64_t start_ns = monotonic_time_ns();
+    rendered = gl_blit_render(
+        target->blit, window, rgba, width, height, rot, flip_h, flip_v);
+    const uint64_t elapsed_ns = monotonic_time_ns() - start_ns;
+    if (elapsed_ns > 100ull * 1000 * 1000) {
+      UVC_LOGW(
+          "UVC_NATIVE",
+          "%s gl_blit_render (incl eglSwapBuffers) took %llu ms",
+          target->name,
+          (unsigned long long)(elapsed_ns / 1000000ull));
+    }
+  }
+  if (!rendered) {
+    const uint64_t start_ns = monotonic_time_ns();
+    rendered = render_rgba_to_window(
+        window, rgba, width, height, rot, flip_h, flip_v);
+    const uint64_t elapsed_ns = monotonic_time_ns() - start_ns;
+    if (elapsed_ns > 100ull * 1000 * 1000) {
+      UVC_LOGW(
+          "UVC_NATIVE",
+          "%s cpu blit took %llu ms",
+          target->name,
+          (unsigned long long)(elapsed_ns / 1000000ull));
+    }
+  }
+  if (!rendered) {
+    if (target == &g_uvc_state.render_targets[RENDER_TARGET_PREVIEW]) {
+      __sync_add_and_fetch(&g_uvc_state.stats.preview_surface_failure_count, 1);
+    } else {
+      __sync_add_and_fetch(&g_uvc_state.stats.recording_surface_failure_count, 1);
+    }
+  }
+}
+
+static void *render_thread_main(void *arg) {
+  (void)arg;
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  for (;;) {
+    while (!g_uvc_state.render_thread_stop &&
+           (!g_uvc_state.previewing ||
+            g_uvc_state.stopping_preview ||
+            g_uvc_state.latest_sequence == g_uvc_state.render_done_sequence ||
+            g_uvc_state.latest_rgba == NULL)) {
+      pthread_cond_wait(&g_uvc_state.render_cond, &g_uvc_state.mutex);
+    }
+    if (g_uvc_state.render_thread_stop) {
+      break;
+    }
+
+    // Grab the newest published frame as the busy buffer. Until the return
+    // below, the callback thread will not reuse this buffer for decoding
+    // (publish picks a different staging buffer), and Dart reads it only
+    // under the mutex — concurrent reads are safe, no copy needed.
+    g_uvc_state.render_busy_rgba = g_uvc_state.latest_rgba;
+    g_uvc_state.render_busy_capacity = g_uvc_state.latest_rgba_capacity;
+    g_uvc_state.render_done_sequence = g_uvc_state.latest_sequence;
+    const uint8_t *rgba = g_uvc_state.latest_rgba;
+    const int width = g_uvc_state.frame_width;
+    const int height = g_uvc_state.frame_height;
+    const int rot = g_uvc_state.preview_rotation;
+    const int flip_h = g_uvc_state.preview_flip_h;
+    const int flip_v = g_uvc_state.preview_flip_v;
+    // Per-cycle window references: a concurrent detach only drops the
+    // target's own reference, never one acquired here.
+    ANativeWindow *windows[RENDER_TARGET_COUNT] = {NULL, NULL};
+    for (int i = 0; i < RENDER_TARGET_COUNT; i++) {
+      if (g_uvc_state.render_targets[i].window != NULL) {
+        windows[i] = g_uvc_state.render_targets[i].window;
+        ANativeWindow_acquire(windows[i]);
+      }
+    }
+    pthread_mutex_unlock(&g_uvc_state.mutex);
+
+    for (int i = 0; i < RENDER_TARGET_COUNT; i++) {
+      if (windows[i] == NULL) {
+        continue;
+      }
+      render_frame_to_target(
+          &g_uvc_state.render_targets[i],
+          windows[i],
+          rgba,
+          width,
+          height,
+          rot,
+          flip_h,
+          flip_v);
+      ANativeWindow_release(windows[i]);
+    }
+
+    pthread_mutex_lock(&g_uvc_state.mutex);
+    if (g_uvc_state.render_busy_rgba != g_uvc_state.latest_rgba) {
+      // A newer frame was published while rendering: this buffer is stale
+      // and unreferenced, recycle it as the decode spare. (The spare slot
+      // is empty by construction whenever the render thread held a buffer
+      // across a publish.)
+      g_uvc_state.spare_rgba = g_uvc_state.render_busy_rgba;
+      g_uvc_state.spare_rgba_capacity = g_uvc_state.render_busy_capacity;
+    }
+    g_uvc_state.render_busy_rgba = NULL;
+    g_uvc_state.render_busy_capacity = 0;
+    pthread_cond_broadcast(&g_uvc_state.render_cond);
+  }
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+
+  // Teardown on this thread: EGL contexts are thread-bound. Only this
+  // thread ever touches the blit instances.
+  for (int i = 0; i < RENDER_TARGET_COUNT; i++) {
+    if (g_uvc_state.render_targets[i].blit != NULL) {
+      gl_blit_destroy(g_uvc_state.render_targets[i].blit);
+      g_uvc_state.render_targets[i].blit = NULL;
+      g_uvc_state.render_targets[i].blit_window = NULL;
+      g_uvc_state.render_targets[i].blit_failed = 0;
+    }
+  }
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  for (int i = 0; i < RENDER_TARGET_COUNT; i++) {
+    if (g_uvc_state.render_targets[i].window != NULL) {
+      ANativeWindow_release(g_uvc_state.render_targets[i].window);
+      g_uvc_state.render_targets[i].window = NULL;
+    }
+  }
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+  return NULL;
+}
+
+// Swaps the window a render target serves and lazily starts the render
+// thread on the first attach. Caller holds g_uvc_state.mutex.
+static void render_set_target_locked(int index, ANativeWindow *window) {
+  render_target_t *target = &g_uvc_state.render_targets[index];
+  if (target->name == NULL) {
+    target->name = index == RENDER_TARGET_PREVIEW ? "preview" : "recording";
+  }
+  if (target->window == window) {
+    return;
+  }
+  if (target->window != NULL) {
+    // Safe while the render thread is mid-cycle: it renders with its own
+    // per-cycle reference acquired under this mutex.
+    ANativeWindow_release(target->window);
+  }
+  target->window = window;
+  if (window != NULL) {
+    ANativeWindow_acquire(window);
+  }
+  if (window != NULL && !g_uvc_state.render_thread_started) {
+    g_uvc_state.render_thread_stop = 0;
+    if (pthread_create(
+            &g_uvc_state.render_thread, NULL, render_thread_main, NULL) == 0) {
+      g_uvc_state.render_thread_started = 1;
+    } else {
+      UVC_LOGE("UVC_NATIVE", "failed to start render thread");
+      ANativeWindow_release(window);
+      target->window = NULL;
+    }
+  }
+}
+
+// Requests the render thread to exit and joins it. Must NOT be called with
+// g_uvc_state.mutex held: the thread takes that mutex in every cycle.
+// Idempotent.
+static void render_thread_stop(void) {
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  if (!g_uvc_state.render_thread_started) {
+    pthread_mutex_unlock(&g_uvc_state.mutex);
+    return;
+  }
+  g_uvc_state.render_thread_stop = 1;
+  pthread_cond_broadcast(&g_uvc_state.render_cond);
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+
+  pthread_join(g_uvc_state.render_thread, NULL);
+
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  g_uvc_state.render_thread_started = 0;
+  g_uvc_state.render_thread_stop = 0;
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+}
 #endif
 
 static void finish_callback_locked(void) {
@@ -694,15 +1038,6 @@ static int begin_stop_preview_locked(uvc_device_handle_t **devh_to_stop) {
 static void finish_stop_preview_locked(void) {
   wait_for_callbacks_locked();
   reset_frame_buffer_locked();
-#if defined(__ANDROID__)
-  if (g_uvc_state.gl_blit != NULL) {
-    // Safe here: callbacks are drained and the render thread has exited, so
-    // the EGL context is no longer current anywhere.
-    gl_blit_destroy(g_uvc_state.gl_blit);
-    g_uvc_state.gl_blit = NULL;
-  }
-  g_uvc_state.gl_blit_failed = 0;
-#endif
   if (g_uvc_state.h26x_rawrec != NULL) {
     // Keep the temp file; the platform layer finalizes (remuxes) it later.
     rec_writer_stop();
@@ -732,6 +1067,14 @@ static void finish_stop_preview_locked(void) {
 }
 
 static void close_device_resources_locked(void) {
+#if defined(__ANDROID__)
+  // An audio start in flight borrowed usb_devh outside the mutex; wait for
+  // it to finish (it only needs the mutex briefly at the end, which
+  // pthread_cond_wait provides) before uvc_close invalidates the handle.
+  while (g_uvc_state.audio_starting) {
+    pthread_cond_wait(&g_uvc_state.callback_cond, &g_uvc_state.mutex);
+  }
+#endif
   if (g_uvc_state.h26x_rawrec != NULL) {
     rec_writer_stop();
     g_uvc_state.h26x_rawrec = NULL;
@@ -754,6 +1097,11 @@ static void close_device_resources_locked(void) {
     h26x_decoder_destroy(g_uvc_state.h26x_rec_decoder);
     g_uvc_state.h26x_rec_decoder = NULL;
   }
+  // Detach the render targets as well: the render thread (when still
+  // running, e.g. on the reopen path) must not keep rendering into the
+  // previous session's surfaces.
+  render_set_target_locked(RENDER_TARGET_PREVIEW, NULL);
+  render_set_target_locked(RENDER_TARGET_RECORDING, NULL);
   release_preview_window_locked();
   release_recording_window_locked();
 #endif
@@ -1192,51 +1540,80 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
   // from freeing these buffers while the lock is dropped.
   const int width = (int)frame->width;
   const int height = (int)frame->height;
-  const size_t required_rgb_bytes = (size_t)width * (size_t)height * 3;
 
-  if (!ensure_rgb_frame(required_rgb_bytes)) {
-    UVC_LOGE(
-        "UVC_NATIVE",
-        "frame callback failed to prepare rgb buffer callback=%u width=%d height=%d bytes=%zu",
-        callback_count,
-        width,
-        height,
-        required_rgb_bytes);
-    pthread_mutex_lock(&g_uvc_state.mutex);
-    g_uvc_state.stats.buffer_allocation_failure_count += 1;
-    g_uvc_state.stats.decode_failure_count += 1;
-    set_last_error("Failed to allocate RGB frame buffer (%zu bytes)", required_rgb_bytes);
-    abort_frame_callback_locked_and_notify();
-    return;
-  }
+  if (frame->frame_format == UVC_FRAME_FORMAT_MJPEG) {
+    // MJPEG decodes straight into the RGBA staging buffer — no intermediate
+    // RGB frame, no per-pixel repack (was ~2 MP of scalar work per frame at
+    // 1080p, on the serial callback thread).
+    const uvc_error_t decode_result =
+        decode_mjpeg_to_staging_rgba(frame, width, height);
+    if (decode_result != UVC_SUCCESS) {
+      UVC_LOGE(
+          "UVC_NATIVE",
+          "mjpeg decode to rgba failed callback=%u width=%d height=%d err=%s",
+          callback_count,
+          width,
+          height,
+          uvc_strerror(decode_result));
+      pthread_mutex_lock(&g_uvc_state.mutex);
+      if (decode_result == UVC_ERROR_NO_MEM) {
+        g_uvc_state.stats.buffer_allocation_failure_count += 1;
+      } else {
+        g_uvc_state.stats.conversion_failure_count += 1;
+      }
+      g_uvc_state.stats.decode_failure_count += 1;
+      set_last_error(
+          "MJPEG decode to RGBA failed: %s", uvc_strerror(decode_result));
+      abort_frame_callback_locked_and_notify();
+      return;
+    }
+  } else {
+    const size_t required_rgb_bytes = (size_t)width * (size_t)height * 3;
 
-  uvc_error_t convert_result = uvc_any2rgb(frame, g_uvc_state.rgb_frame);
-  if (convert_result != UVC_SUCCESS) {
-    UVC_LOGE(
-        "UVC_NATIVE",
-        "uvc_any2rgb failed callback=%u format=%d width=%d height=%d err=%s",
-        callback_count,
-        frame->frame_format,
-        width,
-        height,
-        uvc_strerror(convert_result));
-    pthread_mutex_lock(&g_uvc_state.mutex);
-    g_uvc_state.stats.conversion_failure_count += 1;
-    g_uvc_state.stats.decode_failure_count += 1;
-    set_last_error("uvc_any2rgb failed: %s", uvc_strerror(convert_result));
-    abort_frame_callback_locked_and_notify();
-    return;
-  }
+    if (!ensure_rgb_frame(required_rgb_bytes)) {
+      UVC_LOGE(
+          "UVC_NATIVE",
+          "frame callback failed to prepare rgb buffer callback=%u width=%d height=%d bytes=%zu",
+          callback_count,
+          width,
+          height,
+          required_rgb_bytes);
+      pthread_mutex_lock(&g_uvc_state.mutex);
+      g_uvc_state.stats.buffer_allocation_failure_count += 1;
+      g_uvc_state.stats.decode_failure_count += 1;
+      set_last_error("Failed to allocate RGB frame buffer (%zu bytes)", required_rgb_bytes);
+      abort_frame_callback_locked_and_notify();
+      return;
+    }
 
-  if (!convert_rgb_frame_to_staging()) {
-    pthread_mutex_lock(&g_uvc_state.mutex);
-    g_uvc_state.stats.buffer_allocation_failure_count += 1;
-    g_uvc_state.stats.decode_failure_count += 1;
-    set_last_error(
-        "Failed to allocate %zu bytes for preview frame",
-        (size_t)width * (size_t)height * 4);
-    abort_frame_callback_locked_and_notify();
-    return;
+    uvc_error_t convert_result = uvc_any2rgb(frame, g_uvc_state.rgb_frame);
+    if (convert_result != UVC_SUCCESS) {
+      UVC_LOGE(
+          "UVC_NATIVE",
+          "uvc_any2rgb failed callback=%u format=%d width=%d height=%d err=%s",
+          callback_count,
+          frame->frame_format,
+          width,
+          height,
+          uvc_strerror(convert_result));
+      pthread_mutex_lock(&g_uvc_state.mutex);
+      g_uvc_state.stats.conversion_failure_count += 1;
+      g_uvc_state.stats.decode_failure_count += 1;
+      set_last_error("uvc_any2rgb failed: %s", uvc_strerror(convert_result));
+      abort_frame_callback_locked_and_notify();
+      return;
+    }
+
+    if (!convert_rgb_frame_to_staging()) {
+      pthread_mutex_lock(&g_uvc_state.mutex);
+      g_uvc_state.stats.buffer_allocation_failure_count += 1;
+      g_uvc_state.stats.decode_failure_count += 1;
+      set_last_error(
+          "Failed to allocate %zu bytes for preview frame",
+          (size_t)width * (size_t)height * 4);
+      abort_frame_callback_locked_and_notify();
+      return;
+    }
   }
 
   int jpeg_staged = 0;
@@ -1246,18 +1623,10 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
     jpeg_staged = copy_mjpeg_to_staging(frame);
   }
 
-  // Phase 3 — short lock: publish the staged frame with pointer swaps and
-  // snapshot everything the blit needs.
+  // Phase 3 — short lock: publish the staged frame (pointer moves only) and
+  // wake the render thread. This thread never touches a window or EGL.
   int64_t delivered_sequence = 0;
   uvc_frame_listener_t frame_listener = NULL;
-  const uint8_t *render_rgba = NULL;
-  int render_rot = 0;
-  int render_fh = 0;
-  int render_fv = 0;
-#if defined(__ANDROID__)
-  ANativeWindow *preview_window = NULL;
-  ANativeWindow *recording_window = NULL;
-#endif
 
   pthread_mutex_lock(&g_uvc_state.mutex);
   if (g_uvc_state.stopping_preview) {
@@ -1294,92 +1663,10 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
   g_uvc_state.stats.decode_success_count += 1;
   delivered_sequence = g_uvc_state.latest_sequence;
   frame_listener = g_uvc_state.frame_listener;
-  render_rgba = g_uvc_state.latest_rgba;
-  render_rot = g_uvc_state.preview_rotation;
-  render_fh = g_uvc_state.preview_flip_h;
-  render_fv = g_uvc_state.preview_flip_v;
-#if defined(__ANDROID__)
-  preview_window = g_uvc_state.preview_window;
-  if (preview_window != NULL) {
-    ANativeWindow_acquire(preview_window);
-  }
-  recording_window = g_uvc_state.recording_window;
-  if (recording_window != NULL) {
-    ANativeWindow_acquire(recording_window);
-  }
-#endif
   clear_last_error();
-  pthread_mutex_unlock(&g_uvc_state.mutex);
 
-  // Phase 4 — no lock held: blit to the surfaces. latest_rgba cannot be
-  // swapped concurrently (libuvc delivers callbacks serially) nor freed
-  // (callbacks_inflight is still held); the windows are kept alive by the
-  // references acquired above.
-#if defined(__ANDROID__)
-  int preview_failed = 0;
-  int recording_failed = 0;
-  ANativeWindow *gl_windows[2] = {preview_window, recording_window};
-  int gl_results[2] = {0, 0};
-  const int any_window = preview_window != NULL || recording_window != NULL;
-  if (any_window && !g_uvc_state.gl_blit_failed && g_uvc_state.gl_blit == NULL) {
-    g_uvc_state.gl_blit = gl_blit_create();
-    if (g_uvc_state.gl_blit == NULL) {
-      g_uvc_state.gl_blit_failed = 1;
-    }
-  }
-  // GPU blit for both surfaces (one texture upload each, rotation/flip in
-  // texture coordinates). A window that rejects EGL is marked inside the
-  // renderer and stays on the CPU blit — but note that once a window is fed
-  // through the CPU API, EGL can never attach to it later.
-  if (g_uvc_state.gl_blit != NULL) {
-    for (int i = 0; i < 2; i++) {
-      if (gl_windows[i] != NULL) {
-        gl_results[i] = gl_blit_render(
-            g_uvc_state.gl_blit,
-            gl_windows[i],
-            render_rgba,
-            width,
-            height,
-            render_rot,
-            render_fh,
-            render_fv);
-      }
-    }
-  }
-  if (preview_window != NULL) {
-    if (!gl_results[0]) {
-      preview_failed = !render_rgba_to_window(
-          preview_window, render_rgba, width, height,
-          render_rot, render_fh, render_fv);
-    }
-    ANativeWindow_release(preview_window);
-  }
-  if (recording_window != NULL) {
-    if (!gl_results[1]) {
-      recording_failed = !render_rgba_to_window(
-          recording_window, render_rgba, width, height,
-          render_rot, render_fh, render_fv);
-    }
-    ANativeWindow_release(recording_window);
-  }
-#else
-  (void)render_rgba;
-  (void)render_rot;
-  (void)render_fh;
-  (void)render_fv;
-#endif
-
-  // Phase 5 — short lock: failure accounting and inflight release.
-  pthread_mutex_lock(&g_uvc_state.mutex);
-#if defined(__ANDROID__)
-  if (preview_failed) {
-    g_uvc_state.stats.preview_surface_failure_count += 1;
-    set_last_error("Failed to render preview surface");
-  }
-  if (recording_failed) {
-    g_uvc_state.stats.recording_surface_failure_count += 1;
-  }
-#endif
+  // Phase 4 — short lock: inflight release. All window rendering happens on
+  // the unified render thread, woken by the broadcast inside publish.
   finish_callback_locked();
   pthread_mutex_unlock(&g_uvc_state.mutex);
 
@@ -1952,6 +2239,13 @@ FFI_PLUGIN_EXPORT void uvc_close_device(void) {
     uvc_stop_streaming(devh_to_stop);
   }
 
+#if defined(__ANDROID__)
+  // Stop the unified render thread before teardown: it takes the state
+  // mutex in every cycle, so it must be joined from outside the lock. After
+  // this, reset_frame_buffer_locked's idle wait is trivially satisfied.
+  render_thread_stop();
+#endif
+
   pthread_mutex_lock(&g_uvc_state.mutex);
   if (should_stop_streaming) {
     finish_stop_preview_locked();
@@ -1988,6 +2282,7 @@ Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeAttachSurface(
   pthread_mutex_lock(&g_uvc_state.mutex);
   release_preview_window_locked();
   g_uvc_state.preview_window = window;
+  render_set_target_locked(RENDER_TARGET_PREVIEW, window);
   pthread_mutex_unlock(&g_uvc_state.mutex);
   clear_last_error();
   return UVC_SUCCESS;
@@ -2001,6 +2296,7 @@ Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeDetachSurface(
   (void)thiz;
 
   pthread_mutex_lock(&g_uvc_state.mutex);
+  render_set_target_locked(RENDER_TARGET_PREVIEW, NULL);
   release_preview_window_locked();
   pthread_mutex_unlock(&g_uvc_state.mutex);
 }
@@ -2098,6 +2394,7 @@ Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeAttachRecordingSurf
   pthread_mutex_lock(&g_uvc_state.mutex);
   release_recording_window_locked();
   g_uvc_state.recording_window = window;
+  render_set_target_locked(RENDER_TARGET_RECORDING, window);
   pthread_mutex_unlock(&g_uvc_state.mutex);
   clear_last_error();
   return UVC_SUCCESS;
@@ -2110,7 +2407,11 @@ Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeDetachRecordingSurf
   (void)env;
   (void)thiz;
 
+  // Detaching only swaps the render target's window pointer — the render
+  // thread keeps running (it may still serve the preview) and drops the
+  // recording window from its next cycle on.
   pthread_mutex_lock(&g_uvc_state.mutex);
+  render_set_target_locked(RENDER_TARGET_RECORDING, NULL);
   release_recording_window_locked();
   pthread_mutex_unlock(&g_uvc_state.mutex);
 }
@@ -2159,18 +2460,48 @@ Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_start(
 
   pthread_mutex_lock(&g_uvc_state.mutex);
   jint result = UVC_ERROR_OTHER;
-  if (g_uvc_state.audio != NULL) {
+  libusb_device_handle *usb_devh = NULL;
+  int video_streaming = 0;
+  if (g_uvc_state.audio != NULL || g_uvc_state.audio_starting) {
     result = UVC_ERROR_BUSY;
   } else if (g_uvc_state.devh == NULL) {
     result = UVC_ERROR_NO_DEVICE;
   } else {
-    uac_audio_info_t info;
-    if (uac_audio_probe(g_uvc_state.devh->usb_devh, &info) != 0) {
-      result = UVC_ERROR_INVALID_DEVICE;
-    } else {
-      g_uvc_state.audio = uac_audio_start(g_uvc_state.devh->usb_devh, &info);
-      result = g_uvc_state.audio != NULL ? UVC_SUCCESS : UVC_ERROR_IO;
+    // Flip the state bit under the mutex, then run the slow USB setup
+    // (interface claim with 3x50ms retries, SET_INTERFACE and the
+    // AudioControl transfers, each up to 300ms) WITHOUT the lock: holding
+    // it made every frame callback trylock-fail and drop its frame, and
+    // the sync control transfers starved the libusb event thread of the
+    // events lock, pausing video URB resubmission. audio_starting keeps
+    // device close from freeing devh while it is borrowed.
+    g_uvc_state.audio_starting = 1;
+    usb_devh = g_uvc_state.devh->usb_devh;
+    video_streaming = g_uvc_state.previewing;
+  }
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+  if (usb_devh == NULL) {
+    return result;
+  }
+
+  uac_audio_info_t info;
+  uac_audio_t *audio = NULL;
+  if (uac_audio_probe(usb_devh, &info) != 0) {
+    result = UVC_ERROR_INVALID_DEVICE;
+  } else {
+    audio = uac_audio_start(usb_devh, &info, video_streaming);
+    if (audio == NULL) {
+      result = UVC_ERROR_IO;
     }
+  }
+
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  g_uvc_state.audio_starting = 0;
+  pthread_cond_broadcast(&g_uvc_state.callback_cond);
+  if (audio != NULL) {
+    // devh is still valid: close_device_resources_locked waits for
+    // audio_starting to clear before closing the device.
+    g_uvc_state.audio = audio;
+    result = UVC_SUCCESS;
   }
   pthread_mutex_unlock(&g_uvc_state.mutex);
   return result;
@@ -2195,9 +2526,10 @@ Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_read(
     return UVC_ERROR_INVALID_PARAM;
   }
 
-  // The session is stopped and freed only by callers holding
-  // g_uvc_state.mutex (nativeAudioStop, preview stop, device close), so
-  // retaining under the mutex keeps the session alive for this read.
+  // The session pointer is detached from the state only under
+  // g_uvc_state.mutex (NativeAudio_stop, preview stop, device close), so
+  // fetching + retaining under the mutex keeps the session alive for this
+  // read even though the actual stop/free runs outside the mutex.
   pthread_mutex_lock(&g_uvc_state.mutex);
   uac_audio_t *audio = g_uvc_state.audio;
   if (audio != NULL) {
@@ -2222,12 +2554,19 @@ Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_stop(
   (void)env;
   (void)thiz;
 
+  // Detach under the mutex, stop outside it: uac_audio_stop blocks until
+  // the libusb event thread services the transfer cancellations and active
+  // readers drain, and it ends with two synchronous control transfers —
+  // none of which should hold back frame callbacks. Readers that already
+  // retained the session keep it alive until they leave (uac_audio_retain);
+  // new readers see NULL.
   pthread_mutex_lock(&g_uvc_state.mutex);
-  if (g_uvc_state.audio != NULL) {
-    uac_audio_stop(g_uvc_state.audio);
-    g_uvc_state.audio = NULL;
-  }
+  uac_audio_t *audio = g_uvc_state.audio;
+  g_uvc_state.audio = NULL;
   pthread_mutex_unlock(&g_uvc_state.mutex);
+  if (audio != NULL) {
+    uac_audio_stop(audio);
+  }
   return UVC_SUCCESS;
 }
 #endif

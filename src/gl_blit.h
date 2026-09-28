@@ -10,18 +10,21 @@
 extern "C" {
 #endif
 
-/* GPU blit for the video-encoder input surface: uploads a decoded RGBA frame
- * as a GL texture and draws it into the encoder's ANativeWindow with
- * rotation/flip in texture coordinates, replacing the per-pixel CPU blit
- * (blit_rgba_transform + ANativeWindow_lock, ~8MB transformed writes per
- * frame) on the recording path.
+/* GPU blit: uploads a decoded RGBA frame as a GL texture and draws it into
+ * an ANativeWindow with rotation/flip in texture coordinates, replacing the
+ * per-pixel CPU blit (blit_rgba_transform + ANativeWindow_lock, ~8MB
+ * transformed writes per frame at 1080p). A window that rejects EGL is
+ * marked unsupported and the caller falls back to the CPU blit for it.
  *
- * Only ever used with the encoder surface, never with Flutter's
- * SurfaceTexture (its producer API may already be CPU-bound, which EGL
- * cannot attach to).
+ * Two independent instances exist — one for the preview surface, one for
+ * the recording (encoder input) surface — but BOTH are driven from the
+ * single unified render thread: only one thread ever touches EGL, and
+ * encoder backpressure (a blocking eglSwapBuffers) stalls neither the
+ * frame callback thread nor the preview's renderer instance.
  *
- * Threading: all gl_blit_render calls run on the frame callback thread;
- * gl_blit_destroy runs after that thread has exited. */
+ * Threading: each instance is single-threaded — gl_blit_create,
+ * gl_blit_render and gl_blit_destroy of one instance must all run on the
+ * same thread (EGL contexts are thread-bound). */
 typedef struct gl_blit gl_blit_t;
 
 gl_blit_t *gl_blit_create(void);
