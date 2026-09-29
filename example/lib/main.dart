@@ -90,7 +90,9 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
   @override
   void initState() {
     super.initState();
-    _camera.setLogLevel(UvcLogLevel.debug);
+    // Info by default; flip to debug when the pipeline-timing diagnostics
+    // (UVC_PERF windows, recording selftest) are needed.
+    _camera.setLogLevel(UvcLogLevel.info);
     WidgetsBinding.instance.addObserver(this);
     _streamErrorSub = _camera.streamErrors.listen(_onStreamError);
     // USB hot-plug notifications: attach refreshes the list, detach of the
