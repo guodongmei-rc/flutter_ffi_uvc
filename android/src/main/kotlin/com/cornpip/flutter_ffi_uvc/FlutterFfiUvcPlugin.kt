@@ -484,12 +484,18 @@ class FlutterFfiUvcPlugin :
                 // The output codec follows the camera stream: H.265 stays
                 // H.265 when the device has an HEVC encoder, otherwise the
                 // recording falls back to H.264.
+                val cameraFormat = call.argument<String>("cameraFormat")
                 val videoMime =
-                    if (call.argument<String>("cameraFormat") == "H265" && hevcEncoderAvailable()) {
+                    if (cameraFormat == "H265" && hevcEncoderAvailable()) {
                         MediaFormat.MIMETYPE_VIDEO_HEVC
                     } else {
                         MediaFormat.MIMETYPE_VIDEO_AVC
                     }
+                // Feed mode follows the camera stream too: H.264/H.265 keep
+                // the decoder-to-Surface path; uncompressed/MJPEG previews
+                // are fed as YUV byte buffers from the native recording
+                // queue (no GL, no input Surface on that path).
+                val useBufferInput = cameraFormat != "H264" && cameraFormat != "H265"
                 val audioEncoder = if (call.argument<Boolean>("withAudio") ?: true) {
                     tryStartAudioCapture()?.let { AacAudioEncoder(it[0], it[1]) }
                 } else {
@@ -497,18 +503,21 @@ class FlutterFfiUvcPlugin :
                 }
                 try {
                     val recorder = VideoRecorder(
-                        context, width, height, bitRate, frameRate, audioEncoder, videoMime,
+                        context, width, height, bitRate, frameRate, audioEncoder,
+                        videoMime, useBufferInput,
                     )
                     val surface = recorder.start()
-                    val attachResult = nativeAttachRecordingSurface(surface)
-                    if (attachResult != 0) {
-                        recorder.abort()
-                        result.error(
-                            "attach_failed",
-                            "nativeAttachRecordingSurface failed with code $attachResult",
-                            attachResult,
-                        )
-                        return
+                    if (!useBufferInput) {
+                        val attachResult = nativeAttachRecordingSurface(surface!!)
+                        if (attachResult != 0) {
+                            recorder.abort()
+                            result.error(
+                                "attach_failed",
+                                "nativeAttachRecordingSurface failed with code $attachResult",
+                                attachResult,
+                            )
+                            return
+                        }
                     }
                     videoRecorder = recorder
                     result.success(null)

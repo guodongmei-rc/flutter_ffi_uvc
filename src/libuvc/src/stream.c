@@ -882,6 +882,20 @@ void LIBUSB_CALL _uvc_stream_callback(struct libusb_transfer *transfer) {
       /* This is an isochronous mode transfer, so each packet has a payload transfer */
       int packet_id;
 
+      {
+        struct timespec cb_ts;
+        clock_gettime(CLOCK_MONOTONIC, &cb_ts);
+        const uint64_t cb_now_ns =
+            (uint64_t)cb_ts.tv_sec * 1000000000ull + (uint64_t)cb_ts.tv_nsec;
+        if (strmh->cb_last_ns != 0 && cb_now_ns > strmh->cb_last_ns) {
+          const uint64_t gap_ns = cb_now_ns - strmh->cb_last_ns;
+          if (gap_ns > strmh->cb_gap_max_ns) {
+            strmh->cb_gap_max_ns = gap_ns;
+          }
+        }
+        strmh->cb_last_ns = cb_now_ns;
+      }
+
       strmh->iso_xfer_total++;
       for (packet_id = 0; packet_id < transfer->num_iso_packets; ++packet_id) {
         uint8_t *pktbuf;
@@ -918,24 +932,27 @@ void LIBUSB_CALL _uvc_stream_callback(struct libusb_transfer *transfer) {
         __android_log_print(
             ANDROID_LOG_INFO,
             "flutter_ffi_uvc",
-            "@@@@UVC_STREAM/I iso stats: xfer=%llu bad_xfer=%llu pk=%llu bad=%llu short=%llu zero=%llu",
+            "@@@@UVC_STREAM/I iso stats: xfer=%llu bad_xfer=%llu pk=%llu bad=%llu short=%llu zero=%llu cb_gap_max=%llums",
             (unsigned long long)strmh->iso_xfer_total,
             (unsigned long long)strmh->iso_xfer_bad,
             (unsigned long long)strmh->iso_pk_total,
             (unsigned long long)strmh->iso_pk_bad,
             (unsigned long long)strmh->iso_pk_short,
-            (unsigned long long)strmh->iso_pk_zero);
+            (unsigned long long)strmh->iso_pk_zero,
+            (unsigned long long)(strmh->cb_gap_max_ns / 1000000ull));
 #else
         UVC_LOGI(
             "UVC_STREAM",
-            "iso stats: xfer=%llu bad_xfer=%llu pk=%llu bad=%llu short=%llu zero=%llu",
+            "iso stats: xfer=%llu bad_xfer=%llu pk=%llu bad=%llu short=%llu zero=%llu cb_gap_max=%llums",
             (unsigned long long)strmh->iso_xfer_total,
             (unsigned long long)strmh->iso_xfer_bad,
             (unsigned long long)strmh->iso_pk_total,
             (unsigned long long)strmh->iso_pk_bad,
             (unsigned long long)strmh->iso_pk_short,
-            (unsigned long long)strmh->iso_pk_zero);
+            (unsigned long long)strmh->iso_pk_zero,
+            (unsigned long long)(strmh->cb_gap_max_ns / 1000000ull));
 #endif
+        strmh->cb_gap_max_ns = 0;
       }
     }
     break;
@@ -1380,6 +1397,8 @@ uvc_error_t uvc_stream_start(
         strmh->iso_pk_bad = 0;
         strmh->iso_pk_short = 0;
         strmh->iso_pk_zero = 0;
+        strmh->cb_last_ns = 0;
+        strmh->cb_gap_max_ns = 0;
         break;
       }
     }

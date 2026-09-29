@@ -97,6 +97,35 @@ FFI_PLUGIN_EXPORT void uvc_set_log_level(int level);
 // and do not affect the shared RGBA buffer returned by copyLatestFrame.
 FFI_PLUGIN_EXPORT void uvc_set_preview_transform(int rotation, int flip_h, int flip_v);
 
+// Recording frame queue for the re-encode recording path (uncompressed and
+// MJPEG previews; H.264/H.265 streams keep the decoder-to-surface path).
+// The platform video-encoder feed thread pulls the newest preview frame as
+// YUV through these functions instead of rendering into an encoder input
+// Surface — no GL on the recording path at all.
+//
+// YUV output layouts (BT.601 limited range):
+#define UVC_REC_YUV_NV12 0  // Y plane + interleaved UV chroma
+#define UVC_REC_YUV_I420 1  // Y plane + U plane + V plane
+//
+// Starts the queue. [enc_stride]/[enc_slice_height] are the encoder input
+// buffer's row stride and slice height in pixels (query the codec's input
+// format; both default to the frame width/height when absent). Returns
+// UVC_SUCCESS, UVC_ERROR_BUSY when a queue is already active, or
+// UVC_ERROR_INVALID_PARAM.
+FFI_PLUGIN_EXPORT int uvc_rec_start_queue(
+    int yuv_format, int enc_stride, int enc_slice_height);
+// Waits up to [timeout_ms] for a new frame, converts it to YUV straight
+// into [dst] (typically a MediaCodec input buffer) and returns the byte
+// count with the frame's monotonic-microsecond PTS in [out_pts_us]
+// (strictly increasing). Returns 0 on timeout or when the frame was
+// dropped (wrong dimensions / buffer too small), -1 once the queue is
+// stopped. [dst] must hold stride*slice_height*1.5 bytes.
+FFI_PLUGIN_EXPORT int uvc_rec_read_yuv(
+    uint8_t *dst, int dst_capacity, int timeout_ms, int64_t *out_pts_us);
+// Stops the queue and wakes any blocked reader (which then returns -1).
+// Idempotent.
+FFI_PLUGIN_EXPORT void uvc_rec_stop_queue(void);
+
 // CT/PU camera control IDs
 // PU (Processing Unit) controls: 1-19
 #define UVC_CTRL_ID_BRIGHTNESS                  1

@@ -396,6 +396,68 @@ class FlutterFfiUvcBindings {
   late final _uvc_set_preview_transform = _uvc_set_preview_transformPtr
       .asFunction<void Function(int, int, int)>();
 
+  /// Starts the queue. [enc_stride]/[enc_slice_height] are the encoder input
+  /// buffer's row stride and slice height in pixels (query the codec's input
+  /// format; both default to the frame width/height when absent). Returns
+  /// UVC_SUCCESS, UVC_ERROR_BUSY when a queue is already active, or
+  /// UVC_ERROR_INVALID_PARAM.
+  int uvc_rec_start_queue(
+    int yuv_format,
+    int enc_stride,
+    int enc_slice_height,
+  ) {
+    return _uvc_rec_start_queue(yuv_format, enc_stride, enc_slice_height);
+  }
+
+  late final _uvc_rec_start_queuePtr =
+      _lookup<ffi.NativeFunction<ffi.Int Function(ffi.Int, ffi.Int, ffi.Int)>>(
+        'uvc_rec_start_queue',
+      );
+  late final _uvc_rec_start_queue = _uvc_rec_start_queuePtr
+      .asFunction<int Function(int, int, int)>();
+
+  /// Waits up to [timeout_ms] for a new frame, converts it to YUV straight
+  /// into [dst] (typically a MediaCodec input buffer) and returns the byte
+  /// count with the frame's monotonic-microsecond PTS in [out_pts_us]
+  /// (strictly increasing). Returns 0 on timeout or when the frame was
+  /// dropped (wrong dimensions / buffer too small), -1 once the queue is
+  /// stopped. [dst] must hold stride*slice_height*1.5 bytes.
+  int uvc_rec_read_yuv(
+    ffi.Pointer<ffi.Uint8> dst,
+    int dst_capacity,
+    int timeout_ms,
+    ffi.Pointer<ffi.Int64> out_pts_us,
+  ) {
+    return _uvc_rec_read_yuv(dst, dst_capacity, timeout_ms, out_pts_us);
+  }
+
+  late final _uvc_rec_read_yuvPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Int Function(
+            ffi.Pointer<ffi.Uint8>,
+            ffi.Int,
+            ffi.Int,
+            ffi.Pointer<ffi.Int64>,
+          )
+        >
+      >('uvc_rec_read_yuv');
+  late final _uvc_rec_read_yuv = _uvc_rec_read_yuvPtr
+      .asFunction<
+        int Function(ffi.Pointer<ffi.Uint8>, int, int, ffi.Pointer<ffi.Int64>)
+      >();
+
+  /// Stops the queue and wakes any blocked reader (which then returns -1).
+  /// Idempotent.
+  void uvc_rec_stop_queue() {
+    return _uvc_rec_stop_queue();
+  }
+
+  late final _uvc_rec_stop_queuePtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function()>>('uvc_rec_stop_queue');
+  late final _uvc_rec_stop_queue = _uvc_rec_stop_queuePtr
+      .asFunction<void Function()>();
+
   /// Returns JSON array of all controls the device supports, with min/max/def/cur/res fields.
   /// Returns number of bytes written, or 0 on failure.
   int uvc_ctrl_get_all_json(ffi.Pointer<ffi.Uint8> buffer, int buffer_length) {
@@ -708,6 +770,10 @@ typedef Dartuvc_error_listener_tFunction =
     void Function(ffi.Pointer<ffi.Char> message);
 typedef uvc_error_listener_t =
     ffi.Pointer<ffi.NativeFunction<uvc_error_listener_tFunction>>;
+
+const int UVC_REC_YUV_NV12 = 0;
+
+const int UVC_REC_YUV_I420 = 1;
 
 const int UVC_CTRL_ID_BRIGHTNESS = 1;
 

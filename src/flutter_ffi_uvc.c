@@ -1,5 +1,6 @@
 #include "flutter_ffi_uvc.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <setjmp.h>
 #include <stdarg.h>
@@ -13,9 +14,15 @@
 #endif
 
 #if defined(__ANDROID__)
+#include <android/log.h>
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
 #include <jni.h>
+#endif
+
+#if defined(__aarch64__) || defined(__ARM_NEON)
+#include <arm_neon.h>
+#define UVC_HAVE_NEON 1
 #endif
 
 #include "libuvc/libuvc.h"
@@ -59,23 +66,39 @@ typedef struct {
   uint64_t gap_ring[256];
   uint32_t gap_ring_count;
   uint32_t gap_ring_next;
+  // Pipeline timing window, reset after each periodic UVC_PERF log: which
+  // stage (decode / render / recording-convert) limits sustained fps.
+  uint64_t il_window_start_ns;
+  uint64_t il_input_count;
+  uint64_t il_delivered_count;
+  uint64_t il_decode_sum_ns;
+  uint64_t il_decode_max_ns;
+  uint64_t il_decode_count;
+  uint64_t il_render_sum_ns;
+  uint64_t il_render_max_ns;
+  uint64_t il_render_count;
+  uint64_t il_rec_convert_sum_ns;
+  uint64_t il_rec_convert_max_ns;
+  uint64_t il_rec_convert_count;
 } ffi_uvc_stream_stats_t;
 
 #if defined(__ANDROID__)
-// One render-thread target: a window plus its dedicated gl_blit instance.
-// window is an owned reference swapped under the state mutex; blit is
-// created/used/destroyed on the render thread only (EGL contexts are
-// thread-bound). blit_window tracks which window the instance was built
-// for — a surface recreate makes them differ and the instance is rebuilt.
+// The render thread's single target: the preview window plus its dedicated
+// gl_blit instance. window is an owned reference swapped under the state
+// mutex; blit is created/used/destroyed on the render thread only (EGL
+// contexts are thread-bound). blit_window tracks which window the instance
+// was built for — a surface recreate makes them differ and the instance is
+// rebuilt. (The recording surface is NOT served here: H.264/H.265 streams
+// render into it straight from the hardware decoder, and the re-encode
+// recording path feeds the encoder through the recording frame queue.)
 #define RENDER_TARGET_PREVIEW 0
-#define RENDER_TARGET_RECORDING 1
-#define RENDER_TARGET_COUNT 2
+#define RENDER_TARGET_COUNT 1
 typedef struct {
   ANativeWindow *window;
   gl_blit_t *blit;
   ANativeWindow *blit_window;
   int blit_failed;
-  const char *name;  // "preview" / "recording", for logs
+  const char *name;  // "preview", for logs
 } render_target_t;
 #endif
 
@@ -94,20 +117,61 @@ typedef struct {
   uvc_frame_t *rgb_frame;
   // RGBA frame buffer pool with copy-free ownership handoff:
   //  - latest_rgba: published frame; read by Dart only under the mutex and
-  //    by the render thread only while it is ALSO the render thread's busy
-  //    buffer, so its contents stay stable without any copy;
+  //    by consumers only while it is ALSO their own held buffer, so its
+  //    contents stay stable without any copy;
   //  - staging_rgba: decode target of the callback thread;
   //  - render_busy_rgba: buffer the render thread is reading right now;
-  //  - spare_rgba: idle slot recycled from the render thread.
+  //  - spare_rgba[]: idle slots recycled by consumers.
   // The callback thread only ever writes staging_rgba, and staging is chosen
-  // to be neither latest nor busy, so no full-frame copy happens anywhere.
+  // to be neither latest nor any held buffer, so no full-frame copy happens
+  // anywhere.
   uint8_t *latest_rgba;
   size_t latest_rgba_bytes;
   size_t latest_rgba_capacity;
   uint8_t *render_busy_rgba;
   size_t render_busy_capacity;
-  uint8_t *spare_rgba;
-  size_t spare_rgba_capacity;
+  // Recording frame queue for the re-encode recording path (uncompressed
+  // and MJPEG previews; H.264/H.265 keeps the decoder-to-surface path).
+  // publish drops a borrowed reference to the newest published RGBA frame
+  // into this latest-wins single slot — O(1), no copy; the platform
+  // encoder feed thread pulls it through uvc_rec_read_yuv, which converts
+  // RGBA -> YUV straight into the encoder's input buffer. Pool-buffer
+  // ownership follows the same protocol as render_busy_rgba: while
+  // rec_reading_rgba is non-NULL the callback thread never recycles that
+  // buffer for decoding. All fields are guarded by the state mutex (the
+  // pool protocol lives there); only waiting runs on the dedicated cond.
+  pthread_cond_t rec_cond;
+  int rec_queue_active;
+  int rec_yuv_format;  // UVC_REC_YUV_NV12 / UVC_REC_YUV_I420
+  int rec_enc_stride;
+  int rec_enc_slice_height;
+  const uint8_t *rec_pending_rgba;
+  size_t rec_pending_capacity;
+  int rec_pending_width;
+  int rec_pending_height;
+  int64_t rec_pending_sequence;
+  int64_t rec_pending_pts_us;
+  int64_t rec_done_sequence;
+  uint8_t *rec_reading_rgba;
+  size_t rec_reading_capacity;
+  // Post-transform dimensions the encoder was configured for; frames that
+  // don't match are dropped (counted), the encoder size cannot change
+  // mid-recording. 0 = captured from the first frame.
+  int rec_out_width;
+  int rec_out_height;
+  int64_t rec_last_pts_us;
+  uint64_t rec_dropped_frames;
+  // Feed-thread scratch for the rotation/flip pre-transform; only touched
+  // between the read's grab and return, freed by reset once readers drain.
+  uint8_t *rec_transform_scratch;
+  size_t rec_transform_scratch_capacity;
+  // Idle pool buffers recycled by the render thread and the recording feed
+  // reader. Two slots suffice: at most two consumers can hold a stale
+  // buffer at once (render_busy + rec_reading).
+#define FRAME_POOL_SPARE_MAX 2
+  uint8_t *spare_rgba[FRAME_POOL_SPARE_MAX];
+  size_t spare_rgba_capacity[FRAME_POOL_SPARE_MAX];
+  int spare_count;
   // Raw JPEG copy of the most recent MJPEG frame that decoded successfully,
   // kept so uvc_capture_jpeg can return it losslessly without a re-encode.
   uint8_t *latest_jpeg;
@@ -141,18 +205,23 @@ typedef struct {
   uint32_t error_ring_next;
 #if defined(__ANDROID__)
   ANativeWindow *preview_window;
+  // Recording (encoder input) surface for H.264/H.265 streams ONLY: the
+  // hardware decoder renders into it directly. The uncompressed/MJPEG
+  // re-encode recording path never touches a window — it goes through the
+  // recording frame queue (uvc_rec_read_yuv).
   ANativeWindow *recording_window;
   // Unified render thread: the ONLY thread that touches EGL/GL and window
-  // buffers for the RGBA path (preview AND recording). Two GPU threads
-  // uploading 8MB textures concurrently destabilized the Adreno stack
-  // (BLTLIB semaphore errors, multi-second GPU stalls). The callback thread
-  // never renders; it publishes a frame and broadcasts render_cond.
+  // buffers for the RGBA path (preview only — the recording surface is no
+  // longer rendered at all, see above). Two GPU threads uploading 8MB
+  // textures concurrently destabilized the Adreno stack (BLTLIB semaphore
+  // errors, multi-second GPU stalls). The callback thread never renders;
+  // it publishes a frame and broadcasts render_cond.
   // Started lazily on the first surface attach, stopped on device close.
   pthread_t render_thread;
   int render_thread_started;
   int render_thread_stop;
   int64_t render_done_sequence;
-  render_target_t render_targets[2];  // [0] preview, [1] recording
+  render_target_t render_targets[RENDER_TARGET_COUNT];
 #endif
   // Hardware decoder for H.264/H.265 streams; created lazily on the first
   // compressed-video frame of a session, destroyed on stop/close. Renders
@@ -191,6 +260,7 @@ static ffi_uvc_state_t g_uvc_state = {
     .mutex = PTHREAD_MUTEX_INITIALIZER,
     .callback_cond = PTHREAD_COND_INITIALIZER,
     .render_cond = PTHREAD_COND_INITIALIZER,
+    .rec_cond = PTHREAD_COND_INITIALIZER,
     .device_fd = -1,
 };
 
@@ -500,17 +570,27 @@ static void reset_stream_stats_locked(void) {
 }
 
 static void reset_frame_buffer_locked(void) {
-#if defined(__ANDROID__)
-  // The render thread may still be reading its busy buffer; wait for it to
-  // go idle before freeing the pool. It cannot grab a new frame meanwhile:
-  // grabs are gated on previewing/stopping_preview, and every caller of
-  // this function runs after begin_stop_preview_locked (or after the render
-  // thread was stopped). The wait releases the mutex, so the render thread
-  // can complete its return critical section.
-  while (g_uvc_state.render_busy_rgba != NULL) {
+  // Consumers (the render thread and the recording feed reader) may still
+  // be reading their held buffers; wait for them to go idle before freeing
+  // the pool. They cannot grab new frames meanwhile: render grabs are gated
+  // on previewing/stopping_preview and every caller of this function runs
+  // after begin_stop_preview_locked (or after the render thread was
+  // stopped), and the recording reader only grabs from rec_pending, which
+  // stays NULL after the first wait iteration. The wait releases the
+  // mutex, so the consumers can complete their return critical sections.
+  while (g_uvc_state.render_busy_rgba != NULL ||
+         g_uvc_state.rec_reading_rgba != NULL) {
     pthread_cond_wait(&g_uvc_state.render_cond, &g_uvc_state.mutex);
   }
-#endif
+  // Drop the recording queue's borrowed reference: its buffer is freed
+  // below. The queue itself stays active across preview restarts (watchdog
+  // recovery resumes feeding with the next publish).
+  g_uvc_state.rec_pending_rgba = NULL;
+  g_uvc_state.rec_pending_capacity = 0;
+  g_uvc_state.rec_done_sequence = g_uvc_state.rec_pending_sequence;
+  free(g_uvc_state.rec_transform_scratch);
+  g_uvc_state.rec_transform_scratch = NULL;
+  g_uvc_state.rec_transform_scratch_capacity = 0;
   free(g_uvc_state.latest_rgba);
   g_uvc_state.latest_rgba = NULL;
   g_uvc_state.latest_rgba_bytes = 0;
@@ -518,10 +598,14 @@ static void reset_frame_buffer_locked(void) {
   free(g_uvc_state.staging_rgba);
   g_uvc_state.staging_rgba = NULL;
   g_uvc_state.staging_rgba_capacity = 0;
-  free(g_uvc_state.spare_rgba);
-  g_uvc_state.spare_rgba = NULL;
-  g_uvc_state.spare_rgba_capacity = 0;
+  for (int i = 0; i < g_uvc_state.spare_count; i++) {
+    free(g_uvc_state.spare_rgba[i]);
+    g_uvc_state.spare_rgba[i] = NULL;
+    g_uvc_state.spare_rgba_capacity[i] = 0;
+  }
+  g_uvc_state.spare_count = 0;
   g_uvc_state.render_busy_capacity = 0;
+  g_uvc_state.rec_reading_capacity = 0;
   free(g_uvc_state.latest_jpeg);
   g_uvc_state.latest_jpeg = NULL;
   g_uvc_state.latest_jpeg_bytes = 0;
@@ -623,12 +707,38 @@ static int copy_mjpeg_to_staging(const uvc_frame_t *frame) {
   return 1;
 }
 
+// Returns a stale pool buffer to the spare stack. Caller holds the mutex.
+static void frame_pool_recycle_locked(uint8_t *buffer, size_t capacity) {
+  if (buffer == NULL) {
+    return;
+  }
+  for (int i = 0; i < g_uvc_state.spare_count; i++) {
+    // Defensive: the exactly-once protocol at the call sites should make
+    // this impossible, but a duplicated spare is handed out twice and
+    // later double-freed — never let it in, even if a future call site
+    // breaks the protocol.
+    if (g_uvc_state.spare_rgba[i] == buffer) {
+      UVC_LOGW("UVC_NATIVE", "frame pool: duplicate recycle of %p ignored", (void *)buffer);
+      return;
+    }
+  }
+  if (g_uvc_state.spare_count < FRAME_POOL_SPARE_MAX) {
+    g_uvc_state.spare_rgba[g_uvc_state.spare_count] = buffer;
+    g_uvc_state.spare_rgba_capacity[g_uvc_state.spare_count] = capacity;
+    g_uvc_state.spare_count += 1;
+  } else {
+    // Unreachable by the pool arithmetic (at most two consumers can hold a
+    // stale buffer at once); free rather than leak-track if that ever breaks.
+    free(buffer);
+  }
+}
+
 // Publishes the staged frame with O(1) pointer moves — no copy anywhere:
 // the decoded buffer becomes the published frame, and the next decode
 // target is a buffer nobody else reads. Dart reads latest_rgba only under
-// this mutex; the render thread reads only render_busy_rgba. A buffer the
-// render thread still holds is never reused for decode — the spare slot
-// (recycled by the render thread) covers that case instead.
+// this mutex; the render thread and the recording feed reader read only
+// their own held buffers. A buffer a consumer still holds is never reused
+// for decode — the spare stack they recycle into covers that case instead.
 static void publish_staging_frame_locked(
     int width, int height, int jpeg_staged, size_t jpeg_bytes) {
   uint8_t *old_published = g_uvc_state.latest_rgba;
@@ -638,14 +748,21 @@ static void publish_staging_frame_locked(
   g_uvc_state.latest_rgba_capacity = g_uvc_state.staging_rgba_capacity;
   g_uvc_state.latest_rgba_bytes = (size_t)width * (size_t)height * 4;
 
-  if (old_published != NULL && old_published != g_uvc_state.render_busy_rgba) {
+  if (old_published != NULL &&
+      old_published != g_uvc_state.render_busy_rgba &&
+      old_published != g_uvc_state.rec_reading_rgba) {
     g_uvc_state.staging_rgba = old_published;
     g_uvc_state.staging_rgba_capacity = old_published_capacity;
+  } else if (g_uvc_state.spare_count > 0) {
+    g_uvc_state.spare_count -= 1;
+    g_uvc_state.staging_rgba = g_uvc_state.spare_rgba[g_uvc_state.spare_count];
+    g_uvc_state.staging_rgba_capacity =
+        g_uvc_state.spare_rgba_capacity[g_uvc_state.spare_count];
+    g_uvc_state.spare_rgba[g_uvc_state.spare_count] = NULL;
+    g_uvc_state.spare_rgba_capacity[g_uvc_state.spare_count] = 0;
   } else {
-    g_uvc_state.staging_rgba = g_uvc_state.spare_rgba;
-    g_uvc_state.staging_rgba_capacity = g_uvc_state.spare_rgba_capacity;
-    g_uvc_state.spare_rgba = NULL;
-    g_uvc_state.spare_rgba_capacity = 0;
+    g_uvc_state.staging_rgba = NULL;
+    g_uvc_state.staging_rgba_capacity = 0;
   }
 
   g_uvc_state.frame_width = width;
@@ -663,6 +780,24 @@ static void publish_staging_frame_locked(
     g_uvc_state.latest_jpeg_width = width;
     g_uvc_state.latest_jpeg_height = height;
     g_uvc_state.latest_jpeg_sequence = g_uvc_state.latest_sequence;
+  }
+
+  // Offer the frame to the recording queue: a borrowed reference to the
+  // published buffer, latest wins. The feed reader converts it outside any
+  // lock while the pool protocol keeps this buffer away from decoding.
+  if (g_uvc_state.rec_queue_active) {
+    if (g_uvc_state.rec_pending_rgba != NULL &&
+        g_uvc_state.rec_pending_sequence != g_uvc_state.rec_done_sequence) {
+      // Never picked up before being overwritten: dropped for the encoder.
+      g_uvc_state.rec_dropped_frames += 1;
+    }
+    g_uvc_state.rec_pending_rgba = g_uvc_state.latest_rgba;
+    g_uvc_state.rec_pending_capacity = g_uvc_state.latest_rgba_capacity;
+    g_uvc_state.rec_pending_width = width;
+    g_uvc_state.rec_pending_height = height;
+    g_uvc_state.rec_pending_sequence = g_uvc_state.latest_sequence;
+    g_uvc_state.rec_pending_pts_us = (int64_t)(monotonic_time_ns() / 1000ull);
+    pthread_cond_signal(&g_uvc_state.rec_cond);
   }
 
   // Wake the render thread (and any reset waiters re-checking their
@@ -782,18 +917,19 @@ static int render_rgba_to_window(
 // The callback thread never renders: publish_staging_frame_locked hands the
 // frame over by pointer (see the buffer-pool comment on ffi_uvc_state_t) and
 // broadcasts render_cond. This thread grabs the newest published buffer —
-// latest wins, frames published while it renders are dropped — then serves
-// every attached window in order: preview first, then the recording
-// (encoder input) surface. Encoder backpressure and GPU stalls block only
-// this thread; the frame sequence keeps advancing either way. Each window
-// gets its own gl_blit instance, all driven from this one thread.
+// latest wins, frames published while it renders are dropped — and renders
+// it into the preview window with its own gl_blit instance. GPU stalls now
+// block only this thread; the frame sequence keeps advancing either way.
+// (The recording path no longer renders anywhere: H.264/H.265 goes decoder
+// -> surface, uncompressed/MJPEG goes through the recording frame queue.)
 // ---------------------------------------------------------------------------
 
 // Renders one frame to a target, GPU first with a CPU-blit fallback, timing
 // every call: a single render (which includes eglSwapBuffers, the known
 // backpressure/stall point) taking more than 100ms is logged, to confirm or
 // rule out GPU stalls in the field. Runs on the render thread, no locks.
-static void render_frame_to_target(
+// Returns the elapsed render time in ns (0 when no path attempted).
+static uint64_t render_frame_to_target(
     render_target_t *target,
     ANativeWindow *window,
     const uint8_t *rgba,
@@ -813,6 +949,7 @@ static void render_frame_to_target(
   }
 
   int rendered = 0;
+  uint64_t total_ns = 0;
   if (!target->blit_failed && target->blit == NULL) {
     target->blit = gl_blit_create();
     if (target->blit == NULL) {
@@ -826,6 +963,7 @@ static void render_frame_to_target(
     rendered = gl_blit_render(
         target->blit, window, rgba, width, height, rot, flip_h, flip_v);
     const uint64_t elapsed_ns = monotonic_time_ns() - start_ns;
+    total_ns += elapsed_ns;
     if (elapsed_ns > 100ull * 1000 * 1000) {
       UVC_LOGW(
           "UVC_NATIVE",
@@ -839,6 +977,7 @@ static void render_frame_to_target(
     rendered = render_rgba_to_window(
         window, rgba, width, height, rot, flip_h, flip_v);
     const uint64_t elapsed_ns = monotonic_time_ns() - start_ns;
+    total_ns += elapsed_ns;
     if (elapsed_ns > 100ull * 1000 * 1000) {
       UVC_LOGW(
           "UVC_NATIVE",
@@ -848,12 +987,9 @@ static void render_frame_to_target(
     }
   }
   if (!rendered) {
-    if (target == &g_uvc_state.render_targets[RENDER_TARGET_PREVIEW]) {
-      __sync_add_and_fetch(&g_uvc_state.stats.preview_surface_failure_count, 1);
-    } else {
-      __sync_add_and_fetch(&g_uvc_state.stats.recording_surface_failure_count, 1);
-    }
+    __sync_add_and_fetch(&g_uvc_state.stats.preview_surface_failure_count, 1);
   }
+  return total_ns;
 }
 
 static void *render_thread_main(void *arg) {
@@ -884,9 +1020,9 @@ static void *render_thread_main(void *arg) {
     const int rot = g_uvc_state.preview_rotation;
     const int flip_h = g_uvc_state.preview_flip_h;
     const int flip_v = g_uvc_state.preview_flip_v;
-    // Per-cycle window references: a concurrent detach only drops the
+    // Per-cycle window reference: a concurrent detach only drops the
     // target's own reference, never one acquired here.
-    ANativeWindow *windows[RENDER_TARGET_COUNT] = {NULL, NULL};
+    ANativeWindow *windows[RENDER_TARGET_COUNT] = {NULL};
     for (int i = 0; i < RENDER_TARGET_COUNT; i++) {
       if (g_uvc_state.render_targets[i].window != NULL) {
         windows[i] = g_uvc_state.render_targets[i].window;
@@ -895,11 +1031,12 @@ static void *render_thread_main(void *arg) {
     }
     pthread_mutex_unlock(&g_uvc_state.mutex);
 
+    uint64_t cycle_render_ns = 0;
     for (int i = 0; i < RENDER_TARGET_COUNT; i++) {
       if (windows[i] == NULL) {
         continue;
       }
-      render_frame_to_target(
+      cycle_render_ns += render_frame_to_target(
           &g_uvc_state.render_targets[i],
           windows[i],
           rgba,
@@ -912,13 +1049,25 @@ static void *render_thread_main(void *arg) {
     }
 
     pthread_mutex_lock(&g_uvc_state.mutex);
-    if (g_uvc_state.render_busy_rgba != g_uvc_state.latest_rgba) {
-      // A newer frame was published while rendering: this buffer is stale
-      // and unreferenced, recycle it as the decode spare. (The spare slot
-      // is empty by construction whenever the render thread held a buffer
-      // across a publish.)
-      g_uvc_state.spare_rgba = g_uvc_state.render_busy_rgba;
-      g_uvc_state.spare_rgba_capacity = g_uvc_state.render_busy_capacity;
+    if (cycle_render_ns > 0) {
+      g_uvc_state.stats.il_render_sum_ns += cycle_render_ns;
+      g_uvc_state.stats.il_render_count += 1;
+      if (cycle_render_ns > g_uvc_state.stats.il_render_max_ns) {
+        g_uvc_state.stats.il_render_max_ns = cycle_render_ns;
+      }
+    }
+    if (g_uvc_state.render_busy_rgba != g_uvc_state.latest_rgba &&
+        g_uvc_state.render_busy_rgba != g_uvc_state.rec_reading_rgba) {
+      // A newer frame was published while rendering: this buffer is stale,
+      // recycle it to the spare stack. The second condition is the
+      // exactly-once rule: the recording reader may be holding the SAME
+      // buffer (both consumers grab the published frame). Pushing it here
+      // would let a publish hand it to decoding while the reader is still
+      // converting from it, and the reader's own return would push it a
+      // second time — a duplicated spare gets handed out twice and later
+      // double-freed. When both hold it, the later returner recycles it.
+      frame_pool_recycle_locked(
+          g_uvc_state.render_busy_rgba, g_uvc_state.render_busy_capacity);
     }
     g_uvc_state.render_busy_rgba = NULL;
     g_uvc_state.render_busy_capacity = 0;
@@ -952,7 +1101,7 @@ static void *render_thread_main(void *arg) {
 static void render_set_target_locked(int index, ANativeWindow *window) {
   render_target_t *target = &g_uvc_state.render_targets[index];
   if (target->name == NULL) {
-    target->name = index == RENDER_TARGET_PREVIEW ? "preview" : "recording";
+    target->name = "preview";
   }
   if (target->window == window) {
     return;
@@ -1000,6 +1149,460 @@ static void render_thread_stop(void) {
   pthread_mutex_unlock(&g_uvc_state.mutex);
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// Recording frame queue (re-encode path for uncompressed/MJPEG previews).
+// The platform encoder feed thread pulls frames through uvc_rec_read_yuv:
+// the conversion writes YUV straight into the MediaCodec input buffer, so
+// the recording path never touches GL or an encoder input Surface. H.264/
+// H.265 streams are unaffected — their recording renders from the hardware
+// decoder into the recording surface as before.
+//
+// Queue semantics: latest-wins single slot. publish drops a borrowed
+// reference to the just-published pool buffer (O(1), no copy); a frame the
+// reader never picked up before being overwritten is counted as dropped.
+// The reader marks its buffer rec_reading_rgba under the state mutex so the
+// pool never hands it back to decoding mid-conversion (same protocol as the
+// render thread's busy buffer), and recycles it to the spare stack when done.
+// ---------------------------------------------------------------------------
+
+// BT.601 limited-range RGBA -> YUV420, honoring the encoder's stride and
+// slice height. Dimensions must be even.
+static void rec_convert_rgba_to_yuv_scalar(
+    const uint8_t *rgba, int w, int h,
+    uint8_t *dst, int stride, int slice_height, int yuv_format) {
+  uint8_t *y_plane = dst;
+  uint8_t *chroma = dst + (size_t)stride * (size_t)slice_height;
+
+  for (int row = 0; row < h; ++row) {
+    const uint8_t *src = rgba + (size_t)row * (size_t)w * 4u;
+    uint8_t *y_out = y_plane + (size_t)row * (size_t)stride;
+    for (int col = 0; col < w; ++col) {
+      const int r = src[col * 4 + 0];
+      const int g = src[col * 4 + 1];
+      const int b = src[col * 4 + 2];
+      y_out[col] = (uint8_t)(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
+    }
+  }
+
+  for (int row = 0; row < h; row += 2) {
+    const uint8_t *src0 = rgba + (size_t)row * (size_t)w * 4u;
+    const uint8_t *src1 = src0 + (size_t)w * 4u;
+    for (int col = 0; col < w; col += 2) {
+      const int r = (src0[col * 4 + 0] + src0[col * 4 + 4] +
+                     src1[col * 4 + 0] + src1[col * 4 + 4] + 2) >> 2;
+      const int g = (src0[col * 4 + 1] + src0[col * 4 + 5] +
+                     src1[col * 4 + 1] + src1[col * 4 + 5] + 2) >> 2;
+      const int b = (src0[col * 4 + 2] + src0[col * 4 + 6] +
+                     src1[col * 4 + 2] + src1[col * 4 + 6] + 2) >> 2;
+      const uint8_t u = (uint8_t)(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
+      const uint8_t v = (uint8_t)(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
+      if (yuv_format == UVC_REC_YUV_NV12) {
+        uint8_t *uv = chroma + (size_t)(row / 2) * (size_t)stride;
+        uv[col + 0] = u;
+        uv[col + 1] = v;
+      } else {
+        const size_t c_stride = (size_t)stride / 2;
+        uint8_t *u_plane = chroma;
+        uint8_t *v_plane = chroma + c_stride * (size_t)(slice_height / 2);
+        u_plane[(size_t)(row / 2) * c_stride + (size_t)(col / 2)] = u;
+        v_plane[(size_t)(row / 2) * c_stride + (size_t)(col / 2)] = v;
+      }
+    }
+  }
+}
+
+#if defined(UVC_HAVE_NEON)
+// Computes four U and four V samples (int32x4 each) from 8 source pixels of
+// two adjacent rows, matching the scalar 2x2-average BT.601 math exactly.
+static inline void rec_chroma4_neon(
+    const uint8_t *src0, const uint8_t *src1,
+    int32x4_t *u_out, int32x4_t *v_out) {
+  const uint8x8x4_t p0 = vld4_u8(src0);
+  const uint8x8x4_t p1 = vld4_u8(src1);
+  // Vertical pair sums (u16), then horizontal pair sums (u32): the 2x2 sum.
+  const uint32x4_t r2 = vpaddlq_u16(vaddl_u8(p0.val[0], p1.val[0]));
+  const uint32x4_t g2 = vpaddlq_u16(vaddl_u8(p0.val[1], p1.val[1]));
+  const uint32x4_t b2 = vpaddlq_u16(vaddl_u8(p0.val[2], p1.val[2]));
+  // Rounding >>2, matching (sum + 2) >> 2.
+  const int32x4_t r = vreinterpretq_s32_u32(vrshrq_n_u32(r2, 2));
+  const int32x4_t g = vreinterpretq_s32_u32(vrshrq_n_u32(g2, 2));
+  const int32x4_t b = vreinterpretq_s32_u32(vrshrq_n_u32(b2, 2));
+  const int32x4_t k128 = vdupq_n_s32(128);
+  int32x4_t u = vmulq_n_s32(r, -38);
+  u = vmlaq_n_s32(u, g, -74);
+  u = vmlaq_n_s32(u, b, 112);
+  int32x4_t v = vmulq_n_s32(r, 112);
+  v = vmlaq_n_s32(v, g, -94);
+  v = vmlaq_n_s32(v, b, -18);
+  // Signed arithmetic >>8, like the scalar C shift.
+  *u_out = vaddq_s32(vshrq_n_s32(vaddq_s32(u, k128), 8), k128);
+  *v_out = vaddq_s32(vshrq_n_s32(vaddq_s32(v, k128), 8), k128);
+}
+
+static void rec_convert_rgba_to_yuv_neon(
+    const uint8_t *rgba, int w, int h,
+    uint8_t *dst, int stride, int slice_height, int yuv_format) {
+  uint8_t *y_plane = dst;
+  uint8_t *chroma = dst + (size_t)stride * (size_t)slice_height;
+  const uint16x8_t k128u16 = vdupq_n_u16(128);
+  const uint16x8_t k16u16 = vdupq_n_u16(16);
+
+  for (int row = 0; row < h; ++row) {
+    const uint8_t *src = rgba + (size_t)row * (size_t)w * 4u;
+    uint8_t *y_out = y_plane + (size_t)row * (size_t)stride;
+    int col = 0;
+    for (; col + 8 <= w; col += 8) {
+      const uint8x8x4_t px = vld4_u8(src + (size_t)col * 4u);
+      // y = ((66r + 129g + 25b + 128) >> 8) + 16; max 56228 fits u16.
+      uint16x8_t y = vmulq_n_u16(vmovl_u8(px.val[0]), 66);
+      y = vmlaq_n_u16(y, vmovl_u8(px.val[1]), 129);
+      y = vmlaq_n_u16(y, vmovl_u8(px.val[2]), 25);
+      y = vshrq_n_u16(vaddq_u16(y, k128u16), 8);
+      y = vaddq_u16(y, k16u16);
+      vst1_u8(y_out + col, vmovn_u16(y));
+    }
+    for (; col < w; ++col) {
+      const int r = src[col * 4 + 0];
+      const int g = src[col * 4 + 1];
+      const int b = src[col * 4 + 2];
+      y_out[col] = (uint8_t)(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
+    }
+  }
+
+  for (int row = 0; row < h; row += 2) {
+    const uint8_t *src0 = rgba + (size_t)row * (size_t)w * 4u;
+    const uint8_t *src1 = src0 + (size_t)w * 4u;
+    int col = 0;
+    for (; col + 16 <= w; col += 16) {
+      int32x4_t ua, va, ub, vb;
+      rec_chroma4_neon(src0 + (size_t)col * 4u, src1 + (size_t)col * 4u, &ua, &va);
+      rec_chroma4_neon(
+          src0 + (size_t)col * 4u + 32, src1 + (size_t)col * 4u + 32, &ub, &vb);
+      const int16x8_t u16 = vcombine_s16(vmovn_s32(ua), vmovn_s32(ub));
+      const int16x8_t v16 = vcombine_s16(vmovn_s32(va), vmovn_s32(vb));
+      const uint8x8_t uu = vqmovun_s16(u16);
+      const uint8x8_t vv = vqmovun_s16(v16);
+      if (yuv_format == UVC_REC_YUV_NV12) {
+        const uint8x8x2_t z = vzip_u8(uu, vv);
+        uint8_t *uv = chroma + (size_t)(row / 2) * (size_t)stride + (size_t)col;
+        vst1_u8(uv, z.val[0]);
+        vst1_u8(uv + 8, z.val[1]);
+      } else {
+        const size_t c_stride = (size_t)stride / 2;
+        uint8_t *u_row = chroma + (size_t)(row / 2) * c_stride + (size_t)(col / 2);
+        uint8_t *v_row = chroma + c_stride * (size_t)(slice_height / 2) +
+                         (size_t)(row / 2) * c_stride + (size_t)(col / 2);
+        vst1_u8(u_row, uu);
+        vst1_u8(v_row, vv);
+      }
+    }
+    for (; col < w; col += 2) {
+      const int r = (src0[col * 4 + 0] + src0[col * 4 + 4] +
+                     src1[col * 4 + 0] + src1[col * 4 + 4] + 2) >> 2;
+      const int g = (src0[col * 4 + 1] + src0[col * 4 + 5] +
+                     src1[col * 4 + 1] + src1[col * 4 + 5] + 2) >> 2;
+      const int b = (src0[col * 4 + 2] + src0[col * 4 + 6] +
+                     src1[col * 4 + 2] + src1[col * 4 + 6] + 2) >> 2;
+      const uint8_t u = (uint8_t)(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
+      const uint8_t v = (uint8_t)(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
+      if (yuv_format == UVC_REC_YUV_NV12) {
+        uint8_t *uv = chroma + (size_t)(row / 2) * (size_t)stride;
+        uv[col + 0] = u;
+        uv[col + 1] = v;
+      } else {
+        const size_t c_stride = (size_t)stride / 2;
+        uint8_t *u_plane = chroma;
+        uint8_t *v_plane = chroma + c_stride * (size_t)(slice_height / 2);
+        u_plane[(size_t)(row / 2) * c_stride + (size_t)(col / 2)] = u;
+        v_plane[(size_t)(row / 2) * c_stride + (size_t)(col / 2)] = v;
+      }
+    }
+  }
+}
+#endif  // UVC_HAVE_NEON
+
+static void rec_convert_rgba_to_yuv(
+    const uint8_t *rgba, int w, int h,
+    uint8_t *dst, int stride, int slice_height, int yuv_format) {
+#if defined(UVC_HAVE_NEON)
+  rec_convert_rgba_to_yuv_neon(rgba, w, h, dst, stride, slice_height, yuv_format);
+#else
+  rec_convert_rgba_to_yuv_scalar(rgba, w, h, dst, stride, slice_height, yuv_format);
+#endif
+}
+
+// Byte count of one converted frame inside the encoder input buffer.
+static size_t rec_yuv_frame_bytes(
+    int yuv_format, int stride, int slice_height, int h) {
+  const size_t chroma_offset = (size_t)stride * (size_t)slice_height;
+  if (yuv_format == UVC_REC_YUV_I420) {
+    const size_t c_stride = (size_t)stride / 2;
+    return chroma_offset + c_stride * (size_t)(slice_height / 2) +
+           c_stride * (size_t)(h / 2);
+  }
+  return chroma_offset + (size_t)stride * (size_t)(h / 2);
+}
+
+FFI_PLUGIN_EXPORT int uvc_rec_start_queue(
+    int yuv_format, int enc_stride, int enc_slice_height) {
+  if ((yuv_format != UVC_REC_YUV_NV12 && yuv_format != UVC_REC_YUV_I420) ||
+      enc_stride <= 0 || enc_slice_height <= 0) {
+    set_last_error(
+        "uvc_rec_start_queue: invalid params format=%d stride=%d slice=%d",
+        yuv_format, enc_stride, enc_slice_height);
+    return UVC_ERROR_INVALID_PARAM;
+  }
+
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  if (g_uvc_state.rec_queue_active) {
+    pthread_mutex_unlock(&g_uvc_state.mutex);
+    set_last_error("uvc_rec_start_queue: queue already active");
+    return UVC_ERROR_BUSY;
+  }
+  g_uvc_state.rec_yuv_format = yuv_format;
+  g_uvc_state.rec_enc_stride = enc_stride;
+  g_uvc_state.rec_enc_slice_height = enc_slice_height;
+  g_uvc_state.rec_pending_rgba = NULL;
+  g_uvc_state.rec_pending_capacity = 0;
+  // Only frames published after the start are delivered.
+  g_uvc_state.rec_pending_sequence = g_uvc_state.latest_sequence;
+  g_uvc_state.rec_done_sequence = g_uvc_state.latest_sequence;
+  g_uvc_state.rec_out_width = 0;
+  g_uvc_state.rec_out_height = 0;
+  g_uvc_state.rec_last_pts_us = 0;
+  g_uvc_state.rec_dropped_frames = 0;
+  g_uvc_state.rec_queue_active = 1;
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+  clear_last_error();
+
+#if defined(__ANDROID__)
+  // One-time field diagnostic: run the same RGBA->YUV conversion into plain
+  // malloc'd memory. Set against the per-frame rec_avg (which writes into
+  // MediaCodec input buffers), this splits "conversion is slow" from "codec
+  // input buffers are slow to CPU-write" (uncached ION mappings on some
+  // Qualcomm devices). ~3 x single-frame cost, paid once per recording start.
+  {
+    const int bw = enc_stride > 0 && enc_stride % 2 == 0 ? enc_stride : 1920;
+    const int bh =
+        enc_slice_height > 0 && enc_slice_height % 2 == 0 ? enc_slice_height : 1080;
+    uint8_t *bench_src = malloc((size_t)bw * (size_t)bh * 4u);
+    uint8_t *bench_dst = malloc(rec_yuv_frame_bytes(yuv_format, bw, bh, bh));
+    if (bench_src != NULL && bench_dst != NULL) {
+      memset(bench_src, 0x5a, (size_t)bw * (size_t)bh * 4u);
+      uint64_t best_ns = UINT64_MAX;
+      for (int i = 0; i < 3; ++i) {
+        const uint64_t t0 = monotonic_time_ns();
+        rec_convert_rgba_to_yuv(bench_src, bw, bh, bench_dst, bw, bh, yuv_format);
+        const uint64_t dt = monotonic_time_ns() - t0;
+        if (dt < best_ns) {
+          best_ns = dt;
+        }
+      }
+      __android_log_print(
+          ANDROID_LOG_INFO,
+          "flutter_ffi_uvc",
+          "@@@@UVC_PERF/I rec selftest: malloc-dst convert %dx%d fmt=%d best=%.2fms",
+          bw,
+          bh,
+          yuv_format,
+          (double)best_ns / 1e6);
+    }
+    free(bench_src);
+    free(bench_dst);
+  }
+#endif
+  return UVC_SUCCESS;
+}
+
+FFI_PLUGIN_EXPORT int uvc_rec_read_yuv(
+    uint8_t *dst, int dst_capacity, int timeout_ms, int64_t *out_pts_us) {
+  if (dst == NULL || dst_capacity <= 0) {
+    return UVC_ERROR_INVALID_PARAM;
+  }
+
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  if (!g_uvc_state.rec_queue_active) {
+    pthread_mutex_unlock(&g_uvc_state.mutex);
+    return -1;
+  }
+  if (g_uvc_state.rec_pending_sequence == g_uvc_state.rec_done_sequence &&
+      timeout_ms > 0) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += timeout_ms / 1000;
+    deadline.tv_nsec += (timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+      deadline.tv_sec += 1;
+      deadline.tv_nsec -= 1000000000L;
+    }
+    while (g_uvc_state.rec_queue_active &&
+           g_uvc_state.rec_pending_sequence == g_uvc_state.rec_done_sequence) {
+      if (pthread_cond_timedwait(
+              &g_uvc_state.rec_cond, &g_uvc_state.mutex, &deadline) == ETIMEDOUT) {
+        pthread_mutex_unlock(&g_uvc_state.mutex);
+        return 0;
+      }
+    }
+  }
+  if (!g_uvc_state.rec_queue_active) {
+    pthread_mutex_unlock(&g_uvc_state.mutex);
+    return -1;  // stopped while waiting
+  }
+  if (g_uvc_state.rec_pending_sequence == g_uvc_state.rec_done_sequence) {
+    pthread_mutex_unlock(&g_uvc_state.mutex);
+    return 0;  // non-blocking poll (timeout_ms <= 0): nothing new
+  }
+
+  // Grab the slot and mark the buffer as held by this reader. From here the
+  // pool never hands it back to decoding until the return below.
+  const uint8_t *src = g_uvc_state.rec_pending_rgba;
+  const int src_w = g_uvc_state.rec_pending_width;
+  const int src_h = g_uvc_state.rec_pending_height;
+  const int rot = g_uvc_state.preview_rotation;
+  const int flip_h = g_uvc_state.preview_flip_h;
+  const int flip_v = g_uvc_state.preview_flip_v;
+  int64_t pts_us = g_uvc_state.rec_pending_pts_us;
+  g_uvc_state.rec_done_sequence = g_uvc_state.rec_pending_sequence;
+  g_uvc_state.rec_reading_rgba = (uint8_t *)g_uvc_state.rec_pending_rgba;
+  g_uvc_state.rec_reading_capacity = g_uvc_state.rec_pending_capacity;
+  g_uvc_state.rec_pending_rgba = NULL;
+  g_uvc_state.rec_pending_capacity = 0;
+
+  // The encoder size is fixed at configure time; only frames whose
+  // post-transform dimensions match may be converted. The stride/slice
+  // checks are hard bounds for the conversion's addressing — reject rather
+  // than ever writing past the encoder buffer's layout.
+  const int out_w = (rot == 90 || rot == 270) ? src_h : src_w;
+  const int out_h = (rot == 90 || rot == 270) ? src_w : src_h;
+  if (g_uvc_state.rec_out_width == 0) {
+    g_uvc_state.rec_out_width = out_w;
+    g_uvc_state.rec_out_height = out_h;
+  }
+  const int yuv_format = g_uvc_state.rec_yuv_format;
+  const int stride = g_uvc_state.rec_enc_stride;
+  const int slice_height = g_uvc_state.rec_enc_slice_height;
+  const int dims_ok = src != NULL && src_w % 2 == 0 && src_h % 2 == 0 &&
+                      out_w == g_uvc_state.rec_out_width &&
+                      out_h == g_uvc_state.rec_out_height &&
+                      stride >= out_w && stride % 2 == 0 &&
+                      slice_height >= out_h && slice_height % 2 == 0;
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+
+  const size_t needed =
+      rec_yuv_frame_bytes(yuv_format, stride, slice_height, out_h);
+  int result = 0;
+  uint64_t convert_ns = 0;
+  if (dims_ok && needed <= (size_t)dst_capacity) {
+    const uint64_t convert_start_ns = monotonic_time_ns();
+    const uint8_t *convert_src = src;
+    if (rot != 0 || flip_h || flip_v) {
+      // Rotation/flip: pre-transform into the feed-thread scratch (this is
+      // the one full-frame copy in the system, off the callback thread).
+      const size_t scratch_needed = (size_t)out_w * (size_t)out_h * 4u;
+      if (g_uvc_state.rec_transform_scratch_capacity < scratch_needed) {
+        uint8_t *new_scratch =
+            realloc(g_uvc_state.rec_transform_scratch, scratch_needed);
+        if (new_scratch != NULL) {
+          g_uvc_state.rec_transform_scratch = new_scratch;
+          g_uvc_state.rec_transform_scratch_capacity = scratch_needed;
+        }
+      }
+      if (g_uvc_state.rec_transform_scratch_capacity >= scratch_needed) {
+        blit_rgba_transform(
+            (const uint32_t *)src, src_w, src_h,
+            (uint32_t *)g_uvc_state.rec_transform_scratch, out_w,
+            rot, flip_h, flip_v);
+        convert_src = g_uvc_state.rec_transform_scratch;
+      } else {
+        convert_src = NULL;
+      }
+    }
+    if (convert_src != NULL) {
+      rec_convert_rgba_to_yuv(
+          convert_src, out_w, out_h, dst, stride, slice_height, yuv_format);
+      result = (int)needed;
+    }
+    convert_ns = monotonic_time_ns() - convert_start_ns;
+  }
+
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  if (convert_ns > 0) {
+    g_uvc_state.stats.il_rec_convert_sum_ns += convert_ns;
+    g_uvc_state.stats.il_rec_convert_count += 1;
+    if (convert_ns > g_uvc_state.stats.il_rec_convert_max_ns) {
+      g_uvc_state.stats.il_rec_convert_max_ns = convert_ns;
+    }
+  }
+  if (result > 0) {
+    // Encoder input wants strictly increasing PTS.
+    if (pts_us <= g_uvc_state.rec_last_pts_us) {
+      pts_us = g_uvc_state.rec_last_pts_us + 1;
+    }
+    g_uvc_state.rec_last_pts_us = pts_us;
+    if (out_pts_us != NULL) {
+      *out_pts_us = pts_us;
+    }
+  } else {
+    g_uvc_state.rec_dropped_frames += 1;
+    // Throttled diagnosis: a guard rejecting every frame would otherwise
+    // only surface as a silent "No frames were recorded" at stop.
+    if ((g_uvc_state.rec_dropped_frames & 0x3f) == 1) {
+      UVC_LOGW(
+          "UVC_NATIVE",
+          "recording frame dropped: dims_ok=%d src=%dx%d out=%dx%d expect=%dx%d "
+          "stride=%d slice=%d need=%zu cap=%d (total=%llu)",
+          dims_ok,
+          src_w,
+          src_h,
+          out_w,
+          out_h,
+          g_uvc_state.rec_out_width,
+          g_uvc_state.rec_out_height,
+          stride,
+          slice_height,
+          needed,
+          dst_capacity,
+          (unsigned long long)g_uvc_state.rec_dropped_frames);
+    }
+  }
+  if (g_uvc_state.rec_reading_rgba != NULL) {
+    if (g_uvc_state.rec_reading_rgba != g_uvc_state.latest_rgba &&
+        g_uvc_state.rec_reading_rgba != g_uvc_state.render_busy_rgba) {
+      // Stale already (a newer frame was published during the conversion):
+      // recycle to the spare stack — but only when the render thread is
+      // not holding the SAME buffer (exactly-once rule, see the render
+      // thread's return path); in that case its return recycles it.
+      frame_pool_recycle_locked(
+          g_uvc_state.rec_reading_rgba, g_uvc_state.rec_reading_capacity);
+    }
+    g_uvc_state.rec_reading_rgba = NULL;
+    g_uvc_state.rec_reading_capacity = 0;
+    // Wake reset waiters (they share render_cond for pool-idle waits).
+    pthread_cond_broadcast(&g_uvc_state.render_cond);
+  }
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+  return result;
+}
+
+FFI_PLUGIN_EXPORT void uvc_rec_stop_queue(void) {
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  const int was_active = g_uvc_state.rec_queue_active;
+  const uint64_t dropped = g_uvc_state.rec_dropped_frames;
+  g_uvc_state.rec_queue_active = 0;
+  g_uvc_state.rec_pending_rgba = NULL;
+  g_uvc_state.rec_pending_capacity = 0;
+  g_uvc_state.rec_done_sequence = g_uvc_state.rec_pending_sequence;
+  pthread_cond_broadcast(&g_uvc_state.rec_cond);
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+
+  if (was_active) {
+    UVC_LOGI(
+        "UVC_NATIVE",
+        "recording queue stopped: %llu frames dropped (encoder backpressure)",
+        (unsigned long long)dropped);
+  }
+}
 
 static void finish_callback_locked(void) {
   if (g_uvc_state.callbacks_inflight == 0) {
@@ -1097,14 +1700,21 @@ static void close_device_resources_locked(void) {
     h26x_decoder_destroy(g_uvc_state.h26x_rec_decoder);
     g_uvc_state.h26x_rec_decoder = NULL;
   }
-  // Detach the render targets as well: the render thread (when still
+  // Detach the render target as well: the render thread (when still
   // running, e.g. on the reopen path) must not keep rendering into the
-  // previous session's surfaces.
+  // previous session's surface.
   render_set_target_locked(RENDER_TARGET_PREVIEW, NULL);
-  render_set_target_locked(RENDER_TARGET_RECORDING, NULL);
   release_preview_window_locked();
   release_recording_window_locked();
 #endif
+  // End the recording frame queue: a reader blocked in uvc_rec_read_yuv
+  // wakes and returns -1 instead of dangling across the device close.
+  // (Inline stop: this function already holds the state mutex.)
+  g_uvc_state.rec_queue_active = 0;
+  g_uvc_state.rec_pending_rgba = NULL;
+  g_uvc_state.rec_pending_capacity = 0;
+  g_uvc_state.rec_done_sequence = g_uvc_state.rec_pending_sequence;
+  pthread_cond_broadcast(&g_uvc_state.rec_cond);
 
   if (g_uvc_state.rgb_frame != NULL) {
     UVC_LOGD("UVC_NATIVE", "close_device_resources_locked freeing rgb_frame=%p", (void *)g_uvc_state.rgb_frame);
@@ -1301,6 +1911,7 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
   g_uvc_state.callbacks_inflight += 1;
   g_uvc_state.callback_count += 1;
   g_uvc_state.stats.input_frame_count += 1;
+  g_uvc_state.stats.il_input_count += 1;
   uint32_t callback_count = g_uvc_state.callback_count;
 
   if (g_uvc_state.stats.has_last_source_sequence &&
@@ -1534,6 +2145,7 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
   }
 
   pthread_mutex_unlock(&g_uvc_state.mutex);
+  const uint64_t phase2_start_ns = monotonic_time_ns();
 
   // Phase 2 — no lock held: decode and convert into callback-owned staging
   // buffers. callbacks_inflight (released at the very end) keeps stop/close
@@ -1627,6 +2239,7 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
   // wake the render thread. This thread never touches a window or EGL.
   int64_t delivered_sequence = 0;
   uvc_frame_listener_t frame_listener = NULL;
+  const uint64_t phase2_ns = monotonic_time_ns() - phase2_start_ns;
 
   pthread_mutex_lock(&g_uvc_state.mutex);
   if (g_uvc_state.stopping_preview) {
@@ -1661,6 +2274,70 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
   g_uvc_state.stats.last_delivered_monotonic_ns = callback_monotonic_ns;
   g_uvc_state.stats.delivered_frame_count += 1;
   g_uvc_state.stats.decode_success_count += 1;
+
+  // Pipeline timing: decode+convert (phase 2) happens on this serial callback
+  // thread; a sustained average above the frame interval is what caps fps.
+  g_uvc_state.stats.il_delivered_count += 1;
+  g_uvc_state.stats.il_decode_sum_ns += phase2_ns;
+  g_uvc_state.stats.il_decode_count += 1;
+  if (phase2_ns > g_uvc_state.stats.il_decode_max_ns) {
+    g_uvc_state.stats.il_decode_max_ns = phase2_ns;
+  }
+  if (g_uvc_state.stats.il_window_start_ns == 0) {
+    g_uvc_state.stats.il_window_start_ns = callback_monotonic_ns;
+  } else if (callback_monotonic_ns - g_uvc_state.stats.il_window_start_ns >=
+             5000000000ull) {
+    const ffi_uvc_stream_stats_t *s = &g_uvc_state.stats;
+    const double window_s =
+        (double)(callback_monotonic_ns - s->il_window_start_ns) / 1000000000.0;
+    // Bypasses uvc_log_write (disabled project-wide in uvc_log.h) the same way
+    // stream.c's iso stats do: this is a deliberate field diagnostic.
+#if defined(__ANDROID__)
+    __android_log_print(
+        ANDROID_LOG_INFO,
+        "flutter_ffi_uvc",
+        "@@@@UVC_PERF/I window=%.1fs in=%llu out=%llu fps=%.1f "
+        "decode_avg=%.2fms decode_max=%.2fms "
+        "render_avg=%.2fms render_max=%.2fms "
+        "rec_avg=%.2fms rec_max=%.2fms",
+#else
+    fprintf(
+        stderr,
+        "@@@@UVC_PERF/I window=%.1fs in=%llu out=%llu fps=%.1f "
+        "decode_avg=%.2fms decode_max=%.2fms "
+        "render_avg=%.2fms render_max=%.2fms "
+        "rec_avg=%.2fms rec_max=%.2fms\n",
+#endif
+        window_s,
+        (unsigned long long)s->il_input_count,
+        (unsigned long long)s->il_delivered_count,
+        window_s > 0.0 ? (double)s->il_delivered_count / window_s : 0.0,
+        s->il_decode_count > 0
+            ? (double)s->il_decode_sum_ns / (double)s->il_decode_count / 1e6
+            : 0.0,
+        (double)s->il_decode_max_ns / 1e6,
+        s->il_render_count > 0
+            ? (double)s->il_render_sum_ns / (double)s->il_render_count / 1e6
+            : 0.0,
+        (double)s->il_render_max_ns / 1e6,
+        s->il_rec_convert_count > 0
+            ? (double)s->il_rec_convert_sum_ns /
+                  (double)s->il_rec_convert_count / 1e6
+            : 0.0,
+        (double)s->il_rec_convert_max_ns / 1e6);
+    g_uvc_state.stats.il_window_start_ns = callback_monotonic_ns;
+    g_uvc_state.stats.il_input_count = 0;
+    g_uvc_state.stats.il_delivered_count = 0;
+    g_uvc_state.stats.il_decode_sum_ns = 0;
+    g_uvc_state.stats.il_decode_max_ns = 0;
+    g_uvc_state.stats.il_decode_count = 0;
+    g_uvc_state.stats.il_render_sum_ns = 0;
+    g_uvc_state.stats.il_render_max_ns = 0;
+    g_uvc_state.stats.il_render_count = 0;
+    g_uvc_state.stats.il_rec_convert_sum_ns = 0;
+    g_uvc_state.stats.il_rec_convert_max_ns = 0;
+    g_uvc_state.stats.il_rec_convert_count = 0;
+  }
   delivered_sequence = g_uvc_state.latest_sequence;
   frame_listener = g_uvc_state.frame_listener;
   clear_last_error();
@@ -2391,10 +3068,13 @@ Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeAttachRecordingSurf
     return UVC_ERROR_IO;
   }
 
+  // The recording surface now serves H.264/H.265 streams only (hardware
+  // decoder renders into it directly). Uncompressed/MJPEG recordings feed
+  // the encoder through the recording frame queue instead (NativeRecording
+  // JNI), which never touches a window.
   pthread_mutex_lock(&g_uvc_state.mutex);
   release_recording_window_locked();
   g_uvc_state.recording_window = window;
-  render_set_target_locked(RENDER_TARGET_RECORDING, window);
   pthread_mutex_unlock(&g_uvc_state.mutex);
   clear_last_error();
   return UVC_SUCCESS;
@@ -2407,13 +3087,68 @@ Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeDetachRecordingSurf
   (void)env;
   (void)thiz;
 
-  // Detaching only swaps the render target's window pointer — the render
-  // thread keeps running (it may still serve the preview) and drops the
-  // recording window from its next cycle on.
   pthread_mutex_lock(&g_uvc_state.mutex);
-  render_set_target_locked(RENDER_TARGET_RECORDING, NULL);
   release_recording_window_locked();
   pthread_mutex_unlock(&g_uvc_state.mutex);
+}
+
+// ---------------------------------------------------------------------------
+// Recording frame queue bridge (NativeRecording.kt): the video encoder feed
+// thread pulls YUV frames through these instead of attaching an input
+// Surface. Used by the uncompressed/MJPEG re-encode recording path only.
+// ---------------------------------------------------------------------------
+
+JNIEXPORT jint JNICALL
+Java_com_cornpip_flutter_1ffi_1uvc_NativeRecording_startQueue(
+    JNIEnv *env,
+    jclass clazz,
+    jint yuv_format,
+    jint stride,
+    jint slice_height) {
+  (void)env;
+  (void)clazz;
+  return uvc_rec_start_queue((int)yuv_format, (int)stride, (int)slice_height);
+}
+
+// Fills the direct ByteBuffer (a MediaCodec input buffer) with one
+// converted YUV frame. Returns the byte count, 0 on timeout/dropped frame,
+// -1 once the queue is stopped. out_pts_us[0] receives the frame PTS.
+JNIEXPORT jint JNICALL
+Java_com_cornpip_flutter_1ffi_1uvc_NativeRecording_readFrameYuv(
+    JNIEnv *env,
+    jclass clazz,
+    jobject buffer,
+    jlongArray out_pts_us,
+    jint timeout_ms) {
+  (void)clazz;
+
+  if (buffer == NULL) {
+    return UVC_ERROR_INVALID_PARAM;
+  }
+  uint8_t *dst = (uint8_t *)(*env)->GetDirectBufferAddress(env, buffer);
+  const jlong capacity = (*env)->GetDirectBufferCapacity(env, buffer);
+  if (dst == NULL || capacity <= 0) {
+    return UVC_ERROR_INVALID_PARAM;
+  }
+
+  int64_t pts_us = 0;
+  const int bytes =
+      uvc_rec_read_yuv(dst, (int)capacity, (int)timeout_ms, &pts_us);
+  if (bytes > 0 && out_pts_us != NULL &&
+      (*env)->GetArrayLength(env, out_pts_us) >= 1) {
+    const jlong pts = (jlong)pts_us;
+    (*env)->SetLongArrayRegion(env, out_pts_us, 0, 1, &pts);
+  }
+  return bytes;
+}
+
+JNIEXPORT void JNICALL
+Java_com_cornpip_flutter_1ffi_1uvc_NativeRecording_stopQueue(
+    JNIEnv *env,
+    jclass clazz) {
+  (void)env;
+  (void)clazz;
+  uvc_rec_stop_queue();
 }
 
 // ---------------------------------------------------------------------------

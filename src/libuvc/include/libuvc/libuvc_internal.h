@@ -259,6 +259,11 @@ struct uvc_stream_handle {
   size_t iso_endpoint_bytes_per_packet;
   uint64_t iso_xfer_total, iso_xfer_bad;
   uint64_t iso_pk_total, iso_pk_bad, iso_pk_short, iso_pk_zero;
+  /** Event-thread health probe: monotonic timestamp of the last completed
+   * iso transfer callback and the max gap between completions since the last
+   * stats print. A large gap means the libusb event thread (or host) stalled;
+   * large zero-packet counts with a small gap mean the device went silent. */
+  uint64_t cb_last_ns, cb_gap_max_ns;
   uint8_t *outbuf, *holdbuf;
   pthread_mutex_t cb_mutex;
   pthread_cond_t cb_cond;
