@@ -220,6 +220,13 @@ typedef struct {
   pthread_t render_thread;
   int render_thread_started;
   int render_thread_stop;
+  // Producer-handoff handshake for mode switches: a leftover GL-blit EGL
+  // surface keeps the preview BufferQueue's producer slot claimed and blocks
+  // a MediaCodec decoder from configuring the same window ("already
+  // connected"). Requested under the mutex, executed on the render thread
+  // (EGL objects are thread-bound), completion broadcast on render_cond.
+  int preview_producer_release_requested;
+  int preview_producer_release_done;
   int64_t render_done_sequence;
   render_target_t render_targets[RENDER_TARGET_COUNT];
 #endif
@@ -885,12 +892,23 @@ static int render_rgba_to_window(
   /* A failed geometry update is non-fatal: the window already carries a
    * usable geometry from an earlier session (e.g. after a codec held the
    * producer, some vendor builds reject setBuffersGeometry from here on).
-   * Locking and blitting still works with the existing geometry. */
-  (void)ANativeWindow_setBuffersGeometry(
-      window,
-      out_w,
-      out_h,
-      WINDOW_FORMAT_RGBA_8888);
+   * Locking and blitting still works with the existing geometry.
+   * Called only on a geometry change: on some vendor builds each call
+   * re-binds the CPU producer API to the window, and a CPU-claimed
+   * BufferQueue blocks both eglCreateWindowSurface and MediaCodec from ever
+   * attaching again (see gl_blit_render's comment). Render-thread only, so
+   * the cache needs no locking. */
+  static int s_geo_w = 0;
+  static int s_geo_h = 0;
+  if (s_geo_w != out_w || s_geo_h != out_h) {
+    (void)ANativeWindow_setBuffersGeometry(
+        window,
+        out_w,
+        out_h,
+        WINDOW_FORMAT_RGBA_8888);
+    s_geo_w = out_w;
+    s_geo_h = out_h;
+  }
 
   ANativeWindow_Buffer window_buffer;
   if (ANativeWindow_lock(window, &window_buffer, NULL) != 0) {
@@ -997,6 +1015,7 @@ static void *render_thread_main(void *arg) {
   pthread_mutex_lock(&g_uvc_state.mutex);
   for (;;) {
     while (!g_uvc_state.render_thread_stop &&
+           !g_uvc_state.preview_producer_release_requested &&
            (!g_uvc_state.previewing ||
             g_uvc_state.stopping_preview ||
             g_uvc_state.latest_sequence == g_uvc_state.render_done_sequence ||
@@ -1005,6 +1024,25 @@ static void *render_thread_main(void *arg) {
     }
     if (g_uvc_state.render_thread_stop) {
       break;
+    }
+
+    // Producer handoff for mode switches: destroy the preview blit here, on
+    // the thread that owns its EGL objects, then ack the requester. The
+    // destroy drops the EGL window surface, releasing the BufferQueue's
+    // producer slot so a decoder can claim it.
+    if (g_uvc_state.preview_producer_release_requested) {
+      render_target_t *target = &g_uvc_state.render_targets[RENDER_TARGET_PREVIEW];
+      gl_blit_t *stale_blit = target->blit;
+      target->blit = NULL;
+      target->blit_window = NULL;
+      target->blit_failed = 0;
+      g_uvc_state.preview_producer_release_requested = 0;
+      pthread_mutex_unlock(&g_uvc_state.mutex);
+      gl_blit_destroy(stale_blit);
+      pthread_mutex_lock(&g_uvc_state.mutex);
+      g_uvc_state.preview_producer_release_done = 1;
+      pthread_cond_broadcast(&g_uvc_state.render_cond);
+      continue;
     }
 
     // Grab the newest published frame as the busy buffer. Until the return
@@ -1094,6 +1132,37 @@ static void *render_thread_main(void *arg) {
   }
   pthread_mutex_unlock(&g_uvc_state.mutex);
   return NULL;
+}
+
+// Asks the render thread to destroy the preview blit: its EGL window surface
+// holds the preview BufferQueue's producer slot, and a MediaCodec decoder
+// (H.264/H.265 mode) cannot configure the same window until the slot is free
+// ("connect: already connected"). Caller holds g_uvc_state.mutex; the wait
+// releases it via pthread_cond_timedwait. Bounded wait: a wedged render
+// thread degrades the switch to the old behavior instead of deadlocking.
+static void request_preview_producer_release_locked(void) {
+  if (!g_uvc_state.render_thread_started ||
+      g_uvc_state.render_targets[RENDER_TARGET_PREVIEW].blit == NULL) {
+    return;
+  }
+  g_uvc_state.preview_producer_release_requested = 1;
+  g_uvc_state.preview_producer_release_done = 0;
+  pthread_cond_broadcast(&g_uvc_state.render_cond);
+
+  struct timespec deadline;
+  clock_gettime(CLOCK_REALTIME, &deadline);
+  deadline.tv_nsec += 500 * 1000000L;
+  if (deadline.tv_nsec >= 1000000000L) {
+    deadline.tv_sec += 1;
+    deadline.tv_nsec -= 1000000000L;
+  }
+  while (!g_uvc_state.preview_producer_release_done) {
+    if (pthread_cond_timedwait(
+            &g_uvc_state.render_cond, &g_uvc_state.mutex, &deadline) == ETIMEDOUT) {
+      UVC_LOGW("UVC_NATIVE", "preview producer release timed out");
+      break;
+    }
+  }
 }
 
 // Swaps the window a render target serves and lazily starts the render
@@ -1977,6 +2046,10 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
     if (window != NULL) {
       ANativeWindow_acquire(window);
     }
+    // The decoder claims the preview window's producer slot on first feed;
+    // if a GL blit is still attached (mode switch without a full
+    // stopPreview), release it first or configure fails "already connected".
+    request_preview_producer_release_locked();
     // Re-encode recording path: compressed frames bypass the RGBA staging
     // path, so a second decoder instance renders them into the recording
     // surface (the video encoder's input) directly.
@@ -2594,6 +2667,13 @@ FFI_PLUGIN_EXPORT int uvc_start_preview(
   pthread_mutex_lock(&g_uvc_state.mutex);
   if (should_stop_streaming) {
     finish_stop_preview_locked();
+#if defined(__ANDROID__)
+    // Same producer handoff as uvc_stop_preview: a direct startPreview mode
+    // switch lands here without a public stopPreview call, and a leftover GL
+    // blit EGL surface would block the next session's decoder configure with
+    // "already connected".
+    request_preview_producer_release_locked();
+#endif
   }
 
   uvc_stream_ctrl_t ctrl;
@@ -2894,6 +2974,14 @@ FFI_PLUGIN_EXPORT void uvc_stop_preview(void) {
     g_uvc_state.stats.stop_monotonic_ns = monotonic_time_ns();
   }
   finish_stop_preview_locked();
+#if defined(__ANDROID__)
+  // Hand back the preview surface's producer slot before returning: the next
+  // session may be H.264/H.265, whose decoder must claim it. A leftover EGL
+  // surface from the GL blit would block the decoder's configure with
+  // "already connected" (regressed when rendering moved to the persistent
+  // render thread; previously the blit was destroyed here directly).
+  request_preview_producer_release_locked();
+#endif
   pthread_mutex_unlock(&g_uvc_state.mutex);
   UVC_LOGD("UVC_NATIVE", "uvc_stop_preview end");
 }

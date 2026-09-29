@@ -664,12 +664,10 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
     Duration timeout = _startupProbeTimeout,
   }) async {
     _log('libuvc preview start attempt: ${mode.label} / Texture');
-    // Start every session on a brand-new SurfaceTexture. A reused BufferQueue
-    // carries stale slots across codec sessions (green flash on H.264/H.265),
-    // and once any producer API (CPU blit, MediaCodec) has claimed the queue,
-    // EGL can never attach to it again — which would silently drop the MJPEG
-    // path back to the high-power CPU blit. A fresh queue has neither problem.
-    await _disposePreviewTexture();
+    // The plugin releases the preview surface's producer on stopPreview and
+    // before the H.264/H.265 decoder claims it, so one texture is reused
+    // across mode switches. It is created lazily here and disposed with the
+    // page (or when the texture pipeline is torn down).
     await _ensurePreviewTexture();
     final bool isCompressed =
         mode.formatName == 'H264' || mode.formatName == 'H265';
