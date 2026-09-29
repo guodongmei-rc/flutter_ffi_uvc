@@ -1377,12 +1377,11 @@ FFI_PLUGIN_EXPORT int uvc_rec_start_queue(
   clear_last_error();
 
 #if defined(__ANDROID__)
-  // One-time field diagnostic: run the same RGBA->YUV conversion into plain
-  // malloc'd memory. Set against the per-frame rec_avg (which writes into
-  // MediaCodec input buffers), this splits "conversion is slow" from "codec
-  // input buffers are slow to CPU-write" (uncached ION mappings on some
-  // Qualcomm devices). ~3 x single-frame cost, paid once per recording start.
-  {
+  // One-time field diagnostic (debug log level only): run the same RGBA->YUV
+  // conversion into plain malloc'd memory. Set against the per-frame rec_avg
+  // (which writes into MediaCodec input buffers), this splits "conversion is
+  // slow" from "codec input buffers are slow to CPU-write".
+  if (uvc_log_enabled(UVC_LOG_LEVEL_DEBUG)) {
     const int bw = enc_stride > 0 && enc_stride % 2 == 0 ? enc_stride : 1920;
     const int bh =
         enc_slice_height > 0 && enc_slice_height % 2 == 0 ? enc_slice_height : 1080;
@@ -2285,7 +2284,8 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
   }
   if (g_uvc_state.stats.il_window_start_ns == 0) {
     g_uvc_state.stats.il_window_start_ns = callback_monotonic_ns;
-  } else if (callback_monotonic_ns - g_uvc_state.stats.il_window_start_ns >=
+  } else if (uvc_log_enabled(UVC_LOG_LEVEL_DEBUG) &&
+             callback_monotonic_ns - g_uvc_state.stats.il_window_start_ns >=
              5000000000ull) {
     const ffi_uvc_stream_stats_t *s = &g_uvc_state.stats;
     const double window_s =
