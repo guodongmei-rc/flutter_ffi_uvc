@@ -927,7 +927,8 @@ void LIBUSB_CALL _uvc_stream_callback(struct libusb_transfer *transfer) {
 
       }
 
-      if (strmh->iso_xfer_total % 120 == 0) {
+      if (strmh->iso_xfer_total % 120 == 0 &&
+          uvc_log_enabled(UVC_LOG_LEVEL_DEBUG)) {
 #if defined(__ANDROID__)
         __android_log_print(
             ANDROID_LOG_INFO,

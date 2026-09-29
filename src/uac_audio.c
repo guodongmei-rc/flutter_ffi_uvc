@@ -13,9 +13,15 @@
 #if defined(__ANDROID__)
 #include <android/log.h>
 /* uvc_log is compiled out in this build; diagnostics here must still reach
- * logcat, so all logs go through __android_log_print directly. */
+ * logcat, so all logs go through __android_log_print directly. Info-level
+ * logs (including the per-second stats line) are gated behind the DEBUG
+ * native log level; warnings always print. */
 #define UAC_STATS_LOGI(...) \
-  __android_log_print(ANDROID_LOG_INFO, "flutter_ffi_uvc", __VA_ARGS__)
+  do { \
+    if (uvc_log_enabled(UVC_LOG_LEVEL_DEBUG)) { \
+      __android_log_print(ANDROID_LOG_INFO, "flutter_ffi_uvc", __VA_ARGS__); \
+    } \
+  } while (0)
 #define UAC_STATS_LOGW(...) \
   __android_log_print(ANDROID_LOG_WARN, "flutter_ffi_uvc", __VA_ARGS__)
 #else
