@@ -26,11 +26,15 @@ typedef struct {
   int interface_no;   /* bInterfaceNumber to claim */
   int altsetting;     /* alternate setting carrying the isoc endpoint */
   uint8_t ep_address; /* isochronous IN endpoint */
+  uint8_t ep_interval;/* endpoint bInterval (isoc service interval) */
   uint32_t packet_size;
   int channels;
   int bits;
   int sample_rate;
 } uac_audio_info_t;
+
+/* Bounds the altsetting list uac_audio_probe_all() collects. */
+#define UAC_MAX_CANDIDATES 16
 
 /* Scans the active configuration for a UAC AudioStreaming interface with an
  * isochronous IN endpoint and parses its format descriptor (UAC1 Format
@@ -39,15 +43,32 @@ typedef struct {
  * audio capture interface. */
 int uac_audio_probe(libusb_device_handle *usb_devh, uac_audio_info_t *out);
 
-/* Claims the probed interface, selects its altsetting and starts isoc
- * transfers into the ring buffer. Returns NULL on failure (fully cleaned
- * up; the caller is expected to fall back to video-only recording).
+/* Same scan as uac_audio_probe() but collects EVERY usable altsetting into
+ * out[] (up to max_candidates) and returns the count, -1 on descriptor
+ * errors. The sample rates are packet-size heuristics until a stream is
+ * actually measured — see uac_audio_start(). */
+int uac_audio_probe_all(
+    libusb_device_handle *usb_devh,
+    uac_audio_info_t *out,
+    int max_candidates);
+
+/* Claims the interface of candidates[0], selects its altsetting and starts
+ * isoc transfers into the ring buffer. Only ONE altsetting is ever set:
+ * cycling altsettings while the video stream runs wedges some camera
+ * firmwares. After the stream starts, the real delivery rate is measured
+ * over a short window (~300ms); when it snaps cleanly to a standard sample
+ * rate, that measured rate replaces the descriptor estimate — the winning
+ * format is copied back to candidates[0] so the caller can configure its
+ * encoder with the true rate.
+ * Returns NULL on failure (fully cleaned up; the caller is expected to fall
+ * back to video-only recording).
  * video_streaming!=0 skips the log-only AudioControl probes (selector-unit
  * GET_CUR) so the EP0 traffic added while the video stream is running stays
  * limited to the transfers the mic actually needs (unmute, volume). */
 uac_audio_t *uac_audio_start(
     libusb_device_handle *usb_devh,
-    const uac_audio_info_t *info,
+    uac_audio_info_t *candidates,
+    int candidate_count,
     int video_streaming);
 
 /* Pins the session while a reader thread is inside uac_audio_read(). The

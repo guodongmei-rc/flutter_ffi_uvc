@@ -54,6 +54,9 @@ struct uac_audio {
   int pending;   /* transfers in flight (callback guaranteed) */
   int readers;   /* threads currently inside uac_audio_read */
   int stopping;
+  /* Total delivered PCM bytes since start; uac_audio_start() samples it
+   * twice to measure the real capture rate. Never reset while streaming. */
+  uint64_t stat_bytes_total;
   /* Capture diagnostics: per-window (1000 packets ≈ 1s at 1ms/packet). */
   uint64_t stat_packets;
   uint64_t stat_packets_with_data;
@@ -122,6 +125,16 @@ static int uac_snap_sample_rate(int estimate) {
   return 0;
 }
 
+/* Isoc packets per second for an endpoint bInterval: high-speed devices
+ * schedule 2^(bInterval-1) microframes (125us units) between packets. */
+static int uac_packets_per_sec(uint8_t ep_interval) {
+  int exponent = ep_interval > 0 ? ep_interval - 1 : 0;
+  if (exponent > 4) {
+    exponent = 4;
+  }
+  return 8000 >> exponent;
+}
+
 /* UAC2 descriptors do not state the capture sample rate in the streaming
  * interface, so estimate it from the isoc packet size: a synchronous IN
  * endpoint delivers one packet per service interval holding
@@ -134,11 +147,7 @@ static void uac_estimate_format(uac_audio_info_t *info, uint8_t ep_interval) {
     return;
   }
   const int bytes_per_sample = (info->bits + 7) / 8;
-  int exponent = ep_interval > 0 ? ep_interval - 1 : 0;
-  if (exponent > 4) {
-    exponent = 4;
-  }
-  const int packets_per_sec = 8000 >> exponent;  /* high-speed microframes */
+  const int packets_per_sec = uac_packets_per_sec(ep_interval);
 
   int candidates[2];
   int candidate_count = 0;
@@ -191,8 +200,11 @@ static int uac_as_terminal_link(const unsigned char *extra, int extra_length) {
   return 0;
 }
 
-int uac_audio_probe(libusb_device_handle *usb_devh, uac_audio_info_t *out) {
-  if (usb_devh == NULL || out == NULL) {
+int uac_audio_probe_all(
+    libusb_device_handle *usb_devh,
+    uac_audio_info_t *out,
+    int max_candidates) {
+  if (usb_devh == NULL || out == NULL || max_candidates <= 0) {
     return -1;
   }
   libusb_device *dev = libusb_get_device(usb_devh);
@@ -204,8 +216,6 @@ int uac_audio_probe(libusb_device_handle *usb_devh, uac_audio_info_t *out) {
   }
 
   int found = 0;
-  uac_audio_info_t info;
-  memset(&info, 0, sizeof(info));
   for (int i = 0; i < config->bNumInterfaces; i++) {
     const struct libusb_interface *iface = &config->interface[i];
     for (int a = 0; a < iface->num_altsetting; a++) {
@@ -234,6 +244,7 @@ int uac_audio_probe(libusb_device_handle *usb_devh, uac_audio_info_t *out) {
         candidate.interface_no = alt->bInterfaceNumber;
         candidate.altsetting = alt->bAlternateSetting;
         candidate.ep_address = ep->bEndpointAddress;
+        candidate.ep_interval = ep->bInterval;
         uac_parse_format(
             alt->extra,
             alt->extra_length,
@@ -243,31 +254,40 @@ int uac_audio_probe(libusb_device_handle *usb_devh, uac_audio_info_t *out) {
         uac_estimate_format(&candidate, ep->bInterval);
         UAC_STATS_LOGI(
             "probe candidate: interface=%d alt=%d ep=0x%02x packet=%u "
-            "rate=%d ch=%d bits=%d terminal_link=%d%s",
+            "interval=%u rate=%d ch=%d bits=%d terminal_link=%d%s",
             candidate.interface_no,
             candidate.altsetting,
             candidate.ep_address,
             candidate.packet_size,
+            candidate.ep_interval,
             candidate.sample_rate,
             candidate.channels,
             candidate.bits,
             uac_as_terminal_link(alt->extra, alt->extra_length),
-            found ? "" : " (selected)");
-        if (!found) {
-          info = candidate;
-          found = 1;
+            found == 0 ? " (probe default)" : "");
+        if (found < max_candidates) {
+          out[found] = candidate;
         }
+        found++;
       }
     }
   }
   libusb_free_config_descriptor(config);
 
-  if (!found) {
+  if (found == 0) {
     UAC_STATS_LOGI( "probe: no UAC AudioStreaming capture interface");
     return -1;
   }
-  *out = info;
-  return 0;
+  if (found > max_candidates) {
+    UAC_STATS_LOGI(
+        "probe: %d candidates, keeping first %d", found, max_candidates);
+    found = max_candidates;
+  }
+  return found;
+}
+
+int uac_audio_probe(libusb_device_handle *usb_devh, uac_audio_info_t *out) {
+  return uac_audio_probe_all(usb_devh, out, 1) > 0 ? 0 : -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -518,6 +538,7 @@ static void LIBUSB_CALL uac_audio_transfer_cb(struct libusb_transfer *transfer) 
     for (int p = 0; p < transfer->num_iso_packets; p++) {
       const struct libusb_iso_packet_descriptor *packet =
           &transfer->iso_packet_desc[p];
+      audio->stat_bytes_total += packet->actual_length;
       uac_stats_packet(
           audio,
           transfer->buffer + p * audio->info.packet_size,
@@ -561,13 +582,132 @@ static void LIBUSB_CALL uac_audio_transfer_cb(struct libusb_transfer *transfer) 
   }
 }
 
+/* How long the freshly started stream is measured to learn the real PCM
+ * delivery rate before reporting the capture format. */
+#define UAC_MEASURE_WINDOW_MS 300
+
+/* UAC1 sampling-frequency control (spec 5.2.1.1): a class request on the
+ * isochronous endpoint itself. Some firmwares power up on a very low
+ * default clock (observed ~1000 Hz on a RunCam, delivering only 2000 B/s)
+ * and stream at full rate only after the host sets the frequency — camera
+ * apps whose UAC init sets it get full audio on the same hardware. */
+#define UAC_EP_REQ_GET_CUR 0x81
+#define UAC_EP_REQ_SET_CUR 0x01
+#define UAC_EP_CS_SAMPLING_FREQ 0x01
+
+/* Returns the endpoint's current sampling frequency, or -1 on failure. */
+static int uac_get_sampling_freq(libusb_device_handle *usb_devh, uint8_t ep_address) {
+  uint8_t buf[3] = {0, 0, 0};
+  const int rc = libusb_control_transfer(
+      usb_devh, 0xa2 /* IN | class | endpoint */, UAC_EP_REQ_GET_CUR,
+      (uint16_t)(UAC_EP_CS_SAMPLING_FREQ << 8), ep_address, buf, 3, 300);
+  if (rc != 3) {
+    return -1;
+  }
+  return buf[0] | (buf[1] << 8) | (buf[2] << 16);
+}
+
+/* Sets the endpoint's sampling frequency; returns the libusb status. */
+static int uac_set_sampling_freq(
+    libusb_device_handle *usb_devh, uint8_t ep_address, int freq) {
+  uint8_t buf[3] = {
+      (uint8_t)(freq & 0xff),
+      (uint8_t)((freq >> 8) & 0xff),
+      (uint8_t)((freq >> 16) & 0xff),
+  };
+  return libusb_control_transfer(
+      usb_devh, 0x22 /* OUT | class | endpoint */, UAC_EP_REQ_SET_CUR,
+      (uint16_t)(UAC_EP_CS_SAMPLING_FREQ << 8), ep_address, buf, 3, 300);
+}
+
+/* Claims an interface, detaching a kernel audio driver and retrying briefly:
+ * a capture stopped moments ago can leave the interface briefly unclaimable
+ * (the altsetting-0 reset is still in flight). Returns 0 on success. */
+static int uac_claim_interface(libusb_device_handle *usb_devh, int interface_no) {
+  int rc = -1;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    rc = libusb_claim_interface(usb_devh, interface_no);
+    if (rc == LIBUSB_ERROR_BUSY) {
+      /* The kernel audio driver (snd-usb-audio) may hold the interface. */
+      libusb_detach_kernel_driver(usb_devh, interface_no);
+      rc = libusb_claim_interface(usb_devh, interface_no);
+    }
+    if (rc == 0) {
+      return 0;
+    }
+    if (attempt + 1 < 3) {
+      const struct timespec pause = {0, 50 * 1000 * 1000};
+      nanosleep(&pause, NULL);
+    }
+  }
+  return rc;
+}
+
+/* Points every session transfer at the candidate's endpoint and submits
+ * them. Returns how many transfers went out (0 = candidate unusable, with
+ * the last libusb error in out_rc when non-NULL). */
+static int uac_submit_transfers(
+    uac_audio_t *audio, const uac_audio_info_t *info, int *out_rc) {
+  const int transfer_bytes = (int)(info->packet_size * UAC_ISO_PACKETS);
+  audio->info = *info;
+  for (int i = 0; i < UAC_NUM_TRANSFERS; i++) {
+    struct libusb_transfer *transfer = audio->transfers[i];
+    if (transfer == NULL) {
+      continue;
+    }
+    libusb_fill_iso_transfer(
+        transfer,
+        audio->usb_devh,
+        info->ep_address,
+        transfer->buffer,
+        transfer_bytes,
+        UAC_ISO_PACKETS,
+        uac_audio_transfer_cb,
+        audio,
+        0 /* no timeout; stop() cancels explicitly */);
+    libusb_set_iso_packet_lengths(transfer, info->packet_size);
+  }
+  int submitted = 0;
+  int last_rc = 0;
+  for (int i = 0; i < UAC_NUM_TRANSFERS; i++) {
+    if (audio->transfers[i] == NULL) {
+      continue;
+    }
+    const int rc = libusb_submit_transfer(audio->transfers[i]);
+    if (rc == 0) {
+      submitted++;
+    } else {
+      last_rc = rc;
+    }
+  }
+  if (out_rc != NULL) {
+    *out_rc = last_rc;
+  }
+  pthread_mutex_lock(&audio->mutex);
+  audio->pending += submitted;
+  pthread_mutex_unlock(&audio->mutex);
+  return submitted;
+}
+
+static int64_t uac_monotonic_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec;
+}
+
 uac_audio_t *uac_audio_start(
     libusb_device_handle *usb_devh,
-    const uac_audio_info_t *info,
+    uac_audio_info_t *candidates,
+    int candidate_count,
     int video_streaming) {
-  if (usb_devh == NULL || info == NULL || info->packet_size == 0) {
+  if (usb_devh == NULL || candidates == NULL || candidate_count <= 0) {
     return NULL;
   }
+  const uac_audio_info_t *info = &candidates[0];
+  if (info->packet_size == 0) {
+    return NULL;
+  }
+  const int descriptor_rate = info->sample_rate;
 
   uac_audio_t *audio = calloc(1, sizeof(uac_audio_t));
   if (audio == NULL) {
@@ -601,17 +741,9 @@ uac_audio_t *uac_audio_start(
         free(buffer);
         break;
       }
-      libusb_fill_iso_transfer(
-          transfer,
-          usb_devh,
-          info->ep_address,
-          buffer,
-          (int)transfer_bytes,
-          UAC_ISO_PACKETS,
-          uac_audio_transfer_cb,
-          audio,
-          0 /* no timeout; stop() cancels explicitly */);
-      libusb_set_iso_packet_lengths(transfer, info->packet_size);
+      /* uac_submit_transfers() fills the transfer later and reads
+       * transfer->buffer, so the buffer must be attached here. */
+      transfer->buffer = buffer;
       audio->transfers[i] = transfer;
       transfers_ready++;
     }
@@ -622,31 +754,21 @@ uac_audio_t *uac_audio_start(
     return NULL;
   }
 
-  /* A capture stopped moments ago can leave the interface briefly
-   * unclaimable (the altsetting-0 reset is still in flight); retry a few
-   * times before giving up. */
-  int rc = -1;
-  for (int attempt = 0; attempt < 3; attempt++) {
-    rc = libusb_claim_interface(usb_devh, info->interface_no);
-    if (rc == LIBUSB_ERROR_BUSY) {
-      /* The kernel audio driver (snd-usb-audio) may hold the interface. */
-      libusb_detach_kernel_driver(usb_devh, info->interface_no);
-      rc = libusb_claim_interface(usb_devh, info->interface_no);
-    }
-    if (rc == 0) {
-      rc = libusb_set_interface_alt_setting(
-          usb_devh, info->interface_no, info->altsetting);
-    }
-    if (rc == 0) {
-      break;
-    }
-    if (attempt + 1 < 3) {
-      const struct timespec pause = {0, 50 * 1000 * 1000};
-      nanosleep(&pause, NULL);
-    }
+  /* Commit to the first candidate directly — one claim, one SET_INTERFACE.
+   * Cycling altsettings while the video stream runs wedges some camera
+   * firmwares (on a RunCam the video stream dies mid-switch and does not
+   * recover until the next power cycle), and on such devices every
+   * altsetting delivers the same trickle anyway, so hopping buys nothing. */
+  const int claim_rc = uac_claim_interface(usb_devh, info->interface_no);
+  if (claim_rc != 0) {
+    UAC_STATS_LOGW(
+        "start: claim interface=%d failed rc=%d", info->interface_no, claim_rc);
+    uac_audio_stop(audio);
+    return NULL;
   }
-  if (rc != 0) {
-    UAC_STATS_LOGW( "start: claim/altsetting failed rc=%d", rc);
+  if (libusb_set_interface_alt_setting(
+          usb_devh, info->interface_no, info->altsetting) != 0) {
+    UAC_STATS_LOGW( "start: altsetting=%d rejected", info->altsetting);
     uac_audio_stop(audio);
     return NULL;
   }
@@ -655,28 +777,69 @@ uac_audio_t *uac_audio_start(
    * topology and raise every mic gain found before streaming starts. */
   uac_configure_audio_controls(usb_devh, video_streaming);
 
-  int submitted = 0;
-  for (int i = 0; i < transfers_ready; i++) {
-    if (libusb_submit_transfer(audio->transfers[i]) == 0) {
-      submitted++;
-    }
-  }
+  /* Read the endpoint's current sampling frequency and push the target:
+   * firmwares idling on a low default clock only stream at full rate after
+   * an explicit SET_CUR. Failures are logged and ignored — devices that do
+   * not implement the control simply stream their (already correct) rate. */
+  const int freq_before = uac_get_sampling_freq(usb_devh, info->ep_address);
+  const int freq_set_rc =
+      uac_set_sampling_freq(usb_devh, info->ep_address, info->sample_rate);
+  const int freq_after = uac_get_sampling_freq(usb_devh, info->ep_address);
+  UAC_STATS_LOGI(
+      "ep sampling freq: before=%d set=%d rc=%d after=%d",
+      freq_before, info->sample_rate, freq_set_rc, freq_after);
+
+  int submit_rc = 0;
+  const int submitted = uac_submit_transfers(audio, info, &submit_rc);
   if (submitted == 0) {
-    UAC_STATS_LOGW( "start: no isoc transfer could be submitted");
+    UAC_STATS_LOGW( "start: no isoc transfer could be submitted rc=%d", submit_rc);
     uac_audio_stop(audio);
     return NULL;
   }
 
+  /* Measure the real delivery rate for a short window: descriptor rates
+   * are estimates (UAC2 does not even state one), so the encoder rate is
+   * derived from measured bytes — but only when the measurement snaps
+   * cleanly to a standard rate; otherwise the descriptor estimate stands.
+   * PCM arriving during the window stays in the ring; the reader drains it
+   * once the encoder starts. */
   pthread_mutex_lock(&audio->mutex);
-  audio->pending = submitted;
+  const uint64_t measure_b0 = audio->stat_bytes_total;
   pthread_mutex_unlock(&audio->mutex);
+  const int64_t measure_t0 = uac_monotonic_ns();
+  struct timespec window = {0, UAC_MEASURE_WINDOW_MS * 1000 * 1000};
+  while (nanosleep(&window, &window) != 0 && errno == EINTR) {
+  }
+  pthread_mutex_lock(&audio->mutex);
+  const uint64_t delivered = audio->stat_bytes_total - measure_b0;
+  pthread_mutex_unlock(&audio->mutex);
+  const int64_t elapsed_ns = uac_monotonic_ns() - measure_t0;
+  const uint64_t bps = elapsed_ns > 0
+      ? delivered * 1000000000ull / (uint64_t)elapsed_ns
+      : 0;
+
+  uac_audio_info_t final = *info;
+  const int frame_bytes = final.channels * ((final.bits + 7) / 8);
+  if (frame_bytes > 0 && bps > 0) {
+    const int measured = (int)(bps / (uint64_t)frame_bytes);
+    const int snapped = uac_snap_sample_rate(measured);
+    if (snapped > 0) {
+      final.sample_rate = snapped;
+    }
+  }
+  audio->info = final;
+  candidates[0] = final;
   UAC_STATS_LOGI(
-      "capture started: rate=%d ch=%d bits=%d packet=%u transfers=%d",
-      info->sample_rate,
-      info->channels,
-      info->bits,
-      info->packet_size,
-      submitted);
+      "capture started: alt=%d rate=%d descriptor_rate=%d ch=%d bits=%d "
+      "packet=%u transfers=%d bytes/s=%llu",
+      final.altsetting,
+      final.sample_rate,
+      descriptor_rate,
+      final.channels,
+      final.bits,
+      final.packet_size,
+      submitted,
+      (unsigned long long)bps);
   return audio;
 }
 

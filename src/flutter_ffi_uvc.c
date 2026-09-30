@@ -3273,14 +3273,11 @@ Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_probe(
   return result;
 }
 
-// Starts PCM capture from the camera's UAC interface. 0 on success.
-JNIEXPORT jint JNICALL
-Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_start(
-    JNIEnv *env,
-    jobject thiz) {
-  (void)env;
-  (void)thiz;
-
+// Starts PCM capture from the camera's UAC interface, calibrating every
+// altsetting candidate to find one that really streams (firmwares differ;
+// some altsettings deliver only a trickle). UVC_SUCCESS on success; when
+// detected is non-NULL it receives the measured real capture format.
+static jint native_audio_start_internal(uac_audio_info_t *detected) {
   pthread_mutex_lock(&g_uvc_state.mutex);
   jint result = UVC_ERROR_OTHER;
   libusb_device_handle *usb_devh = NULL;
@@ -3291,12 +3288,12 @@ Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_start(
     result = UVC_ERROR_NO_DEVICE;
   } else {
     // Flip the state bit under the mutex, then run the slow USB setup
-    // (interface claim with 3x50ms retries, SET_INTERFACE and the
-    // AudioControl transfers, each up to 300ms) WITHOUT the lock: holding
-    // it made every frame callback trylock-fail and drop its frame, and
-    // the sync control transfers starved the libusb event thread of the
-    // events lock, pausing video URB resubmission. audio_starting keeps
-    // device close from freeing devh while it is borrowed.
+    // (interface claim with 3x50ms retries, SET_INTERFACE, the AudioControl
+    // transfers and the per-altsetting calibration, each up to 300ms)
+    // WITHOUT the lock: holding it made every frame callback trylock-fail
+    // and drop its frame, and the sync control transfers starved the libusb
+    // event thread of the events lock, pausing video URB resubmission.
+    // audio_starting keeps device close from freeing devh while borrowed.
     g_uvc_state.audio_starting = 1;
     usb_devh = g_uvc_state.devh->usb_devh;
     video_streaming = g_uvc_state.previewing;
@@ -3306,14 +3303,18 @@ Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_start(
     return result;
   }
 
-  uac_audio_info_t info;
+  uac_audio_info_t candidates[UAC_MAX_CANDIDATES];
   uac_audio_t *audio = NULL;
-  if (uac_audio_probe(usb_devh, &info) != 0) {
+  const int count =
+      uac_audio_probe_all(usb_devh, candidates, UAC_MAX_CANDIDATES);
+  if (count <= 0) {
     result = UVC_ERROR_INVALID_DEVICE;
   } else {
-    audio = uac_audio_start(usb_devh, &info, video_streaming);
+    audio = uac_audio_start(usb_devh, candidates, count, video_streaming);
     if (audio == NULL) {
       result = UVC_ERROR_IO;
+    } else if (detected != NULL) {
+      *detected = candidates[0];
     }
   }
 
@@ -3327,6 +3328,38 @@ Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_start(
     result = UVC_SUCCESS;
   }
   pthread_mutex_unlock(&g_uvc_state.mutex);
+  return result;
+}
+
+// Starts PCM capture from the camera's UAC interface. 0 on success.
+JNIEXPORT jint JNICALL
+Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_start(
+    JNIEnv *env,
+    jobject thiz) {
+  (void)env;
+  (void)thiz;
+  return native_audio_start_internal(NULL);
+}
+
+// Starts PCM capture like NativeAudio_start and returns {sampleRate,
+// channels, bits} measured during calibration, or NULL on failure. The
+// returned rate is the real one — descriptor rates are estimates.
+JNIEXPORT jintArray JNICALL
+Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_startDetected(
+    JNIEnv *env,
+    jobject thiz) {
+  (void)thiz;
+
+  uac_audio_info_t detected;
+  if (native_audio_start_internal(&detected) != UVC_SUCCESS) {
+    return NULL;
+  }
+  jintArray result = (*env)->NewIntArray(env, 3);
+  if (result == NULL) {
+    return NULL;
+  }
+  const jint values[3] = {detected.sample_rate, detected.channels, detected.bits};
+  (*env)->SetIntArrayRegion(env, result, 0, 3, values);
   return result;
 }
 

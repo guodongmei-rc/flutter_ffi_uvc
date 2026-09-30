@@ -13,6 +13,7 @@ import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
 import android.media.MediaCodecList
+import android.media.AudioManager
 import android.media.MediaFormat
 import android.media.MediaScannerConnection
 import android.os.Build
@@ -46,6 +47,7 @@ class FlutterFfiUvcPlugin :
     companion object {
         private const val CAMERA_PERMISSION_REQUEST_CODE = 9001
         private const val GALLERY_PERMISSION_REQUEST_CODE = 9002
+        private const val AUDIO_PERMISSION_REQUEST_CODE = 9003
         private const val TAG = "flutter_ffi_uvc"
 
         init {
@@ -239,6 +241,14 @@ class FlutterFfiUvcPlugin :
         permissions: Array<out String>,
         grantResults: IntArray,
     ): Boolean {
+        if (requestCode == AUDIO_PERMISSION_REQUEST_CODE) {
+            // Fire-and-forget: the current recording already fell back to
+            // the libusb path; the grant (or denial) applies to the next one.
+            val granted =
+                grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+            Log.i(TAG, "RECORD_AUDIO permission ${if (granted) "granted" else "denied"}")
+            return true
+        }
         val result = when (requestCode) {
             CAMERA_PERMISSION_REQUEST_CODE -> {
                 val pending = cameraPermissionResult ?: return false
@@ -497,7 +507,8 @@ class FlutterFfiUvcPlugin :
                 // queue (no GL, no input Surface on that path).
                 val useBufferInput = cameraFormat != "H264" && cameraFormat != "H265"
                 val audioEncoder = if (call.argument<Boolean>("withAudio") ?: true) {
-                    tryStartAudioCapture()?.let { AacAudioEncoder(it[0], it[1]) }
+                    maybeRequestAudioPermission()
+                    createAudioEncoder()
                 } else {
                     null
                 }
@@ -616,11 +627,40 @@ class FlutterFfiUvcPlugin :
 
     // Audio capture for recordings. Every failure logs a warning and degrades
     // to video-only — audio must never break a recording.
-    private fun tryStartAudioCapture(): IntArray? {
+    //
+    // Source selection: the Android USB audio path (AudioRecord) is tried
+    // first — the kernel USB audio driver does the isochronous streaming
+    // itself, which is immune to the userspace usbfs starvation some phones
+    // show on raw isoc reads (a steady 1/16 of the nominal rate on a Huawei
+    // nova 12). Without mic permission or a USB audio input device, the
+    // native libusb UAC capture is used instead; startDetected() measures
+    // the real capture format while starting (the descriptor rate is only
+    // an estimate).
+    private fun createAudioEncoder(): AacAudioEncoder? {
+        val context = appContext
+        if (context != null && hasRecordAudioPermission()) {
+            val audioManager =
+                context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val usbInput = UsbMicCapture.findUsbInput(audioManager)
+            if (usbInput != null) {
+                val capture = UsbMicCapture.open(usbInput)
+                if (capture != null) {
+                    Log.i(TAG, "Audio source: AudioRecord USB mic @ ${capture.sampleRate} Hz")
+                    // The kernel path already applies sane gain; keep PCM
+                    // as-is (fixed unity gain, no AGC).
+                    return AacAudioEncoder(
+                        capture.sampleRate, capture.channelCount, 1f, capture,
+                    )
+                }
+                Log.w(TAG, "USB audio input found but AudioRecord failed; using libusb UAC")
+            } else {
+                Log.i(TAG, "No USB audio input device; using libusb UAC capture")
+            }
+        }
         val info = try {
-            NativeAudio.probe()
+            NativeAudio.startDetected()
         } catch (e: Throwable) {
-            Log.w(TAG, "Audio probe failed; recording video-only", e)
+            Log.w(TAG, "Audio capture start threw; recording video-only", e)
             null
         }
         if (info == null) {
@@ -629,19 +669,38 @@ class FlutterFfiUvcPlugin :
         }
         if (info.size < 3 || info[0] <= 0 || info[1] <= 0 || info[2] != 16) {
             Log.w(TAG, "Unsupported UAC format ${info.contentToString()}; recording video-only")
+            stopAudioCaptureQuietly()
             return null
         }
-        val startResult = try {
-            NativeAudio.start()
-        } catch (e: Throwable) {
-            Log.w(TAG, "Audio capture start threw; recording video-only", e)
-            -1
-        }
-        if (startResult != 0) {
-            Log.w(TAG, "Audio capture start failed (rc=$startResult); recording video-only")
-            return null
-        }
-        return info
+        Log.i(TAG, "Audio source: libusb UAC @ ${info[0]} Hz")
+        return AacAudioEncoder(info[0], info[1])
+    }
+
+    private fun hasRecordAudioPermission(): Boolean {
+        val context = appContext ?: return false
+        return ContextCompat.checkSelfPermission(
+            context, android.Manifest.permission.RECORD_AUDIO,
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    /**
+     * Triggers the runtime mic-permission prompt when a USB audio input is
+     * present but RECORD_AUDIO is not granted. Fire-and-forget: the current
+     * recording falls back to the libusb path; the next one can use
+     * AudioRecord.
+     */
+    private fun maybeRequestAudioPermission() {
+        val context = appContext ?: return
+        val currentActivity = activity ?: return
+        if (hasRecordAudioPermission()) return
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        if (UsbMicCapture.findUsbInput(audioManager) == null) return
+        Log.i(TAG, "Requesting RECORD_AUDIO for the USB mic path")
+        ActivityCompat.requestPermissions(
+            currentActivity,
+            arrayOf(android.Manifest.permission.RECORD_AUDIO),
+            AUDIO_PERMISSION_REQUEST_CODE,
+        )
     }
 
     private fun stopAudioCaptureQuietly() {
@@ -654,17 +713,21 @@ class FlutterFfiUvcPlugin :
 
     /** Starts the AAC temp-file recorder for the passthrough recording path. */
     private fun startPassthroughAudio(context: Context) {
-        val info = tryStartAudioCapture() ?: return
+        maybeRequestAudioPermission()
+        val encoder = createAudioEncoder() ?: return
         try {
             val audioFile =
                 File(context.cacheDir, "uvc_audio_${System.currentTimeMillis()}.bin")
-            val recorder = AacFileRecorder(audioFile, info[0], info[1])
+            val recorder = AacFileRecorder(audioFile, encoder)
             recorder.start()
             rawRecAudioTempFile = audioFile
             aacFileRecorder = recorder
         } catch (e: Exception) {
             Log.w(TAG, "Audio recorder failed to start; recording video-only", e)
             stopAudioCaptureQuietly()
+            // Safe on a never-started encoder; releases the AudioRecord when
+            // the kernel path was selected.
+            encoder.stop()
         }
     }
 

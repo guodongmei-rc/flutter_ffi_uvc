@@ -8,16 +8,17 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
- * PCM → AAC encoder fed from the native UAC capture ([NativeAudio]).
+ * PCM → AAC encoder fed from the native UAC capture ([NativeAudio]) or,
+ * when a [UsbMicCapture] is given, from the Android USB audio framework.
  *
- * A feeder thread polls [NativeAudio.read] and queues 16-bit PCM into the
+ * A feeder thread polls the PCM source and queues 16-bit PCM into the
  * codec; a drain thread forwards the encoded output through the callbacks.
  * Presentation timestamps are a monotonic clock starting at [start], so the
  * first sample sits near zero like the video track's.
  */
 internal class AacAudioEncoder(
-    private val sampleRate: Int,
-    private val channelCount: Int,
+    val sampleRate: Int,
+    val channelCount: Int,
     /**
      * Fixed linear gain applied to the PCM before encoding, or 0 (the
      * default) for automatic gain control. Camera mics often run at a very
@@ -27,6 +28,13 @@ internal class AacAudioEncoder(
      * [AGC_MIN_GAIN] during silence to avoid amplifying pure noise floor.
      */
     private val pcmGain: Float = 0f,
+    /**
+     * When given, PCM comes from this Android USB mic capture instead of the
+     * native UAC isoc read — the kernel USB audio driver does the streaming,
+     * which on phones whose usbfs isoc scheduling starves userspace reads
+     * is the only way to get full-rate audio.
+     */
+    private val micCapture: UsbMicCapture? = null,
 ) {
     companion object {
         private const val TAG = "flutter_ffi_uvc"
@@ -82,6 +90,12 @@ internal class AacAudioEncoder(
         codec = encoder
         startNanos = System.nanoTime()
         startTimeUs = startNanos / 1_000
+        if (micCapture != null) {
+            // Start the source before the feeder polls it; a kernel-path
+            // failure here must degrade the same way a dead native capture
+            // does (the feed loop ends and the encoder drains).
+            micCapture.start()
+        }
         drainThread = Thread({ drainLoop(encoder) }, "uvc-audio-drain").also { it.start() }
         feederThread = Thread({ feedLoop(encoder) }, "uvc-audio-feed").also { it.start() }
     }
@@ -89,10 +103,15 @@ internal class AacAudioEncoder(
     /** Queues end-of-stream and waits for the encoder pipeline to drain. */
     fun stop() {
         stopRequested = true
+        // A feeder parked in a blocking AudioRecord read only wakes up when
+        // the recording stops; stop it before joining. The native path
+        // unblocks itself (the plugin stops NativeAudio before this call).
+        micCapture?.stopCapture()
         try { feederThread?.join(JOIN_TIMEOUT_MS) } catch (_: InterruptedException) {}
         try { drainThread?.join(JOIN_TIMEOUT_MS) } catch (_: InterruptedException) {}
         try { codec?.stop() } catch (_: Exception) {}
         try { codec?.release() } catch (_: Exception) {}
+        micCapture?.release()
         codec = null
         feederThread = null
         drainThread = null
@@ -147,9 +166,10 @@ internal class AacAudioEncoder(
         try {
             while (!stopRequested) {
                 pcm.clear()
-                val bytes = NativeAudio.read(pcm, READ_TIMEOUT_MS)
+                val bytes = micCapture?.read(pcm)
+                    ?: NativeAudio.read(pcm, READ_TIMEOUT_MS)
                 if (bytes < 0) break // capture stopped: end of stream
-                if (bytes == 0) continue // poll timeout
+                if (bytes == 0) continue // poll timeout (native path only)
                 val index = encoder.dequeueInputBuffer(QUEUE_TIMEOUT_US)
                 if (index < 0) continue
                 val input = encoder.getInputBuffer(index)

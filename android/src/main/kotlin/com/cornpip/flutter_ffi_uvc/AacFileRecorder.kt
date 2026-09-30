@@ -20,18 +20,16 @@ import java.nio.ByteBuffer
  */
 internal class AacFileRecorder(
     file: File,
-    sampleRate: Int,
-    channelCount: Int,
+    private val encoder: AacAudioEncoder,
 ) {
     companion object {
         private const val TAG = "flutter_ffi_uvc"
         private const val MAGIC = "UVCAUD02"
     }
 
-    private val encoder = AacAudioEncoder(sampleRate, channelCount)
+    private val sampleRate = encoder.sampleRate
+    private val channelCount = encoder.channelCount
     private val out = BufferedOutputStream(FileOutputStream(file))
-    private val sampleRate = sampleRate
-    private val channelCount = channelCount
     private var sampleCount = 0L
 
     fun start() {
