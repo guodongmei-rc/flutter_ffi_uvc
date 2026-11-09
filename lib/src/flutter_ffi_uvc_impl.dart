@@ -7,6 +7,7 @@ import 'package:ffi/ffi.dart';
 import 'package:flutter/services.dart';
 
 import 'flutter_ffi_uvc_bindings_generated.dart';
+import 'ohos/ohos_uvc_camera.dart';
 import 'uvc_camera_api.dart';
 
 class _PreviewRequest {
@@ -1164,4 +1165,11 @@ FlutterFfiUvcBindings get _bindings =>
 /// Import `package:flutter_ffi_uvc/flutter_ffi_uvc.dart` and use this object
 /// directly instead of instantiating your own camera wrapper or using the
 /// generated bindings. The generated bindings are an implementation detail.
-final UvcCamera uvcCamera = _FlutterFfiUvcCamera();
+///
+/// Android talks to the bundled libuvc library over FFI. HarmonyOS has no
+/// such library yet and goes through the platform USB API instead; the name
+/// is compared as a string because `Platform.isOhos` only exists in the
+/// OpenHarmony Flutter SDK, and this file must also compile with the stock one.
+final UvcCamera uvcCamera = Platform.operatingSystem == 'ohos'
+    ? OhosUvcCamera()
+    : _FlutterFfiUvcCamera();

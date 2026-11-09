@@ -1,0 +1,10 @@
+{
+  "module": {
+    "name": "flutter_ffi_uvc",
+    "type": "har",
+    "deviceTypes": [
+      "default",
+      "tablet"
+    ]
+  }
+}

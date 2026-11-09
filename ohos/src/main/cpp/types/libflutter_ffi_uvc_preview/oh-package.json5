@@ -1,0 +1,6 @@
+{
+  "name": "libflutter_ffi_uvc_preview.so",
+  "types": "./index.d.ts",
+  "version": "1.0.0",
+  "description": "Writes decoded preview frames into a Flutter texture surface."
+}

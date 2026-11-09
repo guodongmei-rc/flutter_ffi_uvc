@@ -32,3 +32,5 @@ flutter:
         package: com.cornpip.flutter_ffi_uvc
         pluginClass: FlutterFfiUvcPlugin
         ffiPlugin: true
+      ohos:
+        pluginClass: FlutterFfiUvcPlugin

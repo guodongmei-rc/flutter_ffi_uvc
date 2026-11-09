@@ -1,0 +1,11 @@
+{
+  "name": "flutter_ffi_uvc",
+  "version": "1.0.0",
+  "description": "UVC camera support for Flutter on HarmonyOS.",
+  "main": "index.ets",
+  "author": "",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "libflutter_ffi_uvc_preview.so": "file:./src/main/cpp/types/libflutter_ffi_uvc_preview"
+  }
+}

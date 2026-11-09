@@ -1,0 +1,24 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "module description"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "description"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "flutter_ffi_uvc_example"
+    },
+    {
+      "name": "UvcProbeAbility_desc",
+      "value": "Stage 0 UVC probe"
+    },
+    {
+      "name": "UvcProbeAbility_label",
+      "value": "UVC Probe"
+    }
+  ]
+}
