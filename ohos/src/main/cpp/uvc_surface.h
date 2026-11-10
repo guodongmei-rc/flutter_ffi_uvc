@@ -13,6 +13,7 @@
 #define FLUTTER_FFI_UVC_SURFACE_H_
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -74,8 +75,11 @@ struct PreviewWindow {
   int32_t width = 0;
   int32_t height = 0;
   int32_t format = 0;
-  // Sequence number of the newest frame written, so that two frames decoded
-  // in parallel cannot be shown out of order.
+  // Sequence number of the newest frame written, so that a frame overtaken by
+  // a newer one is not shown after it. Numbers come from NextFrameSequence(),
+  // which is shared by every stream: a window outlives the streams drawing
+  // into it, and a new stream's first frames must not read as older than the
+  // previous stream's last.
   uint64_t shown_sequence = 0;
   // Mappings of the surface's buffers, kept across frames. The surface cycles
   // through a handful of buffers; mapping one afresh for every frame made the
@@ -115,6 +119,10 @@ inline void SyncBuffer(int fd, uint64_t flags) {
   struct dma_buf_sync sync = {flags};
   ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
 }
+
+inline std::atomic<uint64_t> g_frame_sequence{0};
+
+inline uint64_t NextFrameSequence() { return ++g_frame_sequence; }
 
 inline std::mutex g_windows_mutex;
 inline std::map<uint64_t, std::shared_ptr<PreviewWindow>> g_windows;

@@ -275,7 +275,7 @@ class FramePresenter {
         frame = decoded_;
         decoded_ = DecodedFrame();
         has_decoded_ = false;
-        sequence = ++sequence_;
+        sequence = NextFrameSequence();
         window = window_;
       }
       const int64_t started_us = NowMicros();
@@ -333,7 +333,6 @@ class FramePresenter {
   // Decoded frame waiting for the drawer.
   DecodedFrame decoded_;
   bool has_decoded_ = false;
-  uint64_t sequence_ = 0;
   // Cleared for good once NV12 output turns out not to work on this device.
   bool use_yuv_ = true;
 
