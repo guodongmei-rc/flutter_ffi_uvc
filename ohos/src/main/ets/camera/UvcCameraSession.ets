@@ -19,8 +19,9 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import native from 'libflutter_ffi_uvc_preview.so';
 import {
   UvcDeviceInfo, UvcMode, UvcStreamInterface, UVC_KIND_MJPEG,
-  parseUvcDescriptors, listModes, selectAltSetting,
+  parseUvcDescriptors, listModes, selectAltSetting, describeInterfaces,
 } from '../uvc/UvcDescriptor';
+import { UacCaptureInfo, probeUacCapture, describeUacCapture } from '../uvc/UacDescriptor';
 import {
   UvcStreamCtrl, streamCtrlLength, encodeStreamCtrl, decodeStreamCtrl, describeStreamCtrl,
   UVC_SET_CUR, UVC_GET_CUR, UVC_REQ_TYPE_SET, UVC_REQ_TYPE_GET,
@@ -91,6 +92,13 @@ export interface UvcDeviceSummary {
   manufacturerName: string;
   serialNumber: string;
   hasPermission: boolean;
+}
+
+/** PCM format of the device's UAC microphone, as `queryAudioInterface` reports it. */
+export interface UvcAudioSummary {
+  sampleRate: number;
+  channels: number;
+  bitsPerSample: number;
 }
 
 export interface UvcModeSummary {
@@ -272,6 +280,8 @@ export class UvcCameraSession {
   private fd: number = -1;
   private info: UvcDeviceInfo | null = null;
   private modes: UvcMode[] = [];
+  /** UAC capture interface of the open device; null when it has no microphone. */
+  private audio: UacCaptureInfo | null = null;
   private claimedInterfaces: number[] = [];
 
   private stream: UvcStreamInterface | null = null;
@@ -402,6 +412,10 @@ export class UvcCameraSession {
       return this.failWith(UVC_ERROR_NOT_SUPPORTED, 'the system did not provide a descriptor for the device');
     }
     const info = parseUvcDescriptors(raw);
+    const interfaces = describeInterfaces(raw);
+    for (let i = 0; i < interfaces.length; i++) {
+      hilog.info(DOMAIN, TAG, 'descriptor: %{public}s', interfaces[i]);
+    }
     const all = listModes(info);
     const usable: UvcMode[] = [];
     for (let i = 0; i < all.length; i++) {
@@ -417,6 +431,12 @@ export class UvcCameraSession {
     }
     this.info = info;
     this.modes = usable;
+    this.audio = probeUacCapture(raw);
+    if (this.audio !== null) {
+      hilog.info(DOMAIN, TAG, 'uac capture: %{public}s', describeUacCapture(this.audio));
+    } else {
+      hilog.info(DOMAIN, TAG, 'uac capture: no AudioStreaming interface; recordings stay video-only');
+    }
 
     // The interfaces are claimed on our own descriptor, never through
     // usbManager: a claim made by the USB service would lock this one out.
@@ -457,6 +477,25 @@ export class UvcCameraSession {
     return out;
   }
 
+  /**
+   * The microphone format Android's probe would pick, or null when the open
+   * device has no USB Audio Class capture interface (or nothing is open).
+   * Capturing from it is not implemented on HarmonyOS yet; this only answers
+   * whether the camera has one.
+   */
+  audioInterface(): UvcAudioSummary | null {
+    const audio = this.audio;
+    if (this.fd < 0 || audio === null) {
+      return null;
+    }
+    const summary: UvcAudioSummary = {
+      sampleRate: audio.sampleRate,
+      channels: audio.channels,
+      bitsPerSample: audio.bitsPerSample
+    };
+    return summary;
+  }
+
   close(): void {
     this.stopPreview();
     if (this.fd >= 0) {
@@ -479,6 +518,7 @@ export class UvcCameraSession {
     this.device = null;
     this.info = null;
     this.modes = [];
+    this.audio = null;
     this.stream = null;
   }
 

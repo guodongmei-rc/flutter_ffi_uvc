@@ -178,6 +178,23 @@ void main() {
     expect(result.mode.formatName, requested.formatName);
   });
 
+  test('queryAudioInterface reports the microphone format or null', () async {
+    await camera.openUsbDevice(1003);
+    expect(await camera.queryAudioInterface(), isNull);
+    expect(calls.last.method, 'queryAudioInterface');
+
+    replies['queryAudioInterface'] = (_) => <String, Object?>{
+      'sampleRate': 48000,
+      'channels': 1,
+      'bitsPerSample': 16,
+    };
+    final UvcAudioInfo? audio = await camera.queryAudioInterface();
+    expect(audio, isNotNull);
+    expect(audio!.sampleRate, 48000);
+    expect(audio.channels, 1);
+    expect(audio.bitsPerSample, 16);
+  });
+
   test('a preview that fails verification is reported as not running', () async {
     replies['startPreview'] = (_) => <String, Object?>{
       'success': false,

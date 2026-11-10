@@ -211,6 +211,19 @@ UvcSessionListener {
         session.close();
         result.success(null);
         break;
+      case 'queryAudioInterface': {
+        const audio = session.audioInterface();
+        if (audio === null) {
+          result.success(null);
+        } else {
+          const reply: Map<string, Any> = new Map<string, Any>();
+          reply.set('sampleRate', audio.sampleRate);
+          reply.set('channels', audio.channels);
+          reply.set('bitsPerSample', audio.bitsPerSample);
+          result.success(reply);
+        }
+        break;
+      }
       case 'startPreview':
         this.startPreview(session, call, result);
         break;

@@ -453,8 +453,16 @@ class OhosUvcCamera implements UvcCamera {
     }
   }
 
+  /// Reports the device's UAC microphone format from its descriptors, using
+  /// the same candidate rule as Android. Capturing it is not implemented on
+  /// HarmonyOS yet, so a non-null answer means "the camera has a microphone",
+  /// not "recordings will carry audio".
   @override
-  Future<UvcAudioInfo?> queryAudioInterface() async => null;
+  Future<UvcAudioInfo?> queryAudioInterface() async {
+    final Map<Object?, Object?>? reply =
+        await _channel.invokeMapMethod<Object?, Object?>('queryAudioInterface');
+    return reply == null ? null : UvcAudioInfo.fromMap(reply);
+  }
 
   @override
   List<UvcCameraControl> supportedControls() => <UvcCameraControl>[];

@@ -359,3 +359,81 @@ export function defaultModeIndex(modes: UvcMode[], width: number, height: number
   }
   return 0;
 }
+
+/**
+ * One line per interface alternate setting in the configuration descriptor,
+ * for every class (not just video): class/subclass/protocol, endpoints, and
+ * for USB Audio Class streaming interfaces the PCM format they carry. Used
+ * to log what a device offers, e.g. whether it has a UAC microphone.
+ */
+export function describeInterfaces(raw: Uint8Array): string[] {
+  const lines: string[] = [];
+  let offset = 0;
+  let current = '';
+  let inAudioStreaming = false;
+  while (offset + 2 <= raw.length) {
+    const length = raw[offset];
+    const type = raw[offset + 1];
+    if (length < 2 || offset + length > raw.length) {
+      break;
+    }
+    if (type === 2 && length >= 9) {
+      // Configuration header: compare what it announces with what we got.
+      lines.push(`config: ${raw[offset + 4]} interface(s), wTotalLength=${u16(raw, offset + 2)}, ` +
+        `raw bytes=${raw.length}`);
+    } else if (type === 4 && length >= 9) {
+      if (current.length > 0) {
+        lines.push(current);
+      }
+      const cls = raw[offset + 5];
+      const sub = raw[offset + 6];
+      current = `if ${raw[offset + 2]} alt ${raw[offset + 3]}: class ${cls}/${sub}/${raw[offset + 7]}` +
+        ` (${className(cls, sub)}) eps=${raw[offset + 4]}`;
+      inAudioStreaming = cls === 1 && sub === 2;
+    } else if (type === 5 && length >= 7) {
+      const attrs = raw[offset + 3];
+      const kind = ['control', 'iso', 'bulk', 'interrupt'][attrs & 3];
+      current += ` ep 0x${raw[offset + 2].toString(16)} ${kind} ${u16(raw, offset + 4) & 0x7ff}B` +
+        ` x${((u16(raw, offset + 4) >> 11) & 3) + 1} ival=${raw[offset + 6]}`;
+    } else if (type === 0x24 && inAudioStreaming && raw[offset + 2] === 1 && length >= 7) {
+      // AS_GENERAL: bTerminalLink, bDelay, wFormatTag (1 = PCM).
+      current += ` fmtTag=${u16(raw, offset + 5)}`;
+    } else if (type === 0x24 && inAudioStreaming && raw[offset + 2] === 2 && length >= 8) {
+      // FORMAT_TYPE I: channels, subframe size, bit resolution, sample rates.
+      const channels = raw[offset + 4];
+      const bits = raw[offset + 6];
+      const rateCount = raw[offset + 7];
+      const rates: string[] = [];
+      if (rateCount === 0 && length >= 14) {
+        rates.push(`${u24(raw, offset + 8)}-${u24(raw, offset + 11)}`);
+      } else {
+        for (let i = 0; i < rateCount && offset + 8 + i * 3 + 3 <= offset + length; i++) {
+          rates.push(`${u24(raw, offset + 8 + i * 3)}`);
+        }
+      }
+      current += ` pcm ${channels}ch ${bits}bit @ ${rates.join('/')}Hz`;
+    }
+    offset += length;
+  }
+  if (current.length > 0) {
+    lines.push(current);
+  }
+  return lines;
+}
+
+function u24(raw: Uint8Array, offset: number): number {
+  return raw[offset] | (raw[offset + 1] << 8) | (raw[offset + 2] << 16);
+}
+
+function className(cls: number, sub: number): string {
+  if (cls === 14) {
+    return sub === 1 ? 'video control' : sub === 2 ? 'video streaming' : 'video';
+  }
+  if (cls === 1) {
+    return sub === 1 ? 'audio control' : sub === 2 ? 'audio streaming' : 'audio';
+  }
+  if (cls === 3) {
+    return 'HID';
+  }
+  return 'other';
+}
