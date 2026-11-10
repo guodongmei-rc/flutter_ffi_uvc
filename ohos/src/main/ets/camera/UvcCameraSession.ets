@@ -18,8 +18,8 @@ import { fileIo } from '@kit.CoreFileKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import native from 'libflutter_ffi_uvc_preview.so';
 import {
-  UvcDeviceInfo, UvcMode, UvcStreamInterface, UVC_KIND_MJPEG,
-  parseUvcDescriptors, listModes, selectAltSetting, describeInterfaces,
+  UvcDeviceInfo, UvcMode, UvcStreamInterface, UVC_KIND_MJPEG, UVC_KIND_FRAME_BASED, UVC_KIND_UNCOMPRESSED,
+  parseUvcDescriptors, listModes, selectAltSetting, bulkEndpoint, describeInterfaces,
 } from '../uvc/UvcDescriptor';
 import { UacCaptureInfo, probeUacCapture, describeUacCapture } from '../uvc/UacDescriptor';
 import {
@@ -81,7 +81,76 @@ export const UVC_ERROR_INVALID_DEVICE: number = -50;
 export const UVC_ERROR_INVALID_MODE: number = -51;
 
 /** uvc_frame_format value the Dart API uses for MJPEG modes. */
+// libuvc's uvc_frame_format values, which the Dart API uses for `format`.
+export const UVC_FRAME_FORMAT_YUYV: number = 3;
+export const UVC_FRAME_FORMAT_UYVY: number = 4;
 export const UVC_FRAME_FORMAT_MJPEG: number = 7;
+export const UVC_FRAME_FORMAT_H264: number = 8;
+export const UVC_FRAME_FORMAT_NV12: number = 17;
+export const UVC_FRAME_FORMAT_H265: number = 19;
+
+// Codec ids of the native streamStart().
+const STREAM_CODEC_MJPEG: number = 0;
+const STREAM_CODEC_H264: number = 1;
+const STREAM_CODEC_H265: number = 2;
+const STREAM_CODEC_YUY2: number = 3;
+const STREAM_CODEC_UYVY: number = 4;
+const STREAM_CODEC_NV12: number = 5;
+
+/** libuvc frame format of a descriptor mode, or 0 when this backend cannot decode it. */
+function frameFormatOf(mode: UvcMode): number {
+  if (mode.kind === UVC_KIND_MJPEG) {
+    return UVC_FRAME_FORMAT_MJPEG;
+  }
+  if (mode.kind === UVC_KIND_FRAME_BASED) {
+    if (mode.fourcc === 'H264') {
+      return UVC_FRAME_FORMAT_H264;
+    }
+    if (mode.fourcc === 'H265' || mode.fourcc === 'HEVC') {
+      return UVC_FRAME_FORMAT_H265;
+    }
+  }
+  if (mode.kind === UVC_KIND_UNCOMPRESSED) {
+    if (mode.fourcc === 'YUY2' || mode.fourcc === 'YUYV') {
+      return UVC_FRAME_FORMAT_YUYV;
+    }
+    if (mode.fourcc === 'UYVY') {
+      return UVC_FRAME_FORMAT_UYVY;
+    }
+    if (mode.fourcc === 'NV12') {
+      return UVC_FRAME_FORMAT_NV12;
+    }
+  }
+  return 0;
+}
+
+/** Format names as the Android side reports them (libuvc's names). */
+function formatNameOf(mode: UvcMode): string {
+  switch (frameFormatOf(mode)) {
+    case UVC_FRAME_FORMAT_H264: return 'H264';
+    case UVC_FRAME_FORMAT_H265: return 'H265';
+    case UVC_FRAME_FORMAT_YUYV: return 'YUYV';
+    case UVC_FRAME_FORMAT_UYVY: return 'UYVY';
+    case UVC_FRAME_FORMAT_NV12: return 'NV12';
+    default: return UVC_KIND_MJPEG;
+  }
+}
+
+function streamCodecOf(mode: UvcMode): number {
+  switch (frameFormatOf(mode)) {
+    case UVC_FRAME_FORMAT_H264: return STREAM_CODEC_H264;
+    case UVC_FRAME_FORMAT_H265: return STREAM_CODEC_H265;
+    case UVC_FRAME_FORMAT_YUYV: return STREAM_CODEC_YUY2;
+    case UVC_FRAME_FORMAT_UYVY: return STREAM_CODEC_UYVY;
+    case UVC_FRAME_FORMAT_NV12: return STREAM_CODEC_NV12;
+    default: return STREAM_CODEC_MJPEG;
+  }
+}
+
+function isCompressedVideo(mode: UvcMode): boolean {
+  const format = frameFormatOf(mode);
+  return format === UVC_FRAME_FORMAT_H264 || format === UVC_FRAME_FORMAT_H265;
+}
 
 export interface UvcDeviceSummary {
   deviceId: number;
@@ -286,6 +355,8 @@ export class UvcCameraSession {
 
   private stream: UvcStreamInterface | null = null;
   private streamingAltSet: boolean = false;
+  /** Bulk endpoint the running preview streams on; 0 for isochronous ones. */
+  private bulkStreamEndpoint: number = 0;
   /** Native stream id; 0 while nothing is streaming. */
   private streamId: number = 0;
   private window: bigint = NO_WINDOW;
@@ -417,9 +488,13 @@ export class UvcCameraSession {
       hilog.info(DOMAIN, TAG, 'descriptor: %{public}s', interfaces[i]);
     }
     const all = listModes(info);
+    for (let i = 0; i < all.length; i++) {
+      hilog.info(DOMAIN, TAG, 'mode: %{public}s', all[i].label);
+    }
+    // MJPEG, H.264, H.265 and the common uncompressed layouts can be shown.
     const usable: UvcMode[] = [];
     for (let i = 0; i < all.length; i++) {
-      if (all[i].kind === UVC_KIND_MJPEG && all[i].width > 0 && all[i].height > 0 && all[i].interval > 0) {
+      if (frameFormatOf(all[i]) !== 0 && all[i].width > 0 && all[i].height > 0 && all[i].interval > 0) {
         usable.push(all[i]);
       }
     }
@@ -427,7 +502,8 @@ export class UvcCameraSession {
       this.close();
       return this.failWith(
         UVC_ERROR_INVALID_DEVICE,
-        `the device reports ${all.length} mode(s), none of them MJPEG; other formats are not supported yet`);
+        `the device reports ${all.length} mode(s), none of them MJPEG, H.264, H.265, YUY2, UYVY or NV12; ` +
+        'other formats are not supported yet');
     }
     this.info = info;
     this.modes = usable;
@@ -455,7 +531,7 @@ export class UvcCameraSession {
       }
       this.claimedInterfaces.push(wanted[i]);
     }
-    hilog.info(DOMAIN, TAG, 'opened %{public}s: bcdUVC=0x%{public}s, %{public}d MJPEG mode(s)',
+    hilog.info(DOMAIN, TAG, 'opened %{public}s: bcdUVC=0x%{public}s, %{public}d usable mode(s)',
       device.name, info.bcdUVC.toString(16), usable.length);
     this.errorMessage = '';
     return UVC_OK;
@@ -466,8 +542,8 @@ export class UvcCameraSession {
     for (let i = 0; i < this.modes.length; i++) {
       const mode = this.modes[i];
       const summary: UvcModeSummary = {
-        format: UVC_FRAME_FORMAT_MJPEG,
-        formatName: UVC_KIND_MJPEG,
+        format: frameFormatOf(mode),
+        formatName: formatNameOf(mode),
         width: mode.width,
         height: mode.height,
         fps: fpsOf(mode)
@@ -556,7 +632,7 @@ export class UvcCameraSession {
     let mode: UvcMode | null = null;
     for (let i = 0; i < this.modes.length; i++) {
       const candidate = this.modes[i];
-      if (request.format === UVC_FRAME_FORMAT_MJPEG && candidate.width === request.width &&
+      if (frameFormatOf(candidate) === request.format && candidate.width === request.width &&
         candidate.height === request.height && fpsOf(candidate) === request.fps) {
         mode = candidate;
         break;
@@ -583,21 +659,40 @@ export class UvcCameraSession {
       return this.outcome(false, startedAt, UVC_ERROR_IO, this.errorMessage);
     }
     this.negotiatedInterval = ctrl.dwFrameInterval;
-    const alt = selectAltSetting(stream.altSettings, ctrl.dwMaxPayloadTransferSize);
-    if (alt === null) {
-      return this.outcome(false, startedAt, UVC_ERROR_NOT_SUPPORTED,
-        `no isochronous alt setting carries ${ctrl.dwMaxPayloadTransferSize} bytes per packet ` +
-          '(bulk cameras are not supported yet)');
+    // Bulk cameras stream on alt 0 with each payload sized by the negotiated
+    // dwMaxPayloadTransferSize; isochronous ones need the alt setting whose
+    // packets carry that much.
+    const bulk = bulkEndpoint(stream.altSettings);
+    let endpoint: number = 0;
+    let bytesPerPacket: number = 0;
+    let altNumber: number = 0;
+    if (bulk !== null) {
+      if (ctrl.dwMaxPayloadTransferSize <= 0) {
+        return this.outcome(false, startedAt, UVC_ERROR_IO, 'the device negotiated a zero bulk payload size');
+      }
+      endpoint = bulk.endpointAddress;
+      bytesPerPacket = ctrl.dwMaxPayloadTransferSize;
+      this.bulkStreamEndpoint = endpoint;
+    } else {
+      const alt = selectAltSetting(stream.altSettings, ctrl.dwMaxPayloadTransferSize);
+      if (alt === null) {
+        return this.outcome(false, startedAt, UVC_ERROR_NOT_SUPPORTED,
+          `no isochronous alt setting carries ${ctrl.dwMaxPayloadTransferSize} bytes per packet`);
+      }
+      const altResult = native.usbSetInterface(fd, stream.interfaceNumber, alt.alternateSetting);
+      if (altResult < 0) {
+        return this.outcome(false, startedAt, UVC_ERROR_IO,
+          `selecting alt setting ${alt.alternateSetting} failed: ${errnoText(altResult)}`);
+      }
+      this.streamingAltSet = true;
+      endpoint = alt.endpointAddress;
+      bytesPerPacket = alt.bytesPerPacket;
+      altNumber = alt.alternateSetting;
     }
-    const altResult = native.usbSetInterface(fd, stream.interfaceNumber, alt.alternateSetting);
-    if (altResult < 0) {
-      return this.outcome(false, startedAt, UVC_ERROR_IO,
-        `selecting alt setting ${alt.alternateSetting} failed: ${errnoText(altResult)}`);
-    }
-    this.streamingAltSet = true;
 
     const frameLimit = Math.max(ctrl.dwMaxVideoFrameSize, mode.maxVideoFrameBufferSize, MIN_FRAME_LIMIT_BYTES);
-    const streamId = native.streamStart(fd, alt.endpointAddress, alt.bytesPerPacket, frameLimit, this.window);
+    const streamId = native.streamStart(fd, endpoint, bytesPerPacket, frameLimit, this.window,
+      streamCodecOf(mode), mode.width, mode.height, bulk !== null ? 1 : 0);
     if (streamId <= 0) {
       this.idleStream();
       return this.outcome(false, startedAt, UVC_ERROR_IO, `starting the stream failed: ${errnoText(streamId)}`);
@@ -605,8 +700,9 @@ export class UvcCameraSession {
     this.streamId = streamId;
     this.previewMode = mode;
     this.previewing = true;
-    hilog.info(DOMAIN, TAG, 'streaming on alt %{public}d (%{public}d bytes per packet)',
-      alt.alternateSetting, alt.bytesPerPacket);
+    hilog.info(DOMAIN, TAG, 'streaming %{public}s on %{public}s (%{public}d bytes per %{public}s)',
+      formatNameOf(mode), bulk !== null ? 'bulk endpoint' : `alt ${altNumber}`, bytesPerPacket,
+      bulk !== null ? 'transfer' : 'packet');
 
     const needed = Math.max(1, request.consecutiveValidFrames);
     const verified = await this.waitForFrames(streamId, epoch, needed, request.sequenceOnly,
@@ -664,6 +760,12 @@ export class UvcCameraSession {
   takePicture(directory: string): string {
     if (this.streamId <= 0) {
       this.errorMessage = 'no preview is running';
+      return '';
+    }
+    if (this.previewMode !== null && isCompressedVideo(this.previewMode)) {
+      // Same as Android: compressed-video pictures live inside the hardware
+      // decoder and are not read back, so there is nothing to save.
+      this.errorMessage = 'photo capture is not available while previewing H.264/H.265; switch to an MJPEG mode';
       return '';
     }
     const jpeg = native.streamLatestJpeg(this.streamId);
@@ -818,7 +920,16 @@ export class UvcCameraSession {
     if (this.fd >= 0 && stream !== null && this.streamingAltSet) {
       native.usbSetInterface(this.fd, stream.interfaceNumber, 0);
     }
+    if (this.fd >= 0 && this.bulkStreamEndpoint !== 0) {
+      // A bulk camera keeps its data toggle across our restarts; clearing
+      // the halt resets it (and is the stop signal Windows/Linux send).
+      const cleared = native.usbClearHalt(this.fd, this.bulkStreamEndpoint);
+      if (cleared < 0) {
+        hilog.warn(DOMAIN, TAG, 'clearing the bulk endpoint failed: %{public}s', errnoText(cleared));
+      }
+    }
     this.streamingAltSet = false;
+    this.bulkStreamEndpoint = 0;
   }
 
   /**

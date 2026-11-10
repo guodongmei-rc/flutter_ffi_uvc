@@ -284,6 +284,24 @@ export function parseUvcDescriptors(raw: Uint8Array): UvcDeviceInfo {
  * Smallest isochronous alt setting able to carry `maxPayloadTransferSize`
  * bytes per (micro)frame, or null when none can.
  */
+/**
+ * The bulk endpoint of a streaming interface that has no isochronous alt
+ * settings (UVC bulk cameras stream on alt 0), or null for an isochronous one.
+ */
+export function bulkEndpoint(alts: UvcAltSetting[]): UvcAltSetting | null {
+  let bulk: UvcAltSetting | null = null;
+  for (let i = 0; i < alts.length; i++) {
+    const alt = alts[i];
+    if (alt.isochronous) {
+      return null;
+    }
+    if ((alt.attributes & 0x03) === 0x02 && (alt.endpointAddress & 0x80) !== 0 && bulk === null) {
+      bulk = alt;
+    }
+  }
+  return bulk;
+}
+
 export function selectAltSetting(alts: UvcAltSetting[], maxPayloadTransferSize: number): UvcAltSetting | null {
   let best: UvcAltSetting | null = null;
   for (let i = 0; i < alts.length; i++) {
@@ -377,7 +395,11 @@ export function describeInterfaces(raw: Uint8Array): string[] {
     if (length < 2 || offset + length > raw.length) {
       break;
     }
-    if (type === 2 && length >= 9) {
+    if (type === 1 && length >= 18) {
+      // Device header: how many configurations exist besides the active one.
+      lines.push(`device: usb ${(u16(raw, offset + 2) >> 8).toString(16)}.${(u16(raw, offset + 2) & 0xff).toString(16)} ` +
+        `class ${raw[offset + 4]} configurations=${raw[offset + 17]}`);
+    } else if (type === 2 && length >= 9) {
       // Configuration header: compare what it announces with what we got.
       lines.push(`config: ${raw[offset + 4]} interface(s), wTotalLength=${u16(raw, offset + 2)}, ` +
         `raw bytes=${raw.length}`);

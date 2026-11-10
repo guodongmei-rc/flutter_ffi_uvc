@@ -43,7 +43,14 @@ class VideoRecorder {
 
   // Opens `path` for writing and starts an H.264 encoder for `width` x
   // `height` frames at `fps`. Returns 0 or a negative error code.
-  int32_t Start(const std::string &path, int32_t width, int32_t height, int32_t fps, int64_t bitrate) {
+  //
+  // With `external_producer` the frames are not copied in through
+  // WriteFrame(): another component (a video decoder rendering into
+  // InputWindow()) produces the encoder's buffers and reports each one via
+  // NoteProducedFrame(). The surface is then left for that producer to
+  // configure.
+  int32_t Start(const std::string &path, int32_t width, int32_t height, int32_t fps, int64_t bitrate,
+                bool external_producer = false) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (encoder_ != nullptr) {
       return kErrorRecorderBusy;
@@ -79,13 +86,16 @@ class VideoRecorder {
       Release();
       return kErrorRecorderEncoder;
     }
-    // The producer side of the encoder's surface starts without a buffer
-    // configuration; requesting a buffer before setting one fails.
-    OH_NativeWindow_NativeWindowHandleOpt(input_, SET_FORMAT, NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP);
-    OH_NativeWindow_NativeWindowHandleOpt(
-        input_, SET_USAGE,
-        static_cast<uint64_t>(NATIVEBUFFER_USAGE_CPU_READ | NATIVEBUFFER_USAGE_CPU_WRITE | NATIVEBUFFER_USAGE_MEM_DMA));
-    OH_NativeWindow_NativeWindowHandleOpt(input_, SET_BUFFER_GEOMETRY, width, height);
+    external_producer_ = external_producer;
+    if (!external_producer) {
+      // The producer side of the encoder's surface starts without a buffer
+      // configuration; requesting a buffer before setting one fails.
+      OH_NativeWindow_NativeWindowHandleOpt(input_, SET_FORMAT, NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP);
+      OH_NativeWindow_NativeWindowHandleOpt(
+          input_, SET_USAGE,
+          static_cast<uint64_t>(NATIVEBUFFER_USAGE_CPU_READ | NATIVEBUFFER_USAGE_CPU_WRITE | NATIVEBUFFER_USAGE_MEM_DMA));
+      OH_NativeWindow_NativeWindowHandleOpt(input_, SET_BUFFER_GEOMETRY, width, height);
+    }
 
     muxer_ = OH_AVMuxer_Create(fd_, AV_OUTPUT_FORMAT_MPEG_4);
     if (muxer_ == nullptr) {
@@ -107,6 +117,8 @@ class VideoRecorder {
     started_at_us_ = NowMicros();
     frames_in_ = 0;
     frames_out_ = 0;
+    first_pts_us_ = 0;
+    last_pts_us_ = 0;
     rejected_ = 0;
     eos_seen_ = false;
     failed_ = false;
@@ -119,11 +131,26 @@ class VideoRecorder {
     return encoder_ != nullptr;
   }
 
+  // The encoder's input surface, for an external producer. Valid between
+  // Start(..., true) and Stop(); nullptr otherwise.
+  OHNativeWindow *InputWindow() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return external_producer_ ? input_ : nullptr;
+  }
+
+  // Counts a frame an external producer rendered into InputWindow().
+  void NoteProducedFrame() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (encoder_ != nullptr && external_producer_) {
+      frames_in_++;
+    }
+  }
+
   // Feeds one frame. Only NV12 of the configured size is accepted; anything
   // else is counted and skipped. Called from the presenter's draw thread.
   void WriteFrame(const FramePixels &pixels) {
     std::unique_lock<std::mutex> lock(mutex_);
-    if (encoder_ == nullptr || input_ == nullptr || failed_) {
+    if (encoder_ == nullptr || input_ == nullptr || failed_ || external_producer_) {
       return;
     }
     if (!pixels.yuv || pixels.width != width_ || pixels.height != height_) {
@@ -167,9 +194,12 @@ class VideoRecorder {
     const bool failed = failed_;
     OH_LOG_WARN(LOG_APP,
                 "recording stopped: frames in=%{public}lld out=%{public}lld rejected=%{public}lld failed=%{public}d "
-                "eos=%{public}d error=%{public}d",
+                "eos=%{public}d error=%{public}d span=%{public}lld ms (pts %{public}lld..%{public}lld us) "
+                "wall=%{public}lld ms",
                 static_cast<long long>(frames_in_), static_cast<long long>(frames_out_),
-                static_cast<long long>(rejected_), failed_ ? 1 : 0, eos_seen_ ? 1 : 0, error_code_);
+                static_cast<long long>(rejected_), failed_ ? 1 : 0, eos_seen_ ? 1 : 0, error_code_,
+                static_cast<long long>((last_pts_us_ - first_pts_us_) / 1000), static_cast<long long>(first_pts_us_),
+                static_cast<long long>(last_pts_us_), static_cast<long long>((NowMicros() - started_at_us_) / 1000));
     OH_AVCodec *encoder = encoder_;
     OH_AVMuxer *muxer = muxer_;
     const int fd = fd_;
@@ -178,6 +208,7 @@ class VideoRecorder {
     muxer_ = nullptr;
     track_ = -1;
     fd_ = -1;
+    external_producer_ = false;
     // Stopping the encoder waits for its callbacks, which take the mutex.
     lock.unlock();
     Teardown(encoder, muxer, fd);
@@ -279,6 +310,7 @@ class VideoRecorder {
     muxer_ = nullptr;
     track_ = -1;
     fd_ = -1;
+    external_producer_ = false;
     Teardown(encoder, muxer, fd);
     if (!path_.empty()) {
       unlink(path_.c_str());
@@ -305,8 +337,22 @@ class VideoRecorder {
     OH_AVCodecBufferAttr attr = {};
     OH_AVBuffer_GetBufferAttr(buffer, &attr);
     if (self->muxer_ != nullptr && self->track_ >= 0 && attr.size > 0) {
+      const bool is_frame = (attr.flags & AVCODEC_BUFFER_FLAGS_CODEC_DATA) == 0;
+      if (is_frame) {
+        // The file starts at zero whatever clock the producer stamped the
+        // frames with: a decoder rendering into the surface passes the
+        // camera's monotonic capture times through, and the muxer would make
+        // those the file's duration.
+        if (self->frames_out_ == 0) {
+          self->first_pts_us_ = attr.pts;
+        }
+        self->last_pts_us_ = attr.pts;
+        OH_AVCodecBufferAttr rebased = attr;
+        rebased.pts = attr.pts - self->first_pts_us_;
+        OH_AVBuffer_SetBufferAttr(buffer, &rebased);
+      }
       const OH_AVErrCode wrote = OH_AVMuxer_WriteSampleBuffer(self->muxer_, static_cast<uint32_t>(self->track_), buffer);
-      if (wrote == AV_ERR_OK && (attr.flags & AVCODEC_BUFFER_FLAGS_CODEC_DATA) == 0) {
+      if (wrote == AV_ERR_OK && is_frame) {
         self->frames_out_++;
       } else if (wrote != AV_ERR_OK && self->error_code_ == 0) {
         self->error_code_ = 1000 + static_cast<int32_t>(wrote);
@@ -327,6 +373,7 @@ class VideoRecorder {
   std::condition_variable eos_;
   OH_AVCodec *encoder_ = nullptr;
   OHNativeWindow *input_ = nullptr;
+  bool external_producer_ = false;
   OH_AVMuxer *muxer_ = nullptr;
   int32_t track_ = -1;
   int fd_ = -1;
@@ -336,6 +383,8 @@ class VideoRecorder {
   int64_t started_at_us_ = 0;
   int64_t frames_in_ = 0;
   int64_t frames_out_ = 0;
+  int64_t first_pts_us_ = 0;
+  int64_t last_pts_us_ = 0;
   int64_t rejected_ = 0;
   bool eos_seen_ = false;
   bool failed_ = false;

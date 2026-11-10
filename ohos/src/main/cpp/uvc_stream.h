@@ -35,6 +35,8 @@
 #include <linux/usbdevice_fs.h>
 
 #include "uvc_frame_assembler.h"
+#include "uvc_h26x.h"
+#include "uvc_raw.h"
 #include "uvc_recorder.h"
 #include "uvc_surface.h"
 
@@ -54,6 +56,13 @@ inline int UsbReleaseInterface(int fd, unsigned int interface_number) {
 inline int UsbSetInterface(int fd, unsigned int interface_number, unsigned int alt_setting) {
   struct usbdevfs_setinterface request = {interface_number, alt_setting};
   return ioctl(fd, USBDEVFS_SETINTERFACE, &request) < 0 ? -errno : 0;
+}
+
+// CLEAR_FEATURE(ENDPOINT_HALT) on `endpoint`, which also resets the data
+// toggle on both sides. How a bulk UVC camera is told the stream stopped:
+// the spec says nothing, Windows and Linux's uvcvideo do this.
+inline int UsbClearHalt(int fd, unsigned int endpoint) {
+  return ioctl(fd, USBDEVFS_CLEAR_HALT, &endpoint) < 0 ? -errno : 0;
 }
 
 // Returns the number of bytes transferred, or -errno.
@@ -101,6 +110,17 @@ struct StreamStats {
   std::array<uint64_t, kGapBuckets> shown_gaps = {};
   // Whether frames are decoded to NV12 (true) or RGBA.
   bool yuv = false;
+  // H.264/H.265 only: frames the hardware decoder could not take in time,
+  // and frames skipped while waiting for a keyframe.
+  uint64_t starved = 0;
+  uint64_t waiting_keyframe = 0;
+};
+
+// Where the assembled camera frames go. Called from the stream thread.
+class FrameSink {
+ public:
+  virtual ~FrameSink() = default;
+  virtual void Submit(const uint8_t *data, size_t length) = 0;
 };
 
 inline void CountGap(std::array<uint64_t, kGapBuckets> *buckets, int64_t gap_ms) {
@@ -122,9 +142,9 @@ inline void CountGap(std::array<uint64_t, kGapBuckets> *buckets, int64_t gap_ms)
 // waits, and is replaced if a newer one arrives first, so the preview stays
 // at the latest image instead of falling behind when the camera is faster
 // than this pipeline.
-class FramePresenter {
+class FramePresenter : public FrameSink {
  public:
-  ~FramePresenter() { Stop(); }
+  ~FramePresenter() override { Stop(); }
 
   void Start() {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -191,7 +211,7 @@ class FramePresenter {
   }
 
   // Takes one assembled frame. Called from the stream thread.
-  void Submit(const uint8_t *data, size_t length) {
+  void Submit(const uint8_t *data, size_t length) override {
     const int64_t now_us = NowMicros();
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -388,25 +408,511 @@ class FramePresenter {
   std::array<uint64_t, kGapBuckets> shown_gaps_ = {};
 };
 
+// H.264/H.265 presenter ---------------------------------------------------------
+
+// Feeds the camera's access units to a hardware decoder that renders into the
+// attached window, and to a second one rendering into the recorder's encoder
+// surface while recording. Decoders exist only while they have a window and
+// start at a keyframe; see uvc_h26x.h.
+class H26xPresenter : public FrameSink {
+ public:
+  H26xPresenter(StreamCodec codec, int32_t width, int32_t height)
+      : codec_(codec), width_(width), height_(height), params_(codec) {}
+  ~H26xPresenter() override { Stop(); }
+
+  void Start() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    started_at_us_ = NowMicros();
+    stopped_at_us_ = 0;
+  }
+
+  void Stop() {
+    std::unique_ptr<H26xDecoder> preview;
+    std::unique_ptr<H26xDecoder> recording;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopped_at_us_ = NowMicros();
+      preview = std::move(preview_);
+      recording = std::move(recording_);
+    }
+    // Destroying waits for the codec callbacks, which take mutex_.
+    preview.reset();
+    recording.reset();
+  }
+
+  void SetWindow(std::shared_ptr<PreviewWindow> window) {
+    std::unique_ptr<H26xDecoder> old;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      window_ = std::move(window);
+      OHNativeWindow *native = NativeWindow(window_);
+      if (native == nullptr) {
+        old = std::move(preview_);
+      } else if (preview_ != nullptr && !preview_->SetSurface(native)) {
+        old = std::move(preview_);
+      }
+    }
+    old.reset();
+  }
+
+  // Starts rendering into `recorder`'s input surface from the next keyframe.
+  void SetRecorder(std::shared_ptr<VideoRecorder> recorder) {
+    std::unique_ptr<H26xDecoder> old;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      recorder_ = std::move(recorder);
+      old = std::move(recording_);
+    }
+    old.reset();
+  }
+
+  void Size(int32_t *width, int32_t *height) {
+    *width = width_;
+    *height = height_;
+  }
+
+  void Submit(const uint8_t *data, size_t length) override {
+    const int64_t now_us = NowMicros();
+    const std::vector<NalUnit> nals = SplitNals(data, length);
+    std::unique_ptr<H26xDecoder> retired_preview;
+    std::unique_ptr<H26xDecoder> retired_recording;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (last_input_us_ != 0) {
+      CountGap(&input_gaps_, (now_us - last_input_us_) / 1000);
+    }
+    last_input_us_ = now_us;
+    if (nals.empty()) {
+      invalid_++;
+      return;
+    }
+    bool keyframe = false;
+    bool has_slice = false;
+    for (const NalUnit &nal : nals) {
+      if (nal.header >= length) {
+        continue;
+      }
+      const int type = NalType(codec_, data[nal.header]);
+      if (params_.Offer(type, data + nal.offset, nal.length)) {
+        continue;
+      }
+      if (IsSliceNal(codec_, type)) {
+        has_slice = true;
+        if (IsKeyframeNal(codec_, type)) {
+          keyframe = true;
+        }
+      }
+    }
+    if (!has_slice) {
+      return;
+    }
+    if (!params_.Complete()) {
+      waiting_keyframe_++;
+      return;
+    }
+    // Preview decoder: rebuilt at a keyframe when the parameter sets changed.
+    OHNativeWindow *native = NativeWindow(window_);
+    if (preview_ != nullptr && (preview_generation_ != params_.generation() || !preview_->Running()) && keyframe) {
+      retired_preview = std::move(preview_);
+    }
+    if (preview_ == nullptr && native != nullptr && keyframe) {
+      preview_ = MakeDecoder(native, /*recording=*/false);
+      preview_generation_ = params_.generation();
+      preview_waiting_key_ = false;
+    }
+    FeedOne(preview_.get(), &preview_waiting_key_, data, length, now_us, keyframe);
+
+    // Recording decoder: created at the first keyframe after SetRecorder().
+    std::shared_ptr<VideoRecorder> recorder = recorder_;
+    OHNativeWindow *encoder_input = recorder != nullptr ? recorder->InputWindow() : nullptr;
+    if (recording_ != nullptr && (encoder_input == nullptr || !recording_->Running())) {
+      retired_recording = std::move(recording_);
+    }
+    if (recording_ == nullptr && encoder_input != nullptr && keyframe) {
+      recording_ = MakeDecoder(encoder_input, /*recording=*/true);
+      recording_waiting_key_ = false;
+    }
+    FeedOne(recording_.get(), &recording_waiting_key_, data, length, now_us, keyframe);
+    frames_++;
+  }
+
+  void FillStats(StreamStats *stats) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stats->invalid_jpeg = invalid_;
+    stats->shown = shown_;
+    stats->dropped = dropped_;
+    stats->first_frame_ms = first_frame_ms_;
+    stats->yuv = false;
+    stats->waiting_keyframe = waiting_keyframe_;
+    stats->input_gaps = input_gaps_;
+    stats->shown_gaps = shown_gaps_;
+    if (preview_ != nullptr) {
+      const H26xDecoderStats decoder = preview_->Stats();
+      stats->decode_failures = decoder.errors + decode_failures_;
+      stats->starved = decoder.starved + starved_;
+    } else {
+      stats->decode_failures = decode_failures_;
+      stats->starved = starved_;
+    }
+    stats->gap_avg_ms = gap_count_ > 0 ? static_cast<double>(gap_sum_ms_) / static_cast<double>(gap_count_) : 0;
+    stats->gap_max_ms = static_cast<double>(gap_max_ms_);
+    if (!recent_gaps_.empty()) {
+      std::vector<int64_t> sorted = recent_gaps_;
+      std::sort(sorted.begin(), sorted.end());
+      stats->gap_p95_ms = static_cast<double>(sorted[std::min(sorted.size() - 1, sorted.size() * 95 / 100)]);
+    }
+    const int64_t end_us = stopped_at_us_ != 0 ? stopped_at_us_ : NowMicros();
+    stats->elapsed_ms = started_at_us_ != 0 ? (end_us - started_at_us_) / 1000 : 0;
+  }
+
+ private:
+  static OHNativeWindow *NativeWindow(const std::shared_ptr<PreviewWindow> &window) {
+    if (window == nullptr) {
+      return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(window->mutex);
+    return window->window;
+  }
+
+  // mutex_ held.
+  std::unique_ptr<H26xDecoder> MakeDecoder(OHNativeWindow *native, bool recording) {
+    auto decoder = std::make_unique<H26xDecoder>();
+    const int32_t ret = decoder->Start(codec_, width_, height_, native, params_.Bytes());
+    if (ret != 0) {
+      decode_failures_++;
+      return nullptr;
+    }
+    if (recording) {
+      decoder->SetOnRendered([this](int64_t) {
+        std::shared_ptr<VideoRecorder> recorder;
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          recorder = recorder_;
+        }
+        if (recorder != nullptr) {
+          recorder->NoteProducedFrame();
+        }
+      });
+    } else {
+      decoder->SetOnRendered([this](int64_t) { OnShown(); });
+    }
+    OH_LOG_INFO(LOG_APP, "%{public}s decoder started for %{public}s", recording ? "recording" : "preview",
+                codec_ == StreamCodec::kH265 ? "H.265" : "H.264");
+    return decoder;
+  }
+
+  // mutex_ held. A frame the decoder could not take leaves it waiting for the
+  // next keyframe, so that no picture is decoded against a missing reference.
+  void FeedOne(H26xDecoder *decoder, bool *waiting_key, const uint8_t *data, size_t length, int64_t pts_us,
+               bool keyframe) {
+    if (decoder == nullptr) {
+      return;
+    }
+    if (*waiting_key && !keyframe) {
+      waiting_keyframe_++;
+      return;
+    }
+    if (decoder->Feed(data, length, pts_us, keyframe)) {
+      *waiting_key = false;
+    } else {
+      *waiting_key = true;
+      dropped_++;
+    }
+  }
+
+  // Called from the decoder's thread for every picture it rendered.
+  void OnShown() {
+    const int64_t now_us = NowMicros();
+    std::lock_guard<std::mutex> lock(mutex_);
+    NextFrameSequence();
+    shown_++;
+    if (first_frame_ms_ < 0) {
+      first_frame_ms_ = (now_us - started_at_us_) / 1000;
+    } else {
+      const int64_t gap_ms = (now_us - last_shown_us_) / 1000;
+      CountGap(&shown_gaps_, gap_ms);
+      gap_sum_ms_ += gap_ms;
+      gap_count_++;
+      gap_max_ms_ = std::max(gap_max_ms_, gap_ms);
+      if (recent_gaps_.size() < kGapSamples) {
+        recent_gaps_.push_back(gap_ms);
+      } else {
+        recent_gaps_[gap_cursor_] = gap_ms;
+        gap_cursor_ = (gap_cursor_ + 1) % kGapSamples;
+      }
+    }
+    last_shown_us_ = now_us;
+  }
+
+  const StreamCodec codec_;
+  const int32_t width_;
+  const int32_t height_;
+  std::mutex mutex_;
+  ParameterSets params_;
+  std::shared_ptr<PreviewWindow> window_;
+  std::shared_ptr<VideoRecorder> recorder_;
+  std::unique_ptr<H26xDecoder> preview_;
+  std::unique_ptr<H26xDecoder> recording_;
+  uint64_t preview_generation_ = 0;
+  bool preview_waiting_key_ = false;
+  bool recording_waiting_key_ = false;
+
+  int64_t started_at_us_ = 0;
+  int64_t stopped_at_us_ = 0;
+  int64_t last_input_us_ = 0;
+  int64_t last_shown_us_ = 0;
+  uint64_t frames_ = 0;
+  uint64_t invalid_ = 0;
+  uint64_t shown_ = 0;
+  uint64_t dropped_ = 0;
+  uint64_t starved_ = 0;
+  uint64_t decode_failures_ = 0;
+  uint64_t waiting_keyframe_ = 0;
+  int64_t first_frame_ms_ = -1;
+  int64_t gap_sum_ms_ = 0;
+  int64_t gap_count_ = 0;
+  int64_t gap_max_ms_ = 0;
+  std::vector<int64_t> recent_gaps_;
+  size_t gap_cursor_ = 0;
+  std::array<uint64_t, kGapBuckets> input_gaps_ = {};
+  std::array<uint64_t, kGapBuckets> shown_gaps_ = {};
+};
+
+// Uncompressed presenter ----------------------------------------------------------
+
+// Repacks each raw frame to NV12 on its own thread (latest wins, like the
+// MJPEG presenter's draw stage) and writes it to the window and the recorder.
+class RawPresenter : public FrameSink {
+ public:
+  RawPresenter(StreamCodec codec, int32_t width, int32_t height) : codec_(codec), width_(width), height_(height) {}
+  ~RawPresenter() override { Stop(); }
+
+  void Start() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (started_) {
+      return;
+    }
+    started_ = true;
+    stopping_ = false;
+    started_at_us_ = NowMicros();
+    stopped_at_us_ = 0;
+    worker_ = std::thread([this] { Loop(); });
+  }
+
+  void Stop() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!started_) {
+        return;
+      }
+      stopping_ = true;
+      has_pending_ = false;
+      stopped_at_us_ = NowMicros();
+    }
+    wake_.notify_all();
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    started_ = false;
+  }
+
+  void SetWindow(std::shared_ptr<PreviewWindow> window) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    window_ = std::move(window);
+  }
+
+  void SetRecorder(std::shared_ptr<VideoRecorder> recorder) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    recorder_ = std::move(recorder);
+  }
+
+  void Size(int32_t *width, int32_t *height) {
+    *width = width_;
+    *height = height_;
+  }
+
+  // The latest picture as JPEG, encoded on the caller's thread; empty before
+  // the first frame or when encoding fails.
+  std::vector<uint8_t> LatestJpeg() {
+    Nv12Picture picture;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      picture = latest_;
+    }
+    return EncodeNv12ToJpeg(picture, 90);
+  }
+
+  void Submit(const uint8_t *data, size_t length) override {
+    const int64_t now_us = NowMicros();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (last_input_us_ != 0) {
+        CountGap(&input_gaps_, (now_us - last_input_us_) / 1000);
+      }
+      last_input_us_ = now_us;
+      if (length != RawFrameBytes(codec_, width_, height_)) {
+        invalid_++;
+        return;
+      }
+      if (has_pending_) {
+        dropped_++;
+      }
+      pending_.assign(data, data + length);
+      has_pending_ = true;
+    }
+    wake_.notify_one();
+  }
+
+  void FillStats(StreamStats *stats) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stats->invalid_jpeg = invalid_;
+    stats->shown = shown_;
+    stats->decode_failures = failures_;
+    stats->dropped = dropped_;
+    stats->show_ms_total = show_ms_total_;
+    stats->first_frame_ms = first_frame_ms_;
+    stats->yuv = true;
+    stats->input_gaps = input_gaps_;
+    stats->shown_gaps = shown_gaps_;
+    stats->gap_avg_ms = gap_count_ > 0 ? static_cast<double>(gap_sum_ms_) / static_cast<double>(gap_count_) : 0;
+    stats->gap_max_ms = static_cast<double>(gap_max_ms_);
+    if (!recent_gaps_.empty()) {
+      std::vector<int64_t> sorted = recent_gaps_;
+      std::sort(sorted.begin(), sorted.end());
+      stats->gap_p95_ms = static_cast<double>(sorted[std::min(sorted.size() - 1, sorted.size() * 95 / 100)]);
+    }
+    const int64_t end_us = stopped_at_us_ != 0 ? stopped_at_us_ : NowMicros();
+    stats->elapsed_ms = started_at_us_ != 0 ? (end_us - started_at_us_) / 1000 : 0;
+  }
+
+ private:
+  void Loop() {
+    std::vector<uint8_t> raw;
+    Nv12Picture picture;
+    for (;;) {
+      std::shared_ptr<PreviewWindow> window;
+      std::shared_ptr<VideoRecorder> recorder;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        wake_.wait(lock, [this] { return stopping_ || has_pending_; });
+        if (stopping_) {
+          return;
+        }
+        raw.swap(pending_);
+        has_pending_ = false;
+        window = window_;
+        recorder = recorder_;
+      }
+      const int64_t started_us = NowMicros();
+      if (!RepackToNv12(codec_, raw.data(), raw.size(), width_, height_, &picture)) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        failures_++;
+        continue;
+      }
+      const FramePixels pixels = picture.Pixels();
+      uint64_t sequence = 0;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sequence = NextFrameSequence();
+        latest_ = picture;
+      }
+      const int32_t result = window != nullptr ? WriteFrame(window.get(), sequence, pixels) : 0;
+      if (recorder != nullptr) {
+        recorder->WriteFrame(pixels);
+      }
+      const int64_t now_us = NowMicros();
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (result == kResultSuperseded || result == kErrorWindowClosed || result == kResultYuvUnavailable) {
+        dropped_++;
+      } else if (result != 0) {
+        failures_++;
+      } else {
+        shown_++;
+        show_ms_total_ += static_cast<uint64_t>((now_us - started_us) / 1000);
+        if (first_frame_ms_ < 0) {
+          first_frame_ms_ = (now_us - started_at_us_) / 1000;
+        } else {
+          const int64_t gap_ms = (now_us - last_shown_us_) / 1000;
+          CountGap(&shown_gaps_, gap_ms);
+          gap_sum_ms_ += gap_ms;
+          gap_count_++;
+          gap_max_ms_ = std::max(gap_max_ms_, gap_ms);
+          if (recent_gaps_.size() < kGapSamples) {
+            recent_gaps_.push_back(gap_ms);
+          } else {
+            recent_gaps_[gap_cursor_] = gap_ms;
+            gap_cursor_ = (gap_cursor_ + 1) % kGapSamples;
+          }
+        }
+        last_shown_us_ = now_us;
+      }
+    }
+  }
+
+  const StreamCodec codec_;
+  const int32_t width_;
+  const int32_t height_;
+  std::mutex mutex_;
+  std::condition_variable wake_;
+  std::thread worker_;
+  bool started_ = false;
+  bool stopping_ = false;
+  std::shared_ptr<PreviewWindow> window_;
+  std::shared_ptr<VideoRecorder> recorder_;
+  std::vector<uint8_t> pending_;
+  bool has_pending_ = false;
+  Nv12Picture latest_;
+
+  int64_t started_at_us_ = 0;
+  int64_t stopped_at_us_ = 0;
+  int64_t last_input_us_ = 0;
+  int64_t last_shown_us_ = 0;
+  uint64_t invalid_ = 0;
+  uint64_t shown_ = 0;
+  uint64_t dropped_ = 0;
+  uint64_t failures_ = 0;
+  uint64_t show_ms_total_ = 0;
+  int64_t first_frame_ms_ = -1;
+  int64_t gap_sum_ms_ = 0;
+  int64_t gap_count_ = 0;
+  int64_t gap_max_ms_ = 0;
+  std::vector<int64_t> recent_gaps_;
+  size_t gap_cursor_ = 0;
+  std::array<uint64_t, kGapBuckets> input_gaps_ = {};
+  std::array<uint64_t, kGapBuckets> shown_gaps_ = {};
+};
+
 // Isochronous stream -------------------------------------------------------------
 
 struct IsoStreamConfig {
   int fd = -1;
   uint8_t endpoint = 0;
-  // Bytes the selected alt setting can send per (micro)frame.
+  // Isochronous: bytes the selected alt setting can send per (micro)frame.
+  // Bulk: the negotiated dwMaxPayloadTransferSize, so that every transfer
+  // completes with exactly one payload (it ends with a short packet or fills
+  // the buffer), as libuvc reads bulk cameras.
   uint32_t bytes_per_packet = 0;
+  // Bulk endpoint instead of isochronous: one payload per transfer, no
+  // packet descriptors, no alt setting.
+  bool bulk = false;
   // Short transfers keep latency low: frames are handed on once per transfer.
   uint32_t packets_per_urb = 32;
   uint32_t urb_count = 16;
   size_t max_frame_bytes = 4 * 1024 * 1024;
+  // What the frames are, and the picture size the mode promises (the
+  // hardware video decoder is configured with it).
+  StreamCodec codec = StreamCodec::kMjpeg;
+  int32_t width = 0;
+  int32_t height = 0;
 };
 
-// Keeps `urb_count` isochronous URBs queued on the endpoint from its own
-// thread, resubmitting each one as soon as it is reaped, and feeds every
+// Keeps `urb_count` URBs queued on the endpoint from its own thread
+// (isochronous with `packets_per_urb` packets each, or bulk with one payload
+// each), resubmitting each one as soon as it is reaped, and feeds every
 // packet to the frame assembler and completed frames to the presenter.
 class IsoStream {
  public:
-  explicit IsoStream(FramePresenter *presenter) : presenter_(presenter) {}
+  explicit IsoStream(FrameSink *presenter) : presenter_(presenter) {}
   ~IsoStream() { Stop(); }
 
   // Returns 0, or -errno when no transfer could be submitted.
@@ -417,13 +923,16 @@ class IsoStream {
     }
     config_ = config;
     assembler_ = std::make_unique<UvcFrameAssembler>(config.max_frame_bytes);
-    const size_t buffer_bytes = static_cast<size_t>(config.bytes_per_packet) * config.packets_per_urb;
+    if (config.bulk) {
+      config_.packets_per_urb = 1;
+    }
+    const size_t buffer_bytes = static_cast<size_t>(config.bytes_per_packet) * config_.packets_per_urb;
     urbs_.clear();
     for (uint32_t i = 0; i < config.urb_count; i++) {
       Urb urb;
       urb.buffer.resize(buffer_bytes);
       const size_t urb_bytes =
-          sizeof(struct usbdevfs_urb) + config.packets_per_urb * sizeof(struct usbdevfs_iso_packet_desc);
+          sizeof(struct usbdevfs_urb) + config_.packets_per_urb * sizeof(struct usbdevfs_iso_packet_desc);
       urb.storage.resize(urb_bytes);
       urbs_.push_back(std::move(urb));
     }
@@ -487,15 +996,20 @@ class IsoStream {
   int Submit(Urb *urb) {
     struct usbdevfs_urb *request = urb->get();
     memset(urb->storage.data(), 0, urb->storage.size());
-    request->type = USBDEVFS_URB_TYPE_ISO;
     request->endpoint = config_.endpoint;
-    request->flags = USBDEVFS_URB_ISO_ASAP;
     request->buffer = urb->buffer.data();
     request->buffer_length = static_cast<int>(urb->buffer.size());
-    request->number_of_packets = static_cast<int>(config_.packets_per_urb);
     request->usercontext = urb;
-    for (uint32_t i = 0; i < config_.packets_per_urb; i++) {
-      request->iso_frame_desc[i].length = config_.bytes_per_packet;
+    if (config_.bulk) {
+      request->type = USBDEVFS_URB_TYPE_BULK;
+      request->number_of_packets = 0;
+    } else {
+      request->type = USBDEVFS_URB_TYPE_ISO;
+      request->flags = USBDEVFS_URB_ISO_ASAP;
+      request->number_of_packets = static_cast<int>(config_.packets_per_urb);
+      for (uint32_t i = 0; i < config_.packets_per_urb; i++) {
+        request->iso_frame_desc[i].length = config_.bytes_per_packet;
+      }
     }
     if (ioctl(config_.fd, USBDEVFS_SUBMITURB, request) < 0) {
       return -errno;
@@ -510,6 +1024,24 @@ class IsoStream {
     uint64_t empty = 0;
     const uint8_t *buffer = urb->buffer.data();
     const auto on_frame = [this](const uint8_t *data, size_t length) { presenter_->Submit(data, length); };
+    if (config_.bulk) {
+      // The whole transfer is one payload.
+      if (request->actual_length == 0) {
+        empty++;
+      } else if (static_cast<uint32_t>(request->actual_length) > config_.bytes_per_packet) {
+        bad++;
+        assembler_->MarkPacketLost();
+      } else {
+        assembler_->Push(buffer, static_cast<size_t>(request->actual_length), on_frame);
+      }
+      std::lock_guard<std::mutex> lock(stats_mutex_);
+      urbs_done_++;
+      packets_++;
+      bad_packets_ += bad;
+      empty_packets_ += empty;
+      assembler_stats_ = assembler_->stats();
+      return;
+    }
     // usbfs lays the packets out back to back at their requested lengths.
     for (int i = 0; i < request->number_of_packets; i++) {
       const struct usbdevfs_iso_packet_desc &packet = request->iso_frame_desc[i];
@@ -558,6 +1090,10 @@ class IsoStream {
       // A cancelled or failed transfer carries nothing worth assembling.
       if (request->status == 0) {
         Process(urb);
+      } else if (config_.bulk && request->status != -ENOENT && request->status != -ECONNRESET) {
+        // A failed bulk transfer lost part of a frame; -EPIPE (stall) also
+        // ends the stream below when resubmission fails.
+        assembler_->MarkPacketLost();
       }
       const int ret = Submit(urb);
       if (ret != 0) {
@@ -640,7 +1176,7 @@ class IsoStream {
   static constexpr int kDrainTimeoutMs = 500;
   static constexpr int kDrainStepMs = 10;
 
-  FramePresenter *presenter_;
+  FrameSink *presenter_;
   IsoStreamConfig config_;
   std::unique_ptr<UvcFrameAssembler> assembler_;
   std::vector<Urb> urbs_;
@@ -659,54 +1195,111 @@ class IsoStream {
 };
 
 // One running preview: the transfers plus the frames' way to the screen.
+// MJPEG frames go through FramePresenter (decode + draw threads); H.264 and
+// H.265 through H26xPresenter (hardware decoder rendering into the window);
+// uncompressed pictures through RawPresenter (repacked to NV12).
 class StreamSession {
  public:
-  StreamSession() : stream_(&presenter_) {}
-
   int Start(const IsoStreamConfig &config, std::shared_ptr<PreviewWindow> window) {
-    presenter_.SetWindow(std::move(window));
-    presenter_.Start();
-    const int ret = stream_.Start(config);
+    if (stream_ != nullptr) {
+      return -EBUSY;
+    }
+    codec_ = config.codec;
+    if (codec_ == StreamCodec::kMjpeg) {
+      jpeg_ = std::make_unique<FramePresenter>();
+      jpeg_->SetWindow(std::move(window));
+      jpeg_->Start();
+      stream_ = std::make_unique<IsoStream>(jpeg_.get());
+    } else if (IsRawVideo(codec_)) {
+      raw_ = std::make_unique<RawPresenter>(codec_, config.width, config.height);
+      raw_->SetWindow(std::move(window));
+      raw_->Start();
+      stream_ = std::make_unique<IsoStream>(raw_.get());
+    } else {
+      h26x_ = std::make_unique<H26xPresenter>(codec_, config.width, config.height);
+      h26x_->SetWindow(std::move(window));
+      h26x_->Start();
+      stream_ = std::make_unique<IsoStream>(h26x_.get());
+    }
+    const int ret = stream_->Start(config);
     if (ret != 0) {
-      presenter_.Stop();
+      stream_.reset();
+      StopPresenter();
     }
     return ret;
   }
 
-  void SetWindow(std::shared_ptr<PreviewWindow> window) { presenter_.SetWindow(std::move(window)); }
+  void SetWindow(std::shared_ptr<PreviewWindow> window) {
+    if (jpeg_ != nullptr) {
+      jpeg_->SetWindow(std::move(window));
+    } else if (raw_ != nullptr) {
+      raw_->SetWindow(std::move(window));
+    } else if (h26x_ != nullptr) {
+      h26x_->SetWindow(std::move(window));
+    }
+  }
 
   void Stop() {
     StopRecording();
-    stream_.Stop();
-    presenter_.Stop();
+    if (stream_ != nullptr) {
+      stream_->Stop();
+    }
+    StopPresenter();
   }
 
-  std::vector<uint8_t> LatestJpeg() { return presenter_.LatestJpeg(); }
+  // The latest camera frame as JPEG (as sent for MJPEG, encoded here for
+  // uncompressed streams); empty for H.264/H.265 streams, whose pictures only
+  // exist inside the decoder.
+  std::vector<uint8_t> LatestJpeg() {
+    if (jpeg_ != nullptr) {
+      return jpeg_->LatestJpeg();
+    }
+    if (raw_ != nullptr) {
+      return raw_->LatestJpeg();
+    }
+    return std::vector<uint8_t>();
+  }
 
-  // Starts recording the decoded frames to `path`. Needs a decoded frame
-  // first, so the size is known. Returns 0 or a negative error code.
+  // Starts recording to `path`. MJPEG streams feed the encoder with decoded
+  // NV12 frames; H.264/H.265 streams decode into the encoder's surface with a
+  // second decoder instance (no passthrough, same as Android). Returns 0 or a
+  // negative error code.
   int32_t StartRecording(const std::string &path, int32_t fps, int64_t bitrate) {
     if (recorder_ != nullptr) {
       return kErrorRecorderBusy;
     }
     int32_t width = 0;
     int32_t height = 0;
-    presenter_.DecodedSize(&width, &height);
-    if (width <= 0 || height <= 0) {
+    if (jpeg_ != nullptr) {
+      jpeg_->DecodedSize(&width, &height);
+      if (width <= 0 || height <= 0) {
+        return kErrorRecorderNoFrames;
+      }
+      StreamStats stats = Stats();
+      if (!stats.yuv) {
+        // The encoder takes NV12; the RGBA fallback has nothing to feed it.
+        return kErrorRecorderFormat;
+      }
+    } else if (raw_ != nullptr) {
+      raw_->Size(&width, &height);
+    } else if (h26x_ != nullptr) {
+      h26x_->Size(&width, &height);
+    } else {
       return kErrorRecorderNoFrames;
     }
-    StreamStats stats = Stats();
-    if (!stats.yuv) {
-      // The encoder takes NV12; the RGBA fallback has nothing to feed it.
-      return kErrorRecorderFormat;
-    }
     auto recorder = std::make_shared<VideoRecorder>();
-    const int32_t ret = recorder->Start(path, width, height, fps, bitrate);
+    const int32_t ret = recorder->Start(path, width, height, fps, bitrate, /*external_producer=*/h26x_ != nullptr);
     if (ret != 0) {
       return ret;
     }
     recorder_ = recorder;
-    presenter_.SetRecorder(recorder);
+    if (jpeg_ != nullptr) {
+      jpeg_->SetRecorder(recorder);
+    } else if (raw_ != nullptr) {
+      raw_->SetRecorder(recorder);
+    } else {
+      h26x_->SetRecorder(recorder);
+    }
     return 0;
   }
 
@@ -717,7 +1310,14 @@ class StreamSession {
     if (recorder == nullptr) {
       return kErrorRecorderNoFrames;
     }
-    presenter_.SetRecorder(nullptr);
+    // Detaching first stops the producer before the encoder's surface goes.
+    if (jpeg_ != nullptr) {
+      jpeg_->SetRecorder(nullptr);
+    } else if (raw_ != nullptr) {
+      raw_->SetRecorder(nullptr);
+    } else if (h26x_ != nullptr) {
+      h26x_->SetRecorder(nullptr);
+    }
     return recorder->Stop();
   }
 
@@ -725,14 +1325,37 @@ class StreamSession {
 
   StreamStats Stats() {
     StreamStats stats;
-    stream_.FillStats(&stats);
-    presenter_.FillStats(&stats);
+    if (stream_ != nullptr) {
+      stream_->FillStats(&stats);
+    }
+    if (jpeg_ != nullptr) {
+      jpeg_->FillStats(&stats);
+    } else if (raw_ != nullptr) {
+      raw_->FillStats(&stats);
+    } else if (h26x_ != nullptr) {
+      h26x_->FillStats(&stats);
+    }
     return stats;
   }
 
  private:
-  FramePresenter presenter_;
-  IsoStream stream_;
+  void StopPresenter() {
+    if (jpeg_ != nullptr) {
+      jpeg_->Stop();
+    }
+    if (raw_ != nullptr) {
+      raw_->Stop();
+    }
+    if (h26x_ != nullptr) {
+      h26x_->Stop();
+    }
+  }
+
+  StreamCodec codec_ = StreamCodec::kMjpeg;
+  std::unique_ptr<FramePresenter> jpeg_;
+  std::unique_ptr<RawPresenter> raw_;
+  std::unique_ptr<H26xPresenter> h26x_;
+  std::unique_ptr<IsoStream> stream_;
   std::shared_ptr<VideoRecorder> recorder_;
 };
 

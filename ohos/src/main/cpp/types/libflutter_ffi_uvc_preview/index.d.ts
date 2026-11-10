@@ -19,6 +19,13 @@ export const usbReleaseInterface: (fd: number, interfaceNumber: number) => numbe
 export const usbSetInterface: (fd: number, interfaceNumber: number, altSetting: number) => number;
 
 /**
+ * CLEAR_FEATURE(ENDPOINT_HALT) on an endpoint, resetting its data toggle.
+ * This is how a bulk UVC camera is told that streaming stopped. Returns 0 or
+ * a negative errno value.
+ */
+export const usbClearHalt: (fd: number, endpoint: number) => number;
+
+/**
  * One control transfer; `data` is sent or filled depending on the direction
  * bit of `requestType`, and its size is the transfer's wLength. Returns the
  * number of bytes transferred. Blocks for at most `timeoutMs`.
@@ -32,14 +39,27 @@ export const usbClose: (fd: number) => void;
 
 /**
  * Starts receiving the isochronous stream on `endpoint`, with packets of up
- * to `bytesPerPacket` bytes, and showing its MJPEG frames in `window` (0n:
- * decode only). Frames larger than `maxFrameBytes` are dropped. The streaming
- * interface must already be claimed and on its streaming alt setting.
+ * to `bytesPerPacket` bytes, and showing its frames in `window` (0n: receive
+ * without showing). Frames larger than `maxFrameBytes` are dropped. The
+ * streaming interface must already be claimed and on its streaming alt
+ * setting. `codec` says how to decode the frames (0 MJPEG, 1 H.264, 2 H.265,
+ * 3 YUY2, 4 UYVY, 5 NV12); `width`
+ * and `height` are the mode's picture size, which the H.264/H.265 hardware
+ * decoder is configured with (ignored for MJPEG). With `bulk` = 1 the
+ * endpoint is a bulk endpoint: `bytesPerPacket` is then the negotiated
+ * dwMaxPayloadTransferSize and each transfer carries one payload.
+ *
+ * MJPEG frames are decoded on the CPU side of the system image decoder and
+ * drawn into the window; H.264/H.265 frames go to the hardware video decoder,
+ * which renders into the window itself, so they need a window to show
+ * anything and only start at a keyframe; uncompressed frames are repacked to
+ * NV12 and drawn like decoded MJPEG.
  *
  * Returns a positive stream id, or a negative errno value.
  */
 export const streamStart: (
-  fd: number, endpoint: number, bytesPerPacket: number, maxFrameBytes: number, window: bigint) => number;
+  fd: number, endpoint: number, bytesPerPacket: number, maxFrameBytes: number, window: bigint,
+  codec: number, width: number, height: number, bulk: number) => number;
 
 /** Changes the window a running stream draws into; 0n stops drawing. */
 export const streamSetWindow: (stream: number, window: bigint) => void;
@@ -64,10 +84,17 @@ export const streamStop: (stream: number) => void;
  * [23..27] frames arriving and [28..32] frames shown, counted by the gap to
  *          the previous one: <=22, <=30, <=45, <=70, longer (ms)
  * [33] 1 when frames are decoded to NV12, 0 for RGBA
+ * [34] H.264/H.265: frames the hardware decoder had no free input buffer for
+ * [35] H.264/H.265: frames skipped while waiting for parameter sets or a keyframe
  */
 export const streamStats: (stream: number) => number[];
 
-/** The last complete frame of a stream as the camera sent it (JPEG), or undefined before the first. */
+/**
+ * The last complete frame as JPEG: as the camera sent it for MJPEG streams,
+ * encoded from the picture for uncompressed ones; undefined before the first
+ * frame and always for H.264/H.265 streams (their pictures only exist inside
+ * the hardware decoder).
+ */
 export const streamLatestJpeg: (stream: number) => ArrayBuffer | undefined;
 
 /**

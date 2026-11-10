@@ -1,9 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  parseUvcDescriptors, listModes, selectAltSetting, selectAltSettingWithin, defaultModeIndex,
+  parseUvcDescriptors, listModes, selectAltSetting, selectAltSettingWithin, defaultModeIndex, bulkEndpoint,
 } from '../uvc/UvcDescriptor.ts';
-import { runcamLikeDescriptor, interfaceDescriptor, mjpegFormat, mjpegFrame } from './fixture.ts';
+import {
+  runcamLikeDescriptor, interfaceDescriptor, mjpegFormat, mjpegFrame, vsInputHeader, endpointDescriptor,
+} from './fixture.ts';
 
 test('reads bcdUVC and the control interface number from the VC header', () => {
   const info = parseUvcDescriptors(runcamLikeDescriptor(0x0110));
@@ -119,4 +121,28 @@ test('parses a bare configuration without a leading device descriptor', () => {
   const info = parseUvcDescriptors(full.subarray(18));
   assert.equal(info.streams.length, 1);
   assert.equal(info.streams[0].formats.length, 2);
+});
+
+test('a bulk camera streams on alt 0 and has no isochronous alt setting', () => {
+  const bulkCamera = new Uint8Array([
+    ...interfaceDescriptor(1, 0, 1, 0x02),
+    ...vsInputHeader(1, 0x82),
+    ...mjpegFormat(1, 1),
+    ...mjpegFrame(1, 1920, 1080, [333333]),
+    ...endpointDescriptor(0x82, 0x02, 512, 0),
+  ]);
+  const info = parseUvcDescriptors(bulkCamera);
+  const alts = info.streams[0].altSettings;
+  assert.equal(alts.length, 1);
+  assert.equal(alts[0].isochronous, false);
+  assert.equal(selectAltSetting(alts, 24576), null);
+  const bulk = bulkEndpoint(alts);
+  assert.ok(bulk);
+  assert.equal(bulk.endpointAddress, 0x82);
+  assert.equal(bulk.alternateSetting, 0);
+});
+
+test('an isochronous camera has no bulk endpoint', () => {
+  const info = parseUvcDescriptors(runcamLikeDescriptor());
+  assert.equal(bulkEndpoint(info.streams[0].altSettings), null);
 });

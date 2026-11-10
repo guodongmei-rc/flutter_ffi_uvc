@@ -34,7 +34,7 @@ using flutter_ffi_uvc::PreviewWindow;
 using flutter_ffi_uvc::StreamSession;
 using flutter_ffi_uvc::StreamStats;
 
-constexpr size_t kMaxArguments = 8;
+constexpr size_t kMaxArguments = 12;
 
 std::mutex g_streams_mutex;
 std::map<int32_t, std::shared_ptr<StreamSession>> g_streams;
@@ -154,6 +154,17 @@ napi_value UsbSetInterface(napi_env env, napi_callback_info info) {
                                                       static_cast<unsigned int>(alt_setting)));
 }
 
+// usbClearHalt(fd, endpoint): number
+napi_value UsbClearHalt(napi_env env, napi_callback_info info) {
+  const Arguments arguments = GetArguments(env, info);
+  int64_t fd = -1;
+  int64_t endpoint = 0;
+  if (!GetInt(env, arguments, 0, &fd) || !GetInt(env, arguments, 1, &endpoint)) {
+    return Number(env, -EINVAL);
+  }
+  return Number(env, flutter_ffi_uvc::UsbClearHalt(static_cast<int>(fd), static_cast<unsigned int>(endpoint)));
+}
+
 // usbControlTransfer(fd, requestType, request, value, index, data: ArrayBuffer, timeoutMs): number
 napi_value UsbControlTransfer(napi_env env, napi_callback_info info) {
   const Arguments arguments = GetArguments(env, info);
@@ -190,7 +201,7 @@ napi_value UsbClose(napi_env env, napi_callback_info info) {
 
 // Streams ------------------------------------------------------------------------
 
-// streamStart(fd, endpoint, bytesPerPacket, maxFrameBytes, window: bigint): number
+// streamStart(fd, endpoint, bytesPerPacket, maxFrameBytes, window: bigint, codec, width, height, bulk): number
 napi_value StreamStart(napi_env env, napi_callback_info info) {
   const Arguments arguments = GetArguments(env, info);
   int64_t fd = -1;
@@ -198,9 +209,15 @@ napi_value StreamStart(napi_env env, napi_callback_info info) {
   int64_t bytes_per_packet = 0;
   int64_t max_frame_bytes = 0;
   uint64_t window_id = 0;
+  int64_t codec = 0;
+  int64_t width = 0;
+  int64_t height = 0;
+  int64_t bulk = 0;
   if (!GetInt(env, arguments, 0, &fd) || !GetInt(env, arguments, 1, &endpoint) ||
       !GetInt(env, arguments, 2, &bytes_per_packet) || !GetInt(env, arguments, 3, &max_frame_bytes) ||
-      !GetWindowId(env, arguments, 4, &window_id) || bytes_per_packet <= 0 || max_frame_bytes <= 0) {
+      !GetWindowId(env, arguments, 4, &window_id) || !GetInt(env, arguments, 5, &codec) ||
+      !GetInt(env, arguments, 6, &width) || !GetInt(env, arguments, 7, &height) ||
+      !GetInt(env, arguments, 8, &bulk) || bytes_per_packet <= 0 || max_frame_bytes <= 0 || codec < 0 || codec > 5) {
     return Number(env, -EINVAL);
   }
   IsoStreamConfig config;
@@ -208,6 +225,10 @@ napi_value StreamStart(napi_env env, napi_callback_info info) {
   config.endpoint = static_cast<uint8_t>(endpoint);
   config.bytes_per_packet = static_cast<uint32_t>(bytes_per_packet);
   config.max_frame_bytes = static_cast<size_t>(max_frame_bytes);
+  config.codec = static_cast<flutter_ffi_uvc::StreamCodec>(codec);
+  config.width = static_cast<int32_t>(width);
+  config.height = static_cast<int32_t>(height);
+  config.bulk = bulk != 0;
 
   auto session = std::make_shared<StreamSession>();
   const int ret = session->Start(config, window_id != 0 ? flutter_ffi_uvc::FindWindow(window_id) : nullptr);
@@ -298,6 +319,8 @@ napi_value StreamStatsOf(napi_env env, napi_callback_info info) {
     push(static_cast<double>(count));
   }
   push(stats.yuv ? 1 : 0);
+  push(stats.starved);
+  push(stats.waiting_keyframe);
   return result;
 }
 
@@ -360,6 +383,7 @@ napi_value Init(napi_env env, napi_value exports) {
       {"usbClaimInterface", nullptr, UsbClaimInterface, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"usbReleaseInterface", nullptr, UsbReleaseInterface, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"usbSetInterface", nullptr, UsbSetInterface, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"usbClearHalt", nullptr, UsbClearHalt, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"usbControlTransfer", nullptr, UsbControlTransfer, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"usbClose", nullptr, UsbClose, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"streamStart", nullptr, StreamStart, nullptr, nullptr, nullptr, napi_default, nullptr},
