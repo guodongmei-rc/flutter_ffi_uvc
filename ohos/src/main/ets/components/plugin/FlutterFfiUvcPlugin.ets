@@ -14,10 +14,11 @@ import {
   MethodResult,
   StreamHandler,
 } from '@ohos/flutter_ohos';
+import { BusinessError, commonEventManager, usbManager } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import {
   UvcCameraSession, UvcDeviceSummary, UvcModeSummary, UvcPreviewOutcome, UvcPreviewRequest,
-  UvcSessionListener, UvcSessionStats,
+  UvcSessionListener, UvcSessionStats, hasVideoInterface, summarizeDevice,
 } from '../../camera/UvcCameraSession';
 import { NO_WINDOW, UvcPreviewRenderer } from '../../camera/UvcPreviewRenderer';
 
@@ -39,6 +40,7 @@ UvcSessionListener {
   private renderer: UvcPreviewRenderer | null = null;
   private session: UvcCameraSession | null = null;
   private statsTimer: number = -1;
+  private usbSubscriber: commonEventManager.CommonEventSubscriber | null = null;
   private statsTicks: number = 0;
   /** Log transport and rendering counters once per second while previewing. */
   private verbose: boolean = false;
@@ -60,6 +62,57 @@ UvcSessionListener {
     this.channel.setMethodCallHandler(this);
     this.eventChannel = new EventChannel(binding.getBinaryMessenger(), EVENT_CHANNEL);
     this.eventChannel.setStreamHandler(this);
+    this.subscribeUsbEvents();
+  }
+
+  /**
+   * Forwards the system's USB attach/detach broadcasts for video devices as
+   * device events. The broadcast carries the device as JSON in `data`.
+   */
+  private subscribeUsbEvents(): void {
+    const info: commonEventManager.CommonEventSubscribeInfo = {
+      events: [
+        commonEventManager.Support.COMMON_EVENT_USB_DEVICE_ATTACHED,
+        commonEventManager.Support.COMMON_EVENT_USB_DEVICE_DETACHED,
+      ]
+    };
+    commonEventManager.createSubscriber(info).then((subscriber: commonEventManager.CommonEventSubscriber): void => {
+      if (this.channel === null) {
+        // Detached from the engine while the subscriber was being created.
+        return;
+      }
+      this.usbSubscriber = subscriber;
+      commonEventManager.subscribe(subscriber, (error: BusinessError, data: commonEventManager.CommonEventData): void => {
+        if (error) {
+          hilog.warn(0x0001, 'FlutterFfiUvc', 'USB broadcast error: %{public}d', error.code);
+          return;
+        }
+        this.onUsbBroadcast(data);
+      });
+    }).catch((error: BusinessError): void => {
+      hilog.warn(0x0001, 'FlutterFfiUvc', 'subscribing to USB broadcasts failed: %{public}d', error.code);
+    });
+  }
+
+  private onUsbBroadcast(data: commonEventManager.CommonEventData): void {
+    const attached = data.event === commonEventManager.Support.COMMON_EVENT_USB_DEVICE_ATTACHED;
+    if (!attached && data.event !== commonEventManager.Support.COMMON_EVENT_USB_DEVICE_DETACHED) {
+      return;
+    }
+    let device: usbManager.USBDevice | null = null;
+    try {
+      device = data.data ? JSON.parse(data.data) as usbManager.USBDevice : null;
+    } catch (e) {
+      device = null;
+    }
+    if (device === null || !hasVideoInterface(device)) {
+      return;
+    }
+    const event: Map<string, Any> = new Map<string, Any>();
+    event.set('type', 'device');
+    event.set('event', attached ? 'attached' : 'detached');
+    event.set('device', this.deviceToMap(summarizeDevice(device, attached)));
+    this.emit(event);
   }
 
   onDetachedFromEngine(binding: FlutterPluginBinding): void {
@@ -78,6 +131,11 @@ UvcSessionListener {
     }
     this.eventChannel = null;
     this.events = null;
+    const subscriber = this.usbSubscriber;
+    this.usbSubscriber = null;
+    if (subscriber !== null) {
+      commonEventManager.unsubscribe(subscriber);
+    }
   }
 
   // StreamHandler --------------------------------------------------------------
@@ -291,19 +349,22 @@ UvcSessionListener {
   private devicesToList(devices: UvcDeviceSummary[]): Array<Any> {
     const out: Array<Any> = [];
     for (let i = 0; i < devices.length; i++) {
-      const device = devices[i];
-      const map: Map<string, Any> = new Map<string, Any>();
-      map.set('deviceId', device.deviceId);
-      map.set('deviceName', device.deviceName);
-      map.set('vendorId', device.vendorId);
-      map.set('productId', device.productId);
-      map.set('productName', device.productName);
-      map.set('manufacturerName', device.manufacturerName);
-      map.set('serialNumber', device.serialNumber);
-      map.set('hasPermission', device.hasPermission);
-      out.push(map);
+      out.push(this.deviceToMap(devices[i]));
     }
     return out;
+  }
+
+  private deviceToMap(device: UvcDeviceSummary): Map<string, Any> {
+    const map: Map<string, Any> = new Map<string, Any>();
+    map.set('deviceId', device.deviceId);
+    map.set('deviceName', device.deviceName);
+    map.set('vendorId', device.vendorId);
+    map.set('productId', device.productId);
+    map.set('productName', device.productName);
+    map.set('manufacturerName', device.manufacturerName);
+    map.set('serialNumber', device.serialNumber);
+    map.set('hasPermission', device.hasPermission);
+    return map;
   }
 
   private modesToList(modes: UvcModeSummary[]): Array<Any> {

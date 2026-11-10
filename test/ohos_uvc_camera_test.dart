@@ -294,6 +294,43 @@ void main() {
     expect(camera.lastError, 'device disconnected');
   });
 
+  test('USB attach and detach broadcasts arrive on deviceEvents', () async {
+    final List<UvcDeviceEvent> events = <UvcDeviceEvent>[];
+    final StreamSubscription<UvcDeviceEvent> sub = camera.deviceEvents.listen(
+      events.add,
+    );
+    await pumpEventQueue();
+
+    eventSink!.success(<String, Object?>{
+      'type': 'device',
+      'event': 'attached',
+      'device': <String, Object?>{
+        'deviceId': 1003,
+        'deviceName': '1-3',
+        'vendorId': 0x1d6b,
+        'productId': 4,
+        'productName': 'Camera',
+        'manufacturerName': 'Vendor',
+        'serialNumber': '',
+        'hasPermission': true,
+      },
+    });
+    eventSink!.success(<String, Object?>{
+      'type': 'device',
+      'event': 'detached',
+      'device': <String, Object?>{'deviceId': 1003, 'deviceName': '1-3'},
+    });
+    await pumpEventQueue();
+
+    expect(events, hasLength(2));
+    expect(events[0].type, UvcDeviceEventType.attached);
+    expect(events[0].device.deviceId, 1003);
+    expect(events[0].device.productName, 'Camera');
+    expect(events[1].type, UvcDeviceEventType.detached);
+    expect(events[1].device.deviceId, 1003);
+    await sub.cancel();
+  });
+
   test('preview textures go through the platform channel', () async {
     replies['createPreviewTexture'] = (_) => 7;
 

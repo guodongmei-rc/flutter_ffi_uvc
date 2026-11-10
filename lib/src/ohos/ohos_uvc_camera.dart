@@ -15,10 +15,10 @@ import '../uvc_camera_api.dart';
 /// cached when a device is opened, and the frame sequence and stream
 /// statistics are refreshed by periodic events while a preview is running.
 ///
-/// Implemented so far: device listing, open/close, MJPEG mode listing, and
-/// preview into a Flutter texture with frame verification. Camera controls,
-/// frame copies, photo and video capture, preview transforms, device
-/// attach/detach events and stall detection are not available yet and report
+/// Implemented so far: device listing, attach/detach events, open/close,
+/// MJPEG mode listing, and preview into a Flutter texture with frame
+/// verification. Camera controls, frame copies, photo and video capture,
+/// preview transforms and stall detection are not available yet and report
 /// [UvcErrorCode.notSupported] or an empty result.
 class OhosUvcCamera implements UvcCamera {
   OhosUvcCamera();
@@ -71,6 +71,8 @@ class OhosUvcCamera implements UvcCamera {
         if (reason.isNotEmpty) {
           _lastError = reason;
         }
+      case 'device':
+        _deviceEventController.add(UvcDeviceEvent.fromMap(event));
     }
   }
 
@@ -149,8 +151,14 @@ class OhosUvcCamera implements UvcCamera {
         .toList();
   }
 
+  /// Attach and detach broadcasts for USB video devices, as the system
+  /// reports them. A detach of the open device also ends the preview, which
+  /// [streamErrors] reports before this event arrives.
   @override
-  Stream<UvcDeviceEvent> get deviceEvents => _deviceEventController.stream;
+  Stream<UvcDeviceEvent> get deviceEvents {
+    _ensureEvents();
+    return _deviceEventController.stream;
+  }
 
   @override
   Future<int> openUsbDevice(int deviceId) async {

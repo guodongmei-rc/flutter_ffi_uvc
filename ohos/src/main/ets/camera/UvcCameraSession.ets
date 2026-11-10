@@ -175,6 +175,49 @@ function deviceIdOf(device: usbManager.USBDevice): number {
   return device.busNum * 1000 + device.devAddress;
 }
 
+/** Whether the device exposes a USB video class interface. */
+export function hasVideoInterface(device: usbManager.USBDevice): boolean {
+  const configs = device.configs;
+  if (!configs) {
+    return false;
+  }
+  for (let c = 0; c < configs.length; c++) {
+    const interfaces = configs[c].interfaces;
+    if (!interfaces) {
+      continue;
+    }
+    for (let i = 0; i < interfaces.length; i++) {
+      if (interfaces[i].clazz === USB_CLASS_VIDEO) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** The device as the Dart side describes it; `hasPermission` is looked up when `askRight` is set. */
+export function summarizeDevice(device: usbManager.USBDevice, askRight: boolean): UvcDeviceSummary {
+  let hasRight = false;
+  if (askRight) {
+    try {
+      hasRight = usbManager.hasRight(device.name);
+    } catch (e) {
+      hasRight = false;
+    }
+  }
+  const summary: UvcDeviceSummary = {
+    deviceId: deviceIdOf(device),
+    deviceName: device.name,
+    vendorId: device.vendorId,
+    productId: device.productId,
+    productName: device.productName,
+    manufacturerName: device.manufacturerName,
+    serialNumber: device.serial,
+    hasPermission: hasRight
+  };
+  return summary;
+}
+
 function fpsOf(mode: UvcMode): number {
   return mode.interval > 0 ? Math.round(10000000 / mode.interval) : 0;
 }
@@ -240,24 +283,7 @@ export class UvcCameraSession {
     const out: UvcDeviceSummary[] = [];
     const devices = this.videoDevices();
     for (let i = 0; i < devices.length; i++) {
-      const device = devices[i];
-      let hasRight = false;
-      try {
-        hasRight = usbManager.hasRight(device.name);
-      } catch (e) {
-        hasRight = false;
-      }
-      const summary: UvcDeviceSummary = {
-        deviceId: deviceIdOf(device),
-        deviceName: device.name,
-        vendorId: device.vendorId,
-        productId: device.productId,
-        productName: device.productName,
-        manufacturerName: device.manufacturerName,
-        serialNumber: device.serial,
-        hasPermission: hasRight
-      };
-      out.push(summary);
+      out.push(summarizeDevice(devices[i], true));
     }
     return out;
   }
@@ -276,30 +302,11 @@ export class UvcCameraSession {
     }
     for (let i = 0; i < devices.length; i++) {
       const device = devices[i] as usbManager.USBDevice;
-      if (this.hasVideoInterface(device)) {
+      if (hasVideoInterface(device)) {
         out.push(device);
       }
     }
     return out;
-  }
-
-  private hasVideoInterface(device: usbManager.USBDevice): boolean {
-    const configs = device.configs;
-    if (!configs) {
-      return false;
-    }
-    for (let c = 0; c < configs.length; c++) {
-      const interfaces = configs[c].interfaces;
-      if (!interfaces) {
-        continue;
-      }
-      for (let i = 0; i < interfaces.length; i++) {
-        if (interfaces[i].clazz === USB_CLASS_VIDEO) {
-          return true;
-        }
-      }
-    }
-    return false;
   }
 
   /** Opens the device with `deviceId` from listDevices(). Resolves with UVC_OK or an error code. */
