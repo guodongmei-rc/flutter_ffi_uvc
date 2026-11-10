@@ -35,6 +35,7 @@
 #include <linux/usbdevice_fs.h>
 
 #include "uvc_frame_assembler.h"
+#include "uvc_recorder.h"
 #include "uvc_surface.h"
 
 namespace flutter_ffi_uvc {
@@ -170,6 +171,25 @@ class FramePresenter {
     window_ = std::move(window);
   }
 
+  // Every decoded frame is also fed to `recorder` while it is set.
+  void SetRecorder(std::shared_ptr<VideoRecorder> recorder) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    recorder_ = std::move(recorder);
+  }
+
+  // The most recent complete frame, as the camera sent it; empty before the first.
+  std::vector<uint8_t> LatestJpeg() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return latest_jpeg_;
+  }
+
+  // Size of the decoded frames, as reported by the decoder; 0 before the first.
+  void DecodedSize(int32_t *width, int32_t *height) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    *width = decoded_width_;
+    *height = decoded_height_;
+  }
+
   // Takes one assembled frame. Called from the stream thread.
   void Submit(const uint8_t *data, size_t length) {
     const int64_t now_us = NowMicros();
@@ -188,6 +208,7 @@ class FramePresenter {
       }
       pending_.assign(data, data + length);
       has_pending_ = true;
+      latest_jpeg_.assign(data, data + length);
     }
     wake_decoder_.notify_one();
   }
@@ -251,6 +272,8 @@ class FramePresenter {
         continue;
       }
       decode_ms_total_ += decode_ms;
+      decoded_width_ = frame.pixels.width;
+      decoded_height_ = frame.pixels.height;
       if (has_decoded_) {
         ReleaseFrame(&decoded_);
         dropped_++;
@@ -265,6 +288,7 @@ class FramePresenter {
     for (;;) {
       DecodedFrame frame;
       std::shared_ptr<PreviewWindow> window;
+      std::shared_ptr<VideoRecorder> recorder;
       uint64_t sequence = 0;
       {
         std::unique_lock<std::mutex> lock(mutex_);
@@ -277,9 +301,13 @@ class FramePresenter {
         has_decoded_ = false;
         sequence = NextFrameSequence();
         window = window_;
+        recorder = recorder_;
       }
       const int64_t started_us = NowMicros();
       const int32_t result = window != nullptr ? WriteFrame(window.get(), sequence, frame.pixels) : 0;
+      if (recorder != nullptr) {
+        recorder->WriteFrame(frame.pixels);
+      }
       const bool was_yuv = frame.pixels.yuv;
       ReleaseFrame(&frame);
       const int64_t now_us = NowMicros();
@@ -327,9 +355,13 @@ class FramePresenter {
   bool started_ = false;
   bool stopping_ = false;
   std::shared_ptr<PreviewWindow> window_;
+  std::shared_ptr<VideoRecorder> recorder_;
   // Compressed frame waiting for the decoder.
   std::vector<uint8_t> pending_;
   bool has_pending_ = false;
+  std::vector<uint8_t> latest_jpeg_;
+  int32_t decoded_width_ = 0;
+  int32_t decoded_height_ = 0;
   // Decoded frame waiting for the drawer.
   DecodedFrame decoded_;
   bool has_decoded_ = false;
@@ -644,9 +676,52 @@ class StreamSession {
   void SetWindow(std::shared_ptr<PreviewWindow> window) { presenter_.SetWindow(std::move(window)); }
 
   void Stop() {
+    StopRecording();
     stream_.Stop();
     presenter_.Stop();
   }
+
+  std::vector<uint8_t> LatestJpeg() { return presenter_.LatestJpeg(); }
+
+  // Starts recording the decoded frames to `path`. Needs a decoded frame
+  // first, so the size is known. Returns 0 or a negative error code.
+  int32_t StartRecording(const std::string &path, int32_t fps, int64_t bitrate) {
+    if (recorder_ != nullptr) {
+      return kErrorRecorderBusy;
+    }
+    int32_t width = 0;
+    int32_t height = 0;
+    presenter_.DecodedSize(&width, &height);
+    if (width <= 0 || height <= 0) {
+      return kErrorRecorderNoFrames;
+    }
+    StreamStats stats = Stats();
+    if (!stats.yuv) {
+      // The encoder takes NV12; the RGBA fallback has nothing to feed it.
+      return kErrorRecorderFormat;
+    }
+    auto recorder = std::make_shared<VideoRecorder>();
+    const int32_t ret = recorder->Start(path, width, height, fps, bitrate);
+    if (ret != 0) {
+      return ret;
+    }
+    recorder_ = recorder;
+    presenter_.SetRecorder(recorder);
+    return 0;
+  }
+
+  // Returns the number of frames in the file, or a negative error code.
+  int64_t StopRecording() {
+    std::shared_ptr<VideoRecorder> recorder = recorder_;
+    recorder_ = nullptr;
+    if (recorder == nullptr) {
+      return kErrorRecorderNoFrames;
+    }
+    presenter_.SetRecorder(nullptr);
+    return recorder->Stop();
+  }
+
+  bool IsRecording() const { return recorder_ != nullptr; }
 
   StreamStats Stats() {
     StreamStats stats;
@@ -658,6 +733,7 @@ class StreamSession {
  private:
   FramePresenter presenter_;
   IsoStream stream_;
+  std::shared_ptr<VideoRecorder> recorder_;
 };
 
 }  // namespace flutter_ffi_uvc

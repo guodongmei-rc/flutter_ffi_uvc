@@ -1,0 +1,350 @@
+// Records the preview as an MP4 file: NV12 frames go into the input surface of
+// the system's H.264 encoder, and its output is written by the system muxer.
+//
+// Video only so far. The camera's USB microphone (UAC) would need its own
+// isochronous stream and an AAC encoder, as the Android side has.
+
+#ifndef FLUTTER_FFI_UVC_RECORDER_H_
+#define FLUTTER_FFI_UVC_RECORDER_H_
+
+#include <cerrno>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstring>
+#include <fcntl.h>
+#include <mutex>
+#include <poll.h>
+#include <string>
+#include <unistd.h>
+
+#include <hilog/log.h>
+#include <multimedia/player_framework/native_avbuffer.h>
+#include <multimedia/player_framework/native_avcodec_base.h>
+#include <multimedia/player_framework/native_avcodec_videoencoder.h>
+#include <multimedia/player_framework/native_avformat.h>
+#include <multimedia/player_framework/native_avmuxer.h>
+#include <native_window/external_window.h>
+
+#include "uvc_surface.h"
+
+namespace flutter_ffi_uvc {
+
+inline constexpr int32_t kErrorRecorderBusy = -20;
+inline constexpr int32_t kErrorRecorderEncoder = -21;
+inline constexpr int32_t kErrorRecorderMuxer = -22;
+inline constexpr int32_t kErrorRecorderFile = -23;
+inline constexpr int32_t kErrorRecorderNoFrames = -24;
+inline constexpr int32_t kErrorRecorderFormat = -25;
+
+class VideoRecorder {
+ public:
+  ~VideoRecorder() { Stop(); }
+
+  // Opens `path` for writing and starts an H.264 encoder for `width` x
+  // `height` frames at `fps`. Returns 0 or a negative error code.
+  int32_t Start(const std::string &path, int32_t width, int32_t height, int32_t fps, int64_t bitrate) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (encoder_ != nullptr) {
+      return kErrorRecorderBusy;
+    }
+    fd_ = open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd_ < 0) {
+      return kErrorRecorderFile;
+    }
+    path_ = path;
+    width_ = width;
+    height_ = height;
+    encoder_ = OH_VideoEncoder_CreateByMime(OH_AVCODEC_MIMETYPE_VIDEO_AVC);
+    if (encoder_ == nullptr) {
+      Release();
+      return kErrorRecorderEncoder;
+    }
+    OH_AVCodecCallback callback = {OnError, OnStreamChanged, OnNeedInputBuffer, OnNewOutputBuffer};
+    if (OH_VideoEncoder_RegisterCallback(encoder_, callback, this) != AV_ERR_OK) {
+      Release();
+      return kErrorRecorderEncoder;
+    }
+    OH_AVFormat *format = OH_AVFormat_Create();
+    OH_AVFormat_SetIntValue(format, OH_MD_KEY_WIDTH, width);
+    OH_AVFormat_SetIntValue(format, OH_MD_KEY_HEIGHT, height);
+    OH_AVFormat_SetIntValue(format, OH_MD_KEY_PIXEL_FORMAT, AV_PIXEL_FORMAT_NV12);
+    OH_AVFormat_SetDoubleValue(format, OH_MD_KEY_FRAME_RATE, static_cast<double>(fps));
+    OH_AVFormat_SetLongValue(format, OH_MD_KEY_BITRATE, bitrate);
+    OH_AVFormat_SetIntValue(format, OH_MD_KEY_I_FRAME_INTERVAL, 1000);
+    const bool configured = OH_VideoEncoder_Configure(encoder_, format) == AV_ERR_OK;
+    OH_AVFormat_Destroy(format);
+    if (!configured || OH_VideoEncoder_GetSurface(encoder_, &input_) != AV_ERR_OK || input_ == nullptr ||
+        OH_VideoEncoder_Prepare(encoder_) != AV_ERR_OK) {
+      Release();
+      return kErrorRecorderEncoder;
+    }
+    // The producer side of the encoder's surface starts without a buffer
+    // configuration; requesting a buffer before setting one fails.
+    OH_NativeWindow_NativeWindowHandleOpt(input_, SET_FORMAT, NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP);
+    OH_NativeWindow_NativeWindowHandleOpt(
+        input_, SET_USAGE,
+        static_cast<uint64_t>(NATIVEBUFFER_USAGE_CPU_READ | NATIVEBUFFER_USAGE_CPU_WRITE | NATIVEBUFFER_USAGE_MEM_DMA));
+    OH_NativeWindow_NativeWindowHandleOpt(input_, SET_BUFFER_GEOMETRY, width, height);
+
+    muxer_ = OH_AVMuxer_Create(fd_, AV_OUTPUT_FORMAT_MPEG_4);
+    if (muxer_ == nullptr) {
+      Release();
+      return kErrorRecorderMuxer;
+    }
+    OH_AVFormat *track = OH_AVFormat_CreateVideoFormat(OH_AVCODEC_MIMETYPE_VIDEO_AVC, width, height);
+    OH_AVFormat_SetDoubleValue(track, OH_MD_KEY_FRAME_RATE, static_cast<double>(fps));
+    const bool track_added = OH_AVMuxer_AddTrack(muxer_, &track_, track) == AV_ERR_OK;
+    OH_AVFormat_Destroy(track);
+    if (!track_added || OH_AVMuxer_Start(muxer_) != AV_ERR_OK) {
+      Release();
+      return kErrorRecorderMuxer;
+    }
+    if (OH_VideoEncoder_Start(encoder_) != AV_ERR_OK) {
+      Release();
+      return kErrorRecorderEncoder;
+    }
+    started_at_us_ = NowMicros();
+    frames_in_ = 0;
+    frames_out_ = 0;
+    rejected_ = 0;
+    eos_seen_ = false;
+    failed_ = false;
+    error_code_ = 0;
+    return 0;
+  }
+
+  bool IsRecording() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return encoder_ != nullptr;
+  }
+
+  // Feeds one frame. Only NV12 of the configured size is accepted; anything
+  // else is counted and skipped. Called from the presenter's draw thread.
+  void WriteFrame(const FramePixels &pixels) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (encoder_ == nullptr || input_ == nullptr || failed_) {
+      return;
+    }
+    if (!pixels.yuv || pixels.width != width_ || pixels.height != height_) {
+      if (rejected_ == 0) {
+        OH_LOG_WARN(LOG_APP, "recorder skips frames: yuv=%{public}d %{public}dx%{public}d, expected %{public}dx%{public}d",
+                    pixels.yuv ? 1 : 0, pixels.width, pixels.height, width_, height_);
+      }
+      rejected_++;
+      return;
+    }
+    OHNativeWindow *input = input_;
+    const int64_t started_at_us = started_at_us_;
+    writers_++;
+    // The copy takes milliseconds; the encoder's callbacks must not wait for it.
+    lock.unlock();
+    const bool written = CopyInto(input, pixels, started_at_us);
+    lock.lock();
+    writers_--;
+    if (written) {
+      frames_in_++;
+    } else {
+      rejected_++;
+    }
+    writers_idle_.notify_all();
+  }
+
+  // Finishes the file. Returns the number of encoded frames, or a negative
+  // error code when nothing usable was written.
+  int64_t Stop() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (encoder_ == nullptr) {
+      return kErrorRecorderNoFrames;
+    }
+    writers_idle_.wait(lock, [this] { return writers_ == 0; });
+    if (frames_in_ > 0 && !failed_) {
+      OH_VideoEncoder_NotifyEndOfStream(encoder_);
+      // Lets the encoder deliver what it still holds before the muxer closes.
+      eos_.wait_for(lock, std::chrono::milliseconds(kDrainTimeoutMs), [this] { return eos_seen_ || failed_; });
+    }
+    const int64_t written = frames_out_;
+    const bool failed = failed_;
+    OH_LOG_WARN(LOG_APP,
+                "recording stopped: frames in=%{public}lld out=%{public}lld rejected=%{public}lld failed=%{public}d "
+                "eos=%{public}d error=%{public}d",
+                static_cast<long long>(frames_in_), static_cast<long long>(frames_out_),
+                static_cast<long long>(rejected_), failed_ ? 1 : 0, eos_seen_ ? 1 : 0, error_code_);
+    OH_AVCodec *encoder = encoder_;
+    OH_AVMuxer *muxer = muxer_;
+    const int fd = fd_;
+    encoder_ = nullptr;
+    input_ = nullptr;
+    muxer_ = nullptr;
+    track_ = -1;
+    fd_ = -1;
+    // Stopping the encoder waits for its callbacks, which take the mutex.
+    lock.unlock();
+    Teardown(encoder, muxer, fd);
+    if (failed || written == 0) {
+      // Nothing playable was written; do not leave an empty file behind.
+      unlink(path_.c_str());
+    }
+    if (failed) {
+      return kErrorRecorderEncoder;
+    }
+    return written > 0 ? written : kErrorRecorderNoFrames;
+  }
+
+  int64_t frames_in() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return frames_in_;
+  }
+
+ private:
+  static constexpr int kDrainTimeoutMs = 1500;
+
+  // Copies one NV12 frame into a buffer of the encoder's input surface and
+  // queues it, stamped with the time since the recording started.
+  bool CopyInto(OHNativeWindow *input, const FramePixels &pixels, int64_t started_at_us) {
+    OHNativeWindowBuffer *buffer = nullptr;
+    int fence_fd = -1;
+    const int32_t requested = OH_NativeWindow_NativeWindowRequestBuffer(input, &buffer, &fence_fd);
+    if (requested != 0 || buffer == nullptr) {
+      if (!logged_failure_) {
+        logged_failure_ = true;
+        OH_LOG_WARN(LOG_APP, "encoder surface gave no buffer: %{public}d", requested);
+      }
+      return false;
+    }
+    if (fence_fd >= 0) {
+      struct pollfd wait = {fence_fd, POLLIN, 0};
+      poll(&wait, 1, kFenceTimeoutMs);
+      close(fence_fd);
+    }
+    BufferHandle *handle = OH_NativeWindow_GetBufferHandleFromNative(buffer);
+    OH_NativeBuffer *target_buffer = nullptr;
+    YuvLayout target;
+    const int32_t converted = OH_NativeBuffer_FromNativeWindowBuffer(buffer, &target_buffer);
+    if (handle == nullptr || handle->fd < 0 || converted != 0 || !MapYuvLayout(target_buffer, &target) ||
+        target.luma_stride < static_cast<size_t>(width_) || target.chroma_stride < static_cast<size_t>(width_)) {
+      if (!logged_failure_) {
+        logged_failure_ = true;
+        OH_LOG_WARN(LOG_APP,
+                    "encoder buffer unusable: handle=%{public}d fd=%{public}d format=%{public}d %{public}dx%{public}d "
+                    "stride=%{public}d converted=%{public}d strides=%{public}zu/%{public}zu",
+                    handle != nullptr ? 1 : 0, handle != nullptr ? handle->fd : -1, handle != nullptr ? handle->format : -1,
+                    handle != nullptr ? handle->width : -1, handle != nullptr ? handle->height : -1,
+                    handle != nullptr ? handle->stride : -1, converted, target.luma_stride, target.chroma_stride);
+      }
+      OH_NativeWindow_NativeWindowAbortBuffer(input, buffer);
+      return false;
+    }
+    SyncBuffer(handle->fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
+    const size_t row_bytes = static_cast<size_t>(width_);
+    for (int32_t y = 0; y < height_; y++) {
+      memcpy(target.luma + static_cast<size_t>(y) * target.luma_stride,
+             pixels.plane0 + static_cast<size_t>(y) * pixels.stride0, row_bytes);
+    }
+    for (int32_t y = 0; y < height_ / 2; y++) {
+      memcpy(target.chroma + static_cast<size_t>(y) * target.chroma_stride,
+             pixels.plane1 + static_cast<size_t>(y) * pixels.stride1, row_bytes);
+    }
+    SyncBuffer(handle->fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+    // The encoder takes the presentation time from the buffer. Despite the
+    // option's documentation this value is read as microseconds: nanoseconds
+    // produced files a thousand times too long.
+    const uint64_t timestamp_us = static_cast<uint64_t>(NowMicros() - started_at_us);
+    OH_NativeWindow_NativeWindowHandleOpt(input, SET_UI_TIMESTAMP, timestamp_us);
+    Region region = {nullptr, 0};
+    return OH_NativeWindow_NativeWindowFlushBuffer(input, buffer, -1, region) == 0;
+  }
+
+  static void Teardown(OH_AVCodec *encoder, OH_AVMuxer *muxer, int fd) {
+    if (encoder != nullptr) {
+      OH_VideoEncoder_Stop(encoder);
+      OH_VideoEncoder_Destroy(encoder);
+    }
+    if (muxer != nullptr) {
+      OH_AVMuxer_Stop(muxer);
+      OH_AVMuxer_Destroy(muxer);
+    }
+    if (fd >= 0) {
+      close(fd);
+    }
+  }
+
+  // Must hold mutex_. Tears down a recorder that failed while starting.
+  void Release() {
+    OH_AVCodec *encoder = encoder_;
+    OH_AVMuxer *muxer = muxer_;
+    const int fd = fd_;
+    encoder_ = nullptr;
+    input_ = nullptr;
+    muxer_ = nullptr;
+    track_ = -1;
+    fd_ = -1;
+    Teardown(encoder, muxer, fd);
+    if (!path_.empty()) {
+      unlink(path_.c_str());
+    }
+  }
+
+  static void OnError(OH_AVCodec *codec, int32_t error_code, void *user_data) {
+    auto *self = static_cast<VideoRecorder *>(user_data);
+    std::lock_guard<std::mutex> lock(self->mutex_);
+    self->failed_ = true;
+    self->error_code_ = error_code;
+    self->eos_.notify_all();
+  }
+
+  static void OnStreamChanged(OH_AVCodec *codec, OH_AVFormat *format, void *user_data) {}
+
+  static void OnNeedInputBuffer(OH_AVCodec *codec, uint32_t index, OH_AVBuffer *buffer, void *user_data) {
+    // Surface input: never called.
+  }
+
+  static void OnNewOutputBuffer(OH_AVCodec *codec, uint32_t index, OH_AVBuffer *buffer, void *user_data) {
+    auto *self = static_cast<VideoRecorder *>(user_data);
+    std::lock_guard<std::mutex> lock(self->mutex_);
+    OH_AVCodecBufferAttr attr = {};
+    OH_AVBuffer_GetBufferAttr(buffer, &attr);
+    if (self->muxer_ != nullptr && self->track_ >= 0 && attr.size > 0) {
+      const OH_AVErrCode wrote = OH_AVMuxer_WriteSampleBuffer(self->muxer_, static_cast<uint32_t>(self->track_), buffer);
+      if (wrote == AV_ERR_OK && (attr.flags & AVCODEC_BUFFER_FLAGS_CODEC_DATA) == 0) {
+        self->frames_out_++;
+      } else if (wrote != AV_ERR_OK && self->error_code_ == 0) {
+        self->error_code_ = 1000 + static_cast<int32_t>(wrote);
+        OH_LOG_WARN(LOG_APP, "muxer rejected a sample: %{public}d (size %{public}d flags %{public}u pts %{public}lld)",
+                    static_cast<int>(wrote), attr.size, attr.flags, static_cast<long long>(attr.pts));
+      }
+    }
+    if (self->encoder_ != nullptr) {
+      OH_VideoEncoder_FreeOutputBuffer(self->encoder_, index);
+    }
+    if ((attr.flags & AVCODEC_BUFFER_FLAGS_EOS) != 0) {
+      self->eos_seen_ = true;
+      self->eos_.notify_all();
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable eos_;
+  OH_AVCodec *encoder_ = nullptr;
+  OHNativeWindow *input_ = nullptr;
+  OH_AVMuxer *muxer_ = nullptr;
+  int32_t track_ = -1;
+  int fd_ = -1;
+  std::string path_;
+  int32_t width_ = 0;
+  int32_t height_ = 0;
+  int64_t started_at_us_ = 0;
+  int64_t frames_in_ = 0;
+  int64_t frames_out_ = 0;
+  int64_t rejected_ = 0;
+  bool eos_seen_ = false;
+  bool failed_ = false;
+  int32_t error_code_ = 0;
+  int writers_ = 0;
+  std::condition_variable writers_idle_;
+  bool logged_failure_ = false;
+};
+
+}  // namespace flutter_ffi_uvc
+
+#endif  // FLUTTER_FFI_UVC_RECORDER_H_

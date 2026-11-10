@@ -406,14 +406,29 @@ class _UvcPreviewPageState extends State<UvcPreviewPage>
       return;
     }
 
+    // The device may have committed to a different frame rate than asked
+    // (UVC lets it rewrite the PROBE values). Show the mode that is really
+    // streaming; the dropdown can only display modes from its own list, so
+    // keep the requested one if the negotiated rate is not listed.
+    final UvcCameraMode streaming = probeResult.mode;
+    final bool honoured = streaming == mode;
+    final UvcCameraMode shown =
+        !honoured && _cameraModes.contains(streaming) ? streaming : mode;
     setState(() {
-      _selectedMode = mode;
+      _selectedMode = shown;
       _openingDevice = false;
       _previewFrozen = false;
       _manualFocusControlsVisible = false;
-      _status = 'Preview running: ${mode.label} / Texture';
+      _status = honoured
+          ? 'Preview running: ${mode.label} / Texture'
+          : 'Preview running: ${streaming.label} / Texture '
+              '(device refused ${mode.fps}fps)';
     });
-    _log('Preview mode changed: ${mode.label} / Texture');
+    _log(
+      honoured
+          ? 'Preview mode changed: ${mode.label} / Texture'
+          : 'Preview mode changed: requested ${mode.label}, device streams ${streaming.label} / Texture',
+    );
   }
 
   /// Candidate order for the initial open: 1920x1080 at the highest frame

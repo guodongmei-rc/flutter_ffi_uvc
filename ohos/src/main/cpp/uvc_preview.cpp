@@ -1,6 +1,7 @@
 // N-API surface of the HarmonyOS native code. The work itself is in the
 // headers: uvc_stream.h (USB transfers, frame hand-off), uvc_frame_assembler.h
-// (payloads to frames) and uvc_surface.h (JPEG decode and drawing).
+// (payloads to frames), uvc_surface.h (JPEG decode and drawing) and
+// uvc_recorder.h (MP4 recording).
 //
 // Every function here is called from the ArkTS thread that owns the camera
 // session. Streams and windows are referred to by small integer ids rather
@@ -9,6 +10,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -299,6 +301,58 @@ napi_value StreamStatsOf(napi_env env, napi_callback_info info) {
   return result;
 }
 
+// streamLatestJpeg(stream): ArrayBuffer | undefined — the last complete frame as the camera sent it.
+napi_value StreamLatestJpeg(napi_env env, napi_callback_info info) {
+  const Arguments arguments = GetArguments(env, info);
+  int64_t stream_id = 0;
+  std::shared_ptr<StreamSession> session = GetInt(env, arguments, 0, &stream_id) ? FindStream(stream_id) : nullptr;
+  if (session == nullptr) {
+    return Undefined(env);
+  }
+  const std::vector<uint8_t> jpeg = session->LatestJpeg();
+  if (jpeg.empty()) {
+    return Undefined(env);
+  }
+  void *data = nullptr;
+  napi_value result = nullptr;
+  if (napi_create_arraybuffer(env, jpeg.size(), &data, &result) != napi_ok || data == nullptr) {
+    return Undefined(env);
+  }
+  memcpy(data, jpeg.data(), jpeg.size());
+  return result;
+}
+
+// recordStart(stream, path, fps, bitRate): number — 0 or a negative error code.
+napi_value RecordStart(napi_env env, napi_callback_info info) {
+  const Arguments arguments = GetArguments(env, info);
+  int64_t stream_id = 0;
+  int64_t fps = 0;
+  int64_t bitrate = 0;
+  char path[1024] = {0};
+  size_t length = 0;
+  if (!GetInt(env, arguments, 0, &stream_id) || arguments.count < 4 ||
+      napi_get_value_string_utf8(env, arguments.values[1], path, sizeof(path), &length) != napi_ok || length == 0 ||
+      !GetInt(env, arguments, 2, &fps) || !GetInt(env, arguments, 3, &bitrate) || fps <= 0 || bitrate <= 0) {
+    return Number(env, -EINVAL);
+  }
+  std::shared_ptr<StreamSession> session = FindStream(stream_id);
+  if (session == nullptr) {
+    return Number(env, flutter_ffi_uvc::kErrorRecorderNoFrames);
+  }
+  return Number(env, session->StartRecording(path, static_cast<int32_t>(fps), bitrate));
+}
+
+// recordStop(stream): number — frames written, or a negative error code.
+napi_value RecordStop(napi_env env, napi_callback_info info) {
+  const Arguments arguments = GetArguments(env, info);
+  int64_t stream_id = 0;
+  std::shared_ptr<StreamSession> session = GetInt(env, arguments, 0, &stream_id) ? FindStream(stream_id) : nullptr;
+  if (session == nullptr) {
+    return Number(env, flutter_ffi_uvc::kErrorRecorderNoFrames);
+  }
+  return Number(env, static_cast<double>(session->StopRecording()));
+}
+
 napi_value Init(napi_env env, napi_value exports) {
   napi_property_descriptor descriptors[] = {
       {"createWindow", nullptr, CreateWindow, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -312,6 +366,9 @@ napi_value Init(napi_env env, napi_value exports) {
       {"streamSetWindow", nullptr, StreamSetWindow, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"streamStop", nullptr, StreamStop, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"streamStats", nullptr, StreamStatsOf, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"streamLatestJpeg", nullptr, StreamLatestJpeg, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"recordStart", nullptr, RecordStart, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"recordStop", nullptr, RecordStop, nullptr, nullptr, nullptr, napi_default, nullptr},
   };
   napi_define_properties(env, exports, sizeof(descriptors) / sizeof(descriptors[0]), descriptors);
   return exports;

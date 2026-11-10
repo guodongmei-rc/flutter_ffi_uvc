@@ -7,11 +7,11 @@
         "material": {
           "certpath": "/Users/gdm/.ohos/config/default_ohos_7bYu4UBs5fvdTl7f83iqI-3dtxJl2YDmYKrEH9z63sE=.cer",
           "keyAlias": "debugKey",
-          "keyPassword": "0000001AA94C7021D402335FFA7B9999FD0B3C490AD7D680CCD648A3EDE89CBFDA8EFBAE035C86F7F0F7",
+          "keyPassword": "0000001B99A39F60B737FE1D8C036F59609835E0AA6DADE7A252EF8B1AEDE866D426DA50E7241796E937F8",
           "profile": "/Users/gdm/.ohos/config/default_ohos_7bYu4UBs5fvdTl7f83iqI-3dtxJl2YDmYKrEH9z63sE=.p7b",
           "signAlg": "SHA256withECDSA",
           "storeFile": "/Users/gdm/.ohos/config/default_ohos_7bYu4UBs5fvdTl7f83iqI-3dtxJl2YDmYKrEH9z63sE=.p12",
-          "storePassword": "0000001A9FB31FD7BB65BDE322DC0A28CE2798613F622EBBEF13F3E93E8F01FC80A54221712D023CECE3"
+          "storePassword": "0000001B9FCC66B1DC1713D4BB393700B6BBD50EDF503FADD296606F165AFDA8E74F208DA3369AF39E5589"
         }
       }
     ],

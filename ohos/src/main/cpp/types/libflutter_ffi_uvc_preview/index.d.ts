@@ -66,3 +66,17 @@ export const streamStop: (stream: number) => void;
  * [33] 1 when frames are decoded to NV12, 0 for RGBA
  */
 export const streamStats: (stream: number) => number[];
+
+/** The last complete frame of a stream as the camera sent it (JPEG), or undefined before the first. */
+export const streamLatestJpeg: (stream: number) => ArrayBuffer | undefined;
+
+/**
+ * Starts recording the stream's decoded frames to an MP4 file at `path`
+ * (H.264, no audio). Needs at least one decoded frame first. Returns 0 or a
+ * negative error code: -20 already recording, -21 encoder, -22 muxer,
+ * -23 file, -24 no frames yet, -25 frames are not NV12.
+ */
+export const recordStart: (stream: number, path: string, fps: number, bitRate: number) => number;
+
+/** Finishes the recording. Returns the number of frames written, or a negative error code. */
+export const recordStop: (stream: number) => number;

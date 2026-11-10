@@ -14,6 +14,7 @@
 // over isochronous endpoints is handled so far.
 
 import { usbManager, BusinessError } from '@kit.BasicServicesKit';
+import { fileIo } from '@kit.CoreFileKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import native from 'libflutter_ffi_uvc_preview.so';
 import {
@@ -119,6 +120,12 @@ export interface UvcPreviewOutcome {
   elapsedMs: number;
   lastError: string;
   nativeErrorCode: number;
+  /**
+   * Frame rate the device committed to, which may differ from the one
+   * requested: UVC lets the device rewrite the PROBE values and we commit
+   * what it answered. 0 when nothing was negotiated.
+   */
+  negotiatedFps: number;
 }
 
 export interface UvcSessionStats {
@@ -153,9 +160,21 @@ function errorText(e: Object): string {
   return `code=${err.code} message=${err.message}`;
 }
 
-/** Describes a negative errno value returned by the native USB requests. */
+/** Describes a negative error code returned by the native side. */
 function errnoText(result: number): string {
   switch (-result) {
+    case 20:
+      return 'a recording is already running';
+    case 21:
+      return 'the video encoder failed';
+    case 22:
+      return 'the MP4 muxer failed';
+    case 23:
+      return 'the output file could not be created';
+    case 24:
+      return 'no frame has been decoded yet';
+    case 25:
+      return 'the decoded frames are not NV12, which the encoder needs';
     case 12:
       return 'out of USB transfer memory (ENOMEM)';
     case 13:
@@ -222,6 +241,20 @@ function fpsOf(mode: UvcMode): number {
   return mode.interval > 0 ? Math.round(10000000 / mode.interval) : 0;
 }
 
+/** File name for a capture, from the current time: UVC_20261110_093012_345. */
+function captureName(): string {
+  const now = new Date();
+  const pad = (value: number, width: number): string => value.toString().padStart(width, '0');
+  return `UVC_${now.getFullYear()}${pad(now.getMonth() + 1, 2)}${pad(now.getDate(), 2)}_` +
+    `${pad(now.getHours(), 2)}${pad(now.getMinutes(), 2)}${pad(now.getSeconds(), 2)}_${pad(now.getMilliseconds(), 3)}`;
+}
+
+function ensureDirectory(path: string): void {
+  if (!fileIo.accessSync(path)) {
+    fileIo.mkdirSync(path, true);
+  }
+}
+
 function emptyStats(): number[] {
   const stats: number[] = [];
   for (let i = 0; i < STAT_COUNT; i++) {
@@ -246,6 +279,12 @@ export class UvcCameraSession {
   /** Native stream id; 0 while nothing is streaming. */
   private streamId: number = 0;
   private window: bigint = NO_WINDOW;
+  /** Mode of the running preview, for the recording's frame rate. */
+  private previewMode: UvcMode | null = null;
+  /** dwFrameInterval the device committed to for the current/last preview. */
+  private negotiatedInterval: number = 0;
+  /** Path of the MP4 being recorded; '' when not recording. */
+  private recordingPath: string = '';
 
   /** Bumped whenever the preview is started, stopped or the device is closed. */
   private epoch: number = 0;
@@ -498,10 +537,12 @@ export class UvcCameraSession {
     }
     this.stream = stream;
 
+    this.negotiatedInterval = 0;
     const ctrl = this.negotiate(fd, info, stream, mode);
     if (ctrl === null) {
       return this.outcome(false, startedAt, UVC_ERROR_IO, this.errorMessage);
     }
+    this.negotiatedInterval = ctrl.dwFrameInterval;
     const alt = selectAltSetting(stream.altSettings, ctrl.dwMaxPayloadTransferSize);
     if (alt === null) {
       return this.outcome(false, startedAt, UVC_ERROR_NOT_SUPPORTED,
@@ -522,6 +563,7 @@ export class UvcCameraSession {
       return this.outcome(false, startedAt, UVC_ERROR_IO, `starting the stream failed: ${errnoText(streamId)}`);
     }
     this.streamId = streamId;
+    this.previewMode = mode;
     this.previewing = true;
     hilog.info(DOMAIN, TAG, 'streaming on alt %{public}d (%{public}d bytes per packet)',
       alt.alternateSetting, alt.bytesPerPacket);
@@ -553,6 +595,9 @@ export class UvcCameraSession {
 
   stopPreview(): void {
     this.epoch++;
+    if (this.isRecording()) {
+      this.stopRecording();
+    }
     if (this.streamId > 0) {
       this.lastStats = this.readStats();
       native.streamStop(this.streamId);
@@ -561,6 +606,100 @@ export class UvcCameraSession {
     }
     this.idleStream();
     this.previewing = false;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Capture
+  // ---------------------------------------------------------------------------
+
+  /** True while an MP4 is being recorded. */
+  isRecording(): boolean {
+    return this.recordingPath.length > 0;
+  }
+
+  /**
+   * Saves the latest camera frame, as the camera sent it, as a JPEG file in
+   * `directory`. Returns the path, or '' with lastError() set.
+   */
+  takePicture(directory: string): string {
+    if (this.streamId <= 0) {
+      this.errorMessage = 'no preview is running';
+      return '';
+    }
+    const jpeg = native.streamLatestJpeg(this.streamId);
+    if (jpeg === undefined) {
+      this.errorMessage = 'no frame has been received yet';
+      return '';
+    }
+    const path = `${directory}/${captureName()}.jpg`;
+    try {
+      ensureDirectory(directory);
+      const file = fileIo.openSync(path, fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC | fileIo.OpenMode.WRITE_ONLY);
+      try {
+        fileIo.writeSync(file.fd, jpeg);
+      } finally {
+        fileIo.closeSync(file);
+      }
+    } catch (e) {
+      this.errorMessage = `writing ${path} failed: ${errorText(e)}`;
+      return '';
+    }
+    return path;
+  }
+
+  /**
+   * Starts recording the preview to an MP4 file in `directory`. Returns the
+   * path, or '' with lastError() set. `fps` 0 means the mode's frame rate.
+   */
+  startRecording(directory: string, fps: number, bitRate: number): string {
+    if (this.streamId <= 0 || this.previewMode === null) {
+      this.errorMessage = 'no preview is running';
+      return '';
+    }
+    if (this.isRecording()) {
+      this.errorMessage = 'a recording is already running';
+      return '';
+    }
+    // Default to the rate the device actually committed to, not the one the
+    // mode asked for; the camera may have rewritten it during PROBE.
+    const streamingFps = this.negotiatedInterval > 0
+      ? Math.round(10000000 / this.negotiatedInterval) : fpsOf(this.previewMode);
+    const frameRate = fps > 0 ? fps : streamingFps;
+    const mode = this.previewMode;
+    // About 0.1 bit per pixel per frame; roughly what phone cameras use.
+    const rate = bitRate > 0 ? bitRate : Math.max(2000000, Math.round(mode.width * mode.height * frameRate / 10));
+    const path = `${directory}/${captureName()}.mp4`;
+    try {
+      ensureDirectory(directory);
+    } catch (e) {
+      this.errorMessage = `creating ${directory} failed: ${errorText(e)}`;
+      return '';
+    }
+    const result = native.recordStart(this.streamId, path, frameRate, rate);
+    if (result < 0) {
+      this.errorMessage = `starting the recording failed: ${errnoText(result)}`;
+      return '';
+    }
+    this.recordingPath = path;
+    hilog.info(DOMAIN, TAG, 'recording to %{public}s at %{public}d fps, %{public}d bps', path, frameRate, rate);
+    return path;
+  }
+
+  /** Finishes the recording. Returns its path, or '' with lastError() set. */
+  stopRecording(): string {
+    const path = this.recordingPath;
+    this.recordingPath = '';
+    if (path.length === 0) {
+      this.errorMessage = 'no recording is running';
+      return '';
+    }
+    const frames = this.streamId > 0 ? native.recordStop(this.streamId) : -24;
+    if (frames < 0) {
+      this.errorMessage = `the recording failed: ${errnoText(frames)}`;
+      return '';
+    }
+    hilog.info(DOMAIN, TAG, 'recorded %{public}d frames to %{public}s', frames, path);
+    return path;
   }
 
   /**
@@ -613,7 +752,12 @@ export class UvcCameraSession {
       return null;
     }
     const ctrl = decodeStreamCtrl(answer, answered >= 26 ? answered : length);
-    hilog.info(DOMAIN, TAG, 'negotiated %{public}s', describeStreamCtrl(ctrl));
+    hilog.info(DOMAIN, TAG, 'requested fmt=%{public}d frame=%{public}d interval=%{public}d; negotiated %{public}s',
+      mode.formatIndex, mode.frameIndex, mode.interval, describeStreamCtrl(ctrl));
+    if (ctrl.dwFrameInterval !== mode.interval) {
+      hilog.warn(DOMAIN, TAG, 'device kept interval %{public}d instead of requested %{public}d (%{public}d fps)',
+        ctrl.dwFrameInterval, mode.interval, fpsOf(mode));
+    }
     if (ctrl.dwMaxPayloadTransferSize === 0) {
       this.errorMessage = 'the device reported dwMaxPayloadTransferSize=0';
       return null;
@@ -703,7 +847,8 @@ export class UvcCameraSession {
       errorCount: failures,
       elapsedMs: Date.now() - startedAt,
       lastError: message,
-      nativeErrorCode: code
+      nativeErrorCode: code,
+      negotiatedFps: this.negotiatedInterval > 0 ? Math.round(10000000 / this.negotiatedInterval) : 0
     };
     return result;
   }

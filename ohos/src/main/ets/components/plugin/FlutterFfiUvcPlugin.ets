@@ -2,7 +2,12 @@
 // usbManager-based camera session; see lib/src/ohos/ohos_uvc_camera.dart for
 // the Dart side of this channel.
 
+import { common } from '@kit.AbilityKit';
+import { fileIo } from '@kit.CoreFileKit';
+import { photoAccessHelper } from '@kit.MediaLibraryKit';
 import {
+  AbilityAware,
+  AbilityPluginBinding,
   Any,
   EventChannel,
   EventSink,
@@ -32,7 +37,7 @@ function numberArg(call: MethodCall, key: string, fallback: number): number {
 }
 
 /** FlutterFfiUvcPlugin **/
-export default class FlutterFfiUvcPlugin implements FlutterPlugin, MethodCallHandler, StreamHandler,
+export default class FlutterFfiUvcPlugin implements FlutterPlugin, AbilityAware, MethodCallHandler, StreamHandler,
 UvcSessionListener {
   private channel: MethodChannel | null = null;
   private eventChannel: EventChannel | null = null;
@@ -41,6 +46,10 @@ UvcSessionListener {
   private session: UvcCameraSession | null = null;
   private statsTimer: number = -1;
   private usbSubscriber: commonEventManager.CommonEventSubscriber | null = null;
+  /** Where photos and videos are written first: the app's own files directory. */
+  private captureDirectory: string = '';
+  /** Needed for the gallery's authorisation dialog; null while no ability is attached. */
+  private abilityContext: common.UIAbilityContext | null = null;
   private statsTicks: number = 0;
   /** Log transport and rendering counters once per second while previewing. */
   private verbose: boolean = false;
@@ -55,6 +64,7 @@ UvcSessionListener {
   }
 
   onAttachedToEngine(binding: FlutterPluginBinding): void {
+    this.captureDirectory = `${binding.getApplicationContext().filesDir}/DCIM`;
     const renderer = new UvcPreviewRenderer(binding.getTextureRegistry());
     this.renderer = renderer;
     this.session = new UvcCameraSession(this);
@@ -138,6 +148,16 @@ UvcSessionListener {
     }
   }
 
+  // AbilityAware ---------------------------------------------------------------
+
+  onAttachedToAbility(binding: AbilityPluginBinding): void {
+    this.abilityContext = binding.getAbility().context;
+  }
+
+  onDetachedFromAbility(): void {
+    this.abilityContext = null;
+  }
+
   // StreamHandler --------------------------------------------------------------
 
   onListen(args: Any, events: EventSink): void {
@@ -200,6 +220,34 @@ UvcSessionListener {
         this.emitStats();
         result.success(null);
         break;
+      case 'takePicture': {
+        const path = session.takePicture(this.captureDirectory);
+        if (path.length === 0) {
+          result.error('capture', session.lastError(), null);
+        } else {
+          this.publish(path, false, result);
+        }
+        break;
+      }
+      case 'startVideoRecording': {
+        const path = session.startRecording(
+          this.captureDirectory, numberArg(call, 'frameRate', 0), numberArg(call, 'bitRate', 0));
+        if (path.length === 0) {
+          result.error('capture', session.lastError(), null);
+        } else {
+          result.success(this.mediaToMap(path, null));
+        }
+        break;
+      }
+      case 'stopVideoRecording': {
+        const path = session.stopRecording();
+        if (path.length === 0) {
+          result.error('capture', session.lastError(), null);
+        } else {
+          this.publish(path, true, result);
+        }
+        break;
+      }
       case 'createPreviewTexture':
         try {
           result.success(renderer.createTexture());
@@ -269,6 +317,7 @@ UvcSessionListener {
       reply.set('elapsedMs', outcome.elapsedMs);
       reply.set('lastError', outcome.lastError);
       reply.set('nativeErrorCode', outcome.nativeErrorCode);
+      reply.set('negotiatedFps', outcome.negotiatedFps);
       result.success(reply);
     }).catch((error: Error): void => {
       this.stopStatsTimer();
@@ -352,6 +401,66 @@ UvcSessionListener {
       out.push(this.deviceToMap(devices[i]));
     }
     return out;
+  }
+
+  /**
+   * Moves a finished capture into the system gallery and answers with its
+   * URI. The gallery asks the user once and then allows saving for five
+   * minutes (ohos.permission.SHORT_TERM_WRITE_IMAGEVIDEO); when the user
+   * declines, or no ability is attached to show the dialog, the file stays
+   * in the app's directory and its path is returned instead.
+   */
+  private publish(path: string, isVideo: boolean, result: MethodResult): void {
+    this.saveToGallery(path, isVideo).then((uri: string): void => {
+      result.success(this.mediaToMap(uri.length > 0 ? null : path, uri.length > 0 ? uri : null));
+    }).catch((error: Error): void => {
+      hilog.warn(0x0001, 'FlutterFfiUvc', 'saving to the gallery failed: %{public}s', error.message);
+      result.success(this.mediaToMap(path, null));
+    });
+  }
+
+  private async saveToGallery(path: string, isVideo: boolean): Promise<string> {
+    const context = this.abilityContext;
+    if (context === null) {
+      return '';
+    }
+    const helper = photoAccessHelper.getPhotoAccessHelper(context);
+    const fileName = path.substring(path.lastIndexOf('/') + 1);
+    const config: photoAccessHelper.PhotoCreationConfig = {
+      title: fileName.substring(0, fileName.lastIndexOf('.')),
+      fileNameExtension: isVideo ? 'mp4' : 'jpg',
+      photoType: isVideo ? photoAccessHelper.PhotoType.VIDEO : photoAccessHelper.PhotoType.IMAGE,
+      subtype: photoAccessHelper.PhotoSubtype.DEFAULT
+    };
+    let uri = '';
+    try {
+      uri = await helper.createAssetWithShortTermPermission(config);
+    } catch (e) {
+      const error = e as BusinessError;
+      // 201: the user declined. Anything else is a real failure.
+      if (error.code !== 201) {
+        throw new Error(`createAssetWithShortTermPermission failed: code=${error.code} message=${error.message}`);
+      }
+      return '';
+    }
+    if (!uri) {
+      return '';
+    }
+    const target = fileIo.openSync(uri, fileIo.OpenMode.WRITE_ONLY);
+    try {
+      fileIo.copyFileSync(path, target.fd);
+    } finally {
+      fileIo.closeSync(target);
+    }
+    fileIo.unlinkSync(path);
+    return uri;
+  }
+
+  private mediaToMap(path: string | null, uri: string | null): Map<string, Any> {
+    const map: Map<string, Any> = new Map<string, Any>();
+    map.set('path', path);
+    map.set('uri', uri);
+    return map;
   }
 
   private deviceToMap(device: UvcDeviceSummary): Map<string, Any> {

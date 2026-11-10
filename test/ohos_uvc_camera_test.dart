@@ -149,6 +149,35 @@ void main() {
     expect(camera.isPreviewing, isTrue);
   });
 
+  test('the result reports the frame rate the device committed to', () async {
+    replies['startPreview'] = (_) => <String, Object?>{
+      'success': true,
+      'validFrameCount': 3,
+      'consecutiveValidFrames': 3,
+      'errorCount': 0,
+      'elapsedMs': 400,
+      'lastError': '',
+      'nativeErrorCode': 0,
+      'negotiatedFps': 60,
+    };
+    await camera.openUsbDevice(1003);
+    final UvcCameraMode listed = camera.supportedModes().single;
+    final UvcCameraMode requested = UvcCameraMode(
+      frameFormat: listed.frameFormat,
+      formatName: listed.formatName,
+      width: listed.width,
+      height: listed.height,
+      fps: 25,
+    );
+
+    final UvcPreviewStartResult result = await camera.startPreview(requested);
+
+    expect(result.success, isTrue);
+    expect(result.mode.fps, 60);
+    expect(result.mode.width, requested.width);
+    expect(result.mode.formatName, requested.formatName);
+  });
+
   test('a preview that fails verification is reported as not running', () async {
     replies['startPreview'] = (_) => <String, Object?>{
       'success': false,
@@ -356,23 +385,47 @@ void main() {
       UvcErrorCode.notSupported.nativeValue,
     );
     expect(camera.copyLatestFrame(), isNull);
-    expect(camera.isVideoRecording, isFalse);
     expect(await camera.queryAudioInterface(), isNull);
     expect(camera.openFd(3), UvcErrorCode.notSupported.nativeValue);
-    await expectLater(
-      camera.takePicture(),
-      throwsA(
-        isA<UvcException>().having(
-          (UvcException e) => e.code,
-          'code',
-          UvcErrorCode.notSupported,
-        ),
-      ),
-    );
-    await expectLater(
-      camera.startVideoRecording(),
-      throwsA(isA<UvcException>()),
-    );
+  });
+
+  test('photos and recordings are saved through the platform channel', () async {
+    replies['takePicture'] = (_) => <String, Object?>{
+      'path': '/data/app/files/DCIM/UVC_1.jpg',
+      'uri': null,
+    };
+    replies['startVideoRecording'] = (_) => <String, Object?>{
+      'path': '/data/app/files/DCIM/UVC_2.mp4',
+      'uri': null,
+    };
+    replies['stopVideoRecording'] = (_) => <String, Object?>{
+      'path': '/data/app/files/DCIM/UVC_2.mp4',
+      'uri': null,
+    };
+
+    final UvcGalleryMedia photo = await camera.takePicture();
+    expect(photo.path, '/data/app/files/DCIM/UVC_1.jpg');
+    expect(photo.uri, isNull);
+
+    expect(camera.isVideoRecording, isFalse);
+    await camera.startVideoRecording(bitRate: 8000000, frameRate: 30);
+    expect(camera.isVideoRecording, isTrue);
+    expect(calls.last.arguments, <String, Object?>{
+      'bitRate': 8000000,
+      'frameRate': 30,
+    });
+    final UvcGalleryMedia video = await camera.stopVideoRecording();
+    expect(camera.isVideoRecording, isFalse);
+    expect(video.path, '/data/app/files/DCIM/UVC_2.mp4');
+  });
+
+  test('a failed capture surfaces the platform error', () async {
+    messenger.setMockMethodCallHandler(_channel, (MethodCall call) async {
+      throw PlatformException(code: 'capture', message: 'no preview is running');
+    });
+
+    await expectLater(camera.takePicture(), throwsA(isA<PlatformException>()));
+    expect(camera.lastError, 'no preview is running');
   });
 
   test('debug logging is switched on from the debug level up', () async {

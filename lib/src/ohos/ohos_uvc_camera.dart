@@ -16,10 +16,12 @@ import '../uvc_camera_api.dart';
 /// statistics are refreshed by periodic events while a preview is running.
 ///
 /// Implemented so far: device listing, attach/detach events, open/close,
-/// MJPEG mode listing, and preview into a Flutter texture with frame
-/// verification. Camera controls, frame copies, photo and video capture,
-/// preview transforms and stall detection are not available yet and report
-/// [UvcErrorCode.notSupported] or an empty result.
+/// MJPEG mode listing, preview into a Flutter texture with frame
+/// verification, photos and video recording without audio (saved to the
+/// system gallery with the user's consent, else to the app's files
+/// directory). Camera controls, frame
+/// copies, preview transforms and stall detection are not available yet and
+/// report [UvcErrorCode.notSupported] or an empty result.
 class OhosUvcCamera implements UvcCamera {
   OhosUvcCamera();
 
@@ -40,6 +42,7 @@ class OhosUvcCamera implements UvcCamera {
 
   List<UvcCameraMode> _modes = const <UvcCameraMode>[];
   bool _previewing = false;
+  bool _recording = false;
   String _lastError = '';
   int _sequence = 0;
   UvcStreamStats _stats = const UvcStreamStats.zero();
@@ -106,14 +109,6 @@ class OhosUvcCamera implements UvcCamera {
     );
   }
 
-  static Never _unsupported(String feature) {
-    throw UvcException(
-      code: UvcErrorCode.notSupported,
-      nativeCode: UvcErrorCode.notSupported.nativeValue,
-      message: '$feature is not supported on HarmonyOS yet.',
-    );
-  }
-
   // ---------------------------------------------------------------------------
   // Devices
   // ---------------------------------------------------------------------------
@@ -136,8 +131,10 @@ class OhosUvcCamera implements UvcCamera {
   @override
   Future<bool> ensureCameraPermission() async => true;
 
+  /// The gallery asks for consent when a capture is saved (once, then for
+  /// five minutes), so there is nothing to request up front.
   @override
-  Future<bool> ensureGalleryPermission() async => false;
+  Future<bool> ensureGalleryPermission() async => true;
 
   @override
   Future<List<UvcUsbDevice>> listUsbDevices() async {
@@ -247,8 +244,22 @@ class OhosUvcCamera implements UvcCamera {
     if (!success) {
       _lastError = error;
     }
+    // UVC lets the device rewrite the requested frame interval during
+    // PROBE; report the rate it actually committed to so callers can show
+    // the mode that is streaming rather than the one they asked for.
+    final int negotiatedFps = _int(reply?['negotiatedFps']);
+    final UvcCameraMode streaming =
+        success && negotiatedFps > 0 && negotiatedFps != mode.fps
+            ? UvcCameraMode(
+                frameFormat: mode.frameFormat,
+                formatName: mode.formatName,
+                width: mode.width,
+                height: mode.height,
+                fps: negotiatedFps,
+              )
+            : mode;
     return UvcPreviewStartResult(
-      mode: mode,
+      mode: streaming,
       success: success,
       validFrameCount: _int(reply?['validFrameCount']),
       consecutiveValidFrames: _int(reply?['consecutiveValidFrames']),
@@ -393,23 +404,54 @@ class OhosUvcCamera implements UvcCamera {
   UvcPreviewFrame? copyLatestFrameTransformed(UvcPreviewTransform transform) =>
       null;
 
+  /// Saves the latest camera frame as it was sent (MJPEG, so [quality] is not
+  /// used). The gallery asks the user for consent the first time and then
+  /// allows saving for five minutes; the result carries the gallery URI. When
+  /// the user declines, the file stays in the app's files directory and the
+  /// result carries its path instead.
   @override
-  Future<UvcGalleryMedia> takePicture({int quality = 90}) async =>
-      _unsupported('takePicture');
+  Future<UvcGalleryMedia> takePicture({int quality = 90}) async {
+    return _capture('takePicture', const <String, Object?>{});
+  }
 
+  /// Records H.264 video without audio; [stopVideoRecording] saves it like
+  /// [takePicture] does. The camera microphone is not captured on HarmonyOS
+  /// yet, so [withAudio] has no effect.
   @override
   Future<void> startVideoRecording({
     int? bitRate,
     int? frameRate,
     bool withAudio = true,
-  }) async => _unsupported('startVideoRecording');
+  }) async {
+    await _capture('startVideoRecording', <String, Object?>{
+      'bitRate': bitRate ?? 0,
+      'frameRate': frameRate ?? 0,
+    });
+    _recording = true;
+  }
 
   @override
-  Future<UvcGalleryMedia> stopVideoRecording() async =>
-      _unsupported('stopVideoRecording');
+  Future<UvcGalleryMedia> stopVideoRecording() async {
+    _recording = false;
+    return _capture('stopVideoRecording', const <String, Object?>{});
+  }
 
   @override
-  bool get isVideoRecording => false;
+  bool get isVideoRecording => _recording;
+
+  Future<UvcGalleryMedia> _capture(
+    String method,
+    Map<String, Object?> arguments,
+  ) async {
+    try {
+      final Map<Object?, Object?>? reply = await _channel
+          .invokeMapMethod<Object?, Object?>(method, arguments);
+      return UvcGalleryMedia.fromMap(reply ?? const <Object?, Object?>{});
+    } on PlatformException catch (error) {
+      _lastError = error.message ?? error.code;
+      rethrow;
+    }
+  }
 
   @override
   Future<UvcAudioInfo?> queryAudioInterface() async => null;
