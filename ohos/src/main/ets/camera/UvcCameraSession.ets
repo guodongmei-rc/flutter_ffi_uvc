@@ -21,7 +21,9 @@ import {
   UvcDeviceInfo, UvcMode, UvcStreamInterface, UVC_KIND_MJPEG, UVC_KIND_FRAME_BASED, UVC_KIND_UNCOMPRESSED,
   parseUvcDescriptors, listModes, selectAltSetting, bulkEndpoint, describeInterfaces,
 } from '../uvc/UvcDescriptor';
-import { UacCaptureInfo, probeUacCapture, describeUacCapture } from '../uvc/UacDescriptor';
+import {
+  UacCaptureInfo, UacFeatureUnit, probeUacCapture, describeUacCapture, listUacFeatureUnits,
+} from '../uvc/UacDescriptor';
 import {
   UvcStreamCtrl, streamCtrlLength, encodeStreamCtrl, decodeStreamCtrl, describeStreamCtrl,
   UVC_SET_CUR, UVC_GET_CUR, UVC_REQ_TYPE_SET, UVC_REQ_TYPE_GET,
@@ -33,6 +35,16 @@ const TAG: string = 'FlutterFfiUvc';
 
 const USB_CLASS_VIDEO: number = 14;
 const CONTROL_TIMEOUT_MS: number = 1000;
+
+// USB Audio Class 1 requests used to set up the microphone.
+const UAC_SET_CUR: number = 0x01;
+const UAC_GET_CUR: number = 0x81;
+const UAC_GET_MAX: number = 0x83;
+const UAC_REQ_TYPE_SET_ENDPOINT: number = 0x22;
+const UAC_REQ_TYPE_GET_ENDPOINT: number = 0xa2;
+const UAC_CS_MUTE: number = 0x01;
+const UAC_CS_VOLUME: number = 0x02;
+const UAC_CS_SAMPLING_FREQ: number = 0x01;
 /** Frames are never allowed to grow past this, whatever the camera reports. */
 const MIN_FRAME_LIMIT_BYTES: number = 4 * 1024 * 1024;
 const VERIFY_POLL_MS: number = 20;
@@ -252,6 +264,10 @@ function errnoText(result: number): string {
       return 'no frame has been decoded yet';
     case 25:
       return 'the decoded frames are not NV12, which the encoder needs';
+    case 26:
+      return 'the AAC audio encoder failed';
+    case 27:
+      return 'the microphone stream could not be started';
     case 12:
       return 'out of USB transfer memory (ENOMEM)';
     case 13:
@@ -351,6 +367,9 @@ export class UvcCameraSession {
   private modes: UvcMode[] = [];
   /** UAC capture interface of the open device; null when it has no microphone. */
   private audio: UacCaptureInfo | null = null;
+  private featureUnits: UacFeatureUnit[] = [];
+  /** AudioStreaming interface claimed for the running recording, or -1. */
+  private audioInterfaceClaimed: number = -1;
   private claimedInterfaces: number[] = [];
 
   private stream: UvcStreamInterface | null = null;
@@ -508,6 +527,7 @@ export class UvcCameraSession {
     this.info = info;
     this.modes = usable;
     this.audio = probeUacCapture(raw);
+    this.featureUnits = listUacFeatureUnits(raw);
     if (this.audio !== null) {
       hilog.info(DOMAIN, TAG, 'uac capture: %{public}s', describeUacCapture(this.audio));
     } else {
@@ -595,6 +615,8 @@ export class UvcCameraSession {
     this.info = null;
     this.modes = [];
     this.audio = null;
+    this.featureUnits = [];
+    this.audioInterfaceClaimed = -1;
     this.stream = null;
   }
 
@@ -793,7 +815,7 @@ export class UvcCameraSession {
    * Starts recording the preview to an MP4 file in `directory`. Returns the
    * path, or '' with lastError() set. `fps` 0 means the mode's frame rate.
    */
-  startRecording(directory: string, fps: number, bitRate: number): string {
+  startRecording(directory: string, fps: number, bitRate: number, withAudio: boolean): string {
     if (this.streamId <= 0 || this.previewMode === null) {
       this.errorMessage = 'no preview is running';
       return '';
@@ -817,13 +839,28 @@ export class UvcCameraSession {
       this.errorMessage = `creating ${directory} failed: ${errorText(e)}`;
       return '';
     }
-    const result = native.recordStart(this.streamId, path, frameRate, rate);
+    let result = -1;
+    const audio = withAudio ? this.audio : null;
+    if (audio !== null && this.prepareMicrophone(audio)) {
+      result = native.recordStartWithAudio(this.streamId, path, frameRate, rate, this.fd, audio.endpointAddress,
+        audio.packetSize, audio.sampleRate, audio.channels, audio.bitsPerSample);
+      if (result < 0) {
+        // Same as Android: a microphone that will not stream makes the
+        // recording video-only rather than failing it.
+        hilog.warn(DOMAIN, TAG, 'microphone unusable (%{public}s); recording without audio', errnoText(result));
+        this.releaseMicrophone();
+      }
+    }
+    if (result < 0) {
+      result = native.recordStart(this.streamId, path, frameRate, rate);
+    }
     if (result < 0) {
       this.errorMessage = `starting the recording failed: ${errnoText(result)}`;
       return '';
     }
     this.recordingPath = path;
-    hilog.info(DOMAIN, TAG, 'recording to %{public}s at %{public}d fps, %{public}d bps', path, frameRate, rate);
+    hilog.info(DOMAIN, TAG, 'recording to %{public}s at %{public}d fps, %{public}d bps%{public}s', path, frameRate, rate,
+      this.audioInterfaceClaimed >= 0 ? ' with audio' : '');
     return path;
   }
 
@@ -836,12 +873,86 @@ export class UvcCameraSession {
       return '';
     }
     const frames = this.streamId > 0 ? native.recordStop(this.streamId) : -24;
+    this.releaseMicrophone();
     if (frames < 0) {
       this.errorMessage = `the recording failed: ${errnoText(frames)}`;
       return '';
     }
     hilog.info(DOMAIN, TAG, 'recorded %{public}d frames to %{public}s', frames, path);
     return path;
+  }
+
+  /**
+   * Claims the microphone's AudioStreaming interface, selects its alt
+   * setting, sets the sampling frequency and unmutes/raises every Feature
+   * Unit — the sequence Android runs before capturing. False when the
+   * interface cannot be claimed or switched.
+   */
+  private prepareMicrophone(audio: UacCaptureInfo): boolean {
+    const fd = this.fd;
+    if (fd < 0) {
+      return false;
+    }
+    const claimed = native.usbClaimInterface(fd, audio.interfaceNumber);
+    if (claimed < 0) {
+      hilog.warn(DOMAIN, TAG, 'claiming audio interface %{public}d failed: %{public}s', audio.interfaceNumber,
+        errnoText(claimed));
+      return false;
+    }
+    this.audioInterfaceClaimed = audio.interfaceNumber;
+    const switched = native.usbSetInterface(fd, audio.interfaceNumber, audio.altSetting);
+    if (switched < 0) {
+      hilog.warn(DOMAIN, TAG, 'audio alt setting %{public}d rejected: %{public}s', audio.altSetting, errnoText(switched));
+      this.releaseMicrophone();
+      return false;
+    }
+    // Sampling frequency on the endpoint (UAC1 SAMPLING_FREQ_CONTROL, 3 bytes
+    // little-endian). Firmwares idling on a low clock need it; devices
+    // without the control just answer with an error, which is fine.
+    const freq = new Uint8Array([audio.sampleRate & 0xff, (audio.sampleRate >> 8) & 0xff, (audio.sampleRate >> 16) & 0xff]);
+    const setFreq = native.usbControlTransfer(fd, UAC_REQ_TYPE_SET_ENDPOINT, UAC_SET_CUR,
+      UAC_CS_SAMPLING_FREQ << 8, audio.endpointAddress, freq.buffer as ArrayBuffer, CONTROL_TIMEOUT_MS);
+    const current = new Uint8Array(3);
+    const getFreq = native.usbControlTransfer(fd, UAC_REQ_TYPE_GET_ENDPOINT, UAC_GET_CUR,
+      UAC_CS_SAMPLING_FREQ << 8, audio.endpointAddress, current.buffer as ArrayBuffer, CONTROL_TIMEOUT_MS);
+    hilog.info(DOMAIN, TAG, 'microphone sampling freq: set %{public}d rc=%{public}d, now %{public}d rc=%{public}d',
+      audio.sampleRate, setFreq, current[0] | (current[1] << 8) | (current[2] << 16), getFreq);
+    // Unmute and raise the gain of every Feature Unit channel offering it.
+    for (let u = 0; u < this.featureUnits.length; u++) {
+      const unit = this.featureUnits[u];
+      const index = (unit.unitId << 8) | unit.interfaceNumber;
+      for (let ch = 0; ch < unit.controls.length; ch++) {
+        const controls = unit.controls[ch];
+        if ((controls & 0x01) !== 0) {
+          const mute = new Uint8Array([0]);
+          const rc = native.usbControlTransfer(fd, UVC_REQ_TYPE_SET, UAC_SET_CUR, (UAC_CS_MUTE << 8) | ch, index,
+            mute.buffer as ArrayBuffer, CONTROL_TIMEOUT_MS);
+          hilog.info(DOMAIN, TAG, 'microphone unmute unit=%{public}d ch=%{public}d rc=%{public}d', unit.unitId, ch, rc);
+        }
+        if ((controls & 0x02) !== 0) {
+          const volume = new Uint8Array(2);
+          const max = native.usbControlTransfer(fd, UVC_REQ_TYPE_GET, UAC_GET_MAX, (UAC_CS_VOLUME << 8) | ch, index,
+            volume.buffer as ArrayBuffer, CONTROL_TIMEOUT_MS);
+          if (max === 2) {
+            const rc = native.usbControlTransfer(fd, UVC_REQ_TYPE_SET, UAC_SET_CUR, (UAC_CS_VOLUME << 8) | ch, index,
+              volume.buffer as ArrayBuffer, CONTROL_TIMEOUT_MS);
+            hilog.info(DOMAIN, TAG, 'microphone volume unit=%{public}d ch=%{public}d max=%{public}d rc=%{public}d',
+              unit.unitId, ch, volume[0] | (volume[1] << 8), rc);
+          }
+        }
+      }
+    }
+    return true;
+  }
+
+  /** Puts the microphone interface back on alt 0 and releases it. */
+  private releaseMicrophone(): void {
+    const interfaceNumber = this.audioInterfaceClaimed;
+    this.audioInterfaceClaimed = -1;
+    if (this.fd >= 0 && interfaceNumber >= 0) {
+      native.usbSetInterface(this.fd, interfaceNumber, 0);
+      native.usbReleaseInterface(this.fd, interfaceNumber);
+    }
   }
 
   /**

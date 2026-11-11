@@ -425,11 +425,12 @@ void main() {
     expect(photo.uri, isNull);
 
     expect(camera.isVideoRecording, isFalse);
-    await camera.startVideoRecording(bitRate: 8000000, frameRate: 30);
+    await camera.startVideoRecording(bitRate: 8000000, frameRate: 30, withAudio: false);
     expect(camera.isVideoRecording, isTrue);
     expect(calls.last.arguments, <String, Object?>{
       'bitRate': 8000000,
       'frameRate': 30,
+      'withAudio': false,
     });
     final UvcGalleryMedia video = await camera.stopVideoRecording();
     expect(camera.isVideoRecording, isFalse);

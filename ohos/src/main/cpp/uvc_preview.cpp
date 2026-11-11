@@ -362,7 +362,30 @@ napi_value RecordStart(napi_env env, napi_callback_info info) {
   if (session == nullptr) {
     return Number(env, flutter_ffi_uvc::kErrorRecorderNoFrames);
   }
-  return Number(env, session->StartRecording(path, static_cast<int32_t>(fps), bitrate));
+  // Optional microphone: fd, endpoint, packetSize, sampleRate, channels, bits.
+  flutter_ffi_uvc::UacCaptureConfig audio;
+  bool with_audio = false;
+  if (arguments.count >= 10) {
+    int64_t fd = -1;
+    int64_t endpoint = 0;
+    int64_t packet_size = 0;
+    int64_t sample_rate = 0;
+    int64_t channels = 0;
+    int64_t bits = 16;
+    if (GetInt(env, arguments, 4, &fd) && GetInt(env, arguments, 5, &endpoint) && GetInt(env, arguments, 6, &packet_size) &&
+        GetInt(env, arguments, 7, &sample_rate) && GetInt(env, arguments, 8, &channels) &&
+        GetInt(env, arguments, 9, &bits) && fd >= 0 && endpoint > 0 && packet_size > 0 && sample_rate > 0 &&
+        channels > 0) {
+      audio.fd = static_cast<int>(fd);
+      audio.endpoint = static_cast<uint8_t>(endpoint);
+      audio.packet_size = static_cast<uint32_t>(packet_size);
+      audio.sample_rate = static_cast<int32_t>(sample_rate);
+      audio.channels = static_cast<int32_t>(channels);
+      audio.bits = static_cast<int32_t>(bits);
+      with_audio = true;
+    }
+  }
+  return Number(env, session->StartRecording(path, static_cast<int32_t>(fps), bitrate, with_audio ? &audio : nullptr));
 }
 
 // recordStop(stream): number — frames written, or a negative error code.
@@ -392,6 +415,7 @@ napi_value Init(napi_env env, napi_value exports) {
       {"streamStats", nullptr, StreamStatsOf, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"streamLatestJpeg", nullptr, StreamLatestJpeg, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"recordStart", nullptr, RecordStart, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"recordStartWithAudio", nullptr, RecordStart, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"recordStop", nullptr, RecordStop, nullptr, nullptr, nullptr, napi_default, nullptr},
   };
   napi_define_properties(env, exports, sizeof(descriptors) / sizeof(descriptors[0]), descriptors);

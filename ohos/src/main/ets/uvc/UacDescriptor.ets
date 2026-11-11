@@ -180,3 +180,52 @@ export function describeUacCapture(info: UacCaptureInfo): string {
     `packet=${info.packetSize} interval=${info.endpointInterval} rate=${info.sampleRate} ` +
     `ch=${info.channels} bits=${info.bitsPerSample} terminal_link=${info.terminalLink}`;
 }
+
+const UAC_SUBCLASS_CONTROL = 1;
+const AC_FEATURE_UNIT = 0x06;
+
+/** A UAC1 Feature Unit: which channels (0 = master) offer mute and volume. */
+export class UacFeatureUnit {
+  interfaceNumber: number = 0;
+  unitId: number = 0;
+  /** Per channel entry (index 0 = master): bit 0 mute, bit 1 volume. */
+  controls: number[] = [];
+}
+
+/**
+ * Feature Units of every AudioControl interface, in descriptor order. Used
+ * to unmute the microphone and raise its gain before capturing, as the
+ * Android side does.
+ */
+export function listUacFeatureUnits(raw: Uint8Array): UacFeatureUnit[] {
+  const units: UacFeatureUnit[] = [];
+  let offset = 0;
+  let inControl = false;
+  let interfaceNumber = 0;
+  while (offset + 2 <= raw.length) {
+    const length = raw[offset];
+    const type = raw[offset + 1];
+    if (length < 2 || offset + length > raw.length) {
+      break;
+    }
+    if (type === DT_INTERFACE && length >= 9) {
+      inControl = raw[offset + 5] === UAC_CLASS_AUDIO && raw[offset + 6] === UAC_SUBCLASS_CONTROL;
+      interfaceNumber = raw[offset + 2];
+    } else if (type === DT_CS_INTERFACE && inControl && raw[offset + 2] === AC_FEATURE_UNIT && length >= 7) {
+      // bUnitID(3) bSourceID(4) bControlSize(5) bmaControls(6..) iFeature.
+      const controlSize = raw[offset + 5];
+      if (controlSize >= 1 && controlSize <= 4) {
+        const unit = new UacFeatureUnit();
+        unit.interfaceNumber = interfaceNumber;
+        unit.unitId = raw[offset + 3];
+        const entries = Math.floor((length - 7) / controlSize);
+        for (let i = 0; i < entries && i < 9; i++) {
+          unit.controls.push(raw[offset + 6 + i * controlSize]);
+        }
+        units.push(unit);
+      }
+    }
+    offset += length;
+  }
+  return units;
+}

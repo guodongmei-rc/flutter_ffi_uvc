@@ -414,9 +414,11 @@ class OhosUvcCamera implements UvcCamera {
     return _capture('takePicture', const <String, Object?>{});
   }
 
-  /// Records H.264 video without audio; [stopVideoRecording] saves it like
-  /// [takePicture] does. The camera microphone is not captured on HarmonyOS
-  /// yet, so [withAudio] has no effect.
+  /// Records H.264 video, with the camera's USB microphone as an AAC track
+  /// when [withAudio] is true and the device has one (see
+  /// [queryAudioInterface]); [stopVideoRecording] saves the file like
+  /// [takePicture] does. A microphone that fails to stream makes the
+  /// recording video-only rather than failing it, as on Android.
   @override
   Future<void> startVideoRecording({
     int? bitRate,
@@ -426,6 +428,7 @@ class OhosUvcCamera implements UvcCamera {
     await _capture('startVideoRecording', <String, Object?>{
       'bitRate': bitRate ?? 0,
       'frameRate': frameRate ?? 0,
+      'withAudio': withAudio,
     });
     _recording = true;
   }

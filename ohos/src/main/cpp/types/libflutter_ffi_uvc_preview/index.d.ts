@@ -105,5 +105,19 @@ export const streamLatestJpeg: (stream: number) => ArrayBuffer | undefined;
  */
 export const recordStart: (stream: number, path: string, fps: number, bitRate: number) => number;
 
+/**
+ * Like recordStart, with the camera's microphone recorded as an AAC track.
+ * The AudioStreaming interface must already be claimed, on its streaming alt
+ * setting and configured (sampling frequency, unmute); `endpoint`,
+ * `packetSize`, `sampleRate`, `channels` and `bits` describe its isochronous
+ * IN endpoint and PCM format. The real sample rate is measured over the first
+ * 300 ms (the call blocks for that long) and used when it differs from
+ * `sampleRate`. Fails with -27 when the microphone delivers nothing, without
+ * starting the recording; the caller may then record without audio.
+ */
+export const recordStartWithAudio: (
+  stream: number, path: string, fps: number, bitRate: number,
+  fd: number, endpoint: number, packetSize: number, sampleRate: number, channels: number, bits: number) => number;
+
 /** Finishes the recording. Returns the number of frames written, or a negative error code. */
 export const recordStop: (stream: number) => number;

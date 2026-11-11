@@ -38,6 +38,8 @@
 #include "uvc_h26x.h"
 #include "uvc_raw.h"
 #include "uvc_recorder.h"
+#include "uvc_uac.h"
+#include "uvc_urb.h"
 #include "uvc_surface.h"
 
 namespace flutter_ffi_uvc {
@@ -46,7 +48,19 @@ namespace flutter_ffi_uvc {
 // Each returns the ioctl's result, or -errno on failure.
 
 inline int UsbClaimInterface(int fd, unsigned int interface_number) {
-  return ioctl(fd, USBDEVFS_CLAIMINTERFACE, &interface_number) < 0 ? -errno : 0;
+  if (ioctl(fd, USBDEVFS_CLAIMINTERFACE, &interface_number) == 0) {
+    return 0;
+  }
+  if (errno != EBUSY) {
+    return -errno;
+  }
+  // A kernel driver holds the interface (the system binds snd-usb-audio to
+  // a camera's microphone, for instance). Detach it and claim in one step,
+  // which is what libusb's detach_kernel_driver does for the Android side.
+  struct usbdevfs_disconnect_claim claim = {};
+  claim.interface = interface_number;
+  claim.flags = 0;
+  return ioctl(fd, USBDEVFS_DISCONNECT_CLAIM, &claim) < 0 ? -errno : 0;
 }
 
 inline int UsbReleaseInterface(int fd, unsigned int interface_number) {
@@ -910,10 +924,10 @@ struct IsoStreamConfig {
 // (isochronous with `packets_per_urb` packets each, or bulk with one payload
 // each), resubmitting each one as soon as it is reaped, and feeds every
 // packet to the frame assembler and completed frames to the presenter.
-class IsoStream {
+class IsoStream : public UrbOwner {
  public:
   explicit IsoStream(FrameSink *presenter) : presenter_(presenter) {}
-  ~IsoStream() { Stop(); }
+  ~IsoStream() override { Stop(); }
 
   // Returns 0, or -errno when no transfer could be submitted.
   int Start(const IsoStreamConfig &config) {
@@ -928,6 +942,7 @@ class IsoStream {
     }
     const size_t buffer_bytes = static_cast<size_t>(config.bytes_per_packet) * config_.packets_per_urb;
     urbs_.clear();
+    urbs_.reserve(config.urb_count);
     for (uint32_t i = 0; i < config.urb_count; i++) {
       Urb urb;
       urb.buffer.resize(buffer_bytes);
@@ -935,6 +950,11 @@ class IsoStream {
           sizeof(struct usbdevfs_urb) + config_.packets_per_urb * sizeof(struct usbdevfs_iso_packet_desc);
       urb.storage.resize(urb_bytes);
       urbs_.push_back(std::move(urb));
+    }
+    // The tags point at the vector's elements, which never move again.
+    for (Urb &urb : urbs_) {
+      urb.tag.owner = this;
+      urb.tag.urb = &urb;
     }
     int first_error = 0;
     size_t submitted = 0;
@@ -965,10 +985,19 @@ class IsoStream {
     }
     if (QueuedCount() > 0) {
       // The kernel still owns these transfers and may write to their buffers;
-      // closing the descriptor ends them. Leak them rather than free them.
+      // closing the descriptor ends them. Leak them rather than free them,
+      // and detach them from this object, which is about to go.
+      for (Urb &urb : urbs_) {
+        urb.tag.owner = nullptr;
+      }
       new std::vector<Urb>(std::move(urbs_));
     }
     urbs_.clear();
+  }
+
+  void OnReaped(void *urb) override {
+    std::lock_guard<std::mutex> lock(completed_mutex_);
+    completed_.push_back(static_cast<Urb *>(urb));
   }
 
   void FillStats(StreamStats *stats) {
@@ -989,6 +1018,7 @@ class IsoStream {
     std::vector<uint8_t> storage;
     std::vector<uint8_t> buffer;
     bool queued = false;
+    UrbTag tag;
 
     struct usbdevfs_urb *get() { return reinterpret_cast<struct usbdevfs_urb *>(storage.data()); }
   };
@@ -999,7 +1029,7 @@ class IsoStream {
     request->endpoint = config_.endpoint;
     request->buffer = urb->buffer.data();
     request->buffer_length = static_cast<int>(urb->buffer.size());
-    request->usercontext = urb;
+    request->usercontext = &urb->tag;
     if (config_.bulk) {
       request->type = USBDEVFS_URB_TYPE_BULK;
       request->number_of_packets = 0;
@@ -1064,29 +1094,26 @@ class IsoStream {
     assembler_stats_ = assembler_->stats();
   }
 
-  // Reaps every completed URB; returns false once the device is gone.
+  // Reaps what has completed on the descriptor (ours and the microphone's)
+  // and handles the URBs that came back to us; returns false once the device
+  // is gone.
   bool Reap(bool resubmit) {
-    for (;;) {
-      void *reaped = nullptr;
-      if (ioctl(config_.fd, USBDEVFS_REAPURBNDELAY, &reaped) < 0) {
-        if (errno == EAGAIN) {
-          return true;
-        }
-        if (errno == EINTR) {
-          continue;
-        }
-        SetStopErrno(errno);
-        return false;
-      }
-      auto *request = static_cast<struct usbdevfs_urb *>(reaped);
-      Urb *urb = request != nullptr ? static_cast<Urb *>(request->usercontext) : nullptr;
-      if (urb == nullptr) {
-        continue;
-      }
+    int error = 0;
+    if (!ReapAll(config_.fd, &error)) {
+      SetStopErrno(error);
+      return false;
+    }
+    std::vector<Urb *> done;
+    {
+      std::lock_guard<std::mutex> lock(completed_mutex_);
+      done.swap(completed_);
+    }
+    for (Urb *urb : done) {
       urb->queued = false;
       if (!resubmit) {
         continue;
       }
+      const struct usbdevfs_urb *request = urb->get();
       // A cancelled or failed transfer carries nothing worth assembling.
       if (request->status == 0) {
         Process(urb);
@@ -1105,6 +1132,7 @@ class IsoStream {
         }
       }
     }
+    return true;
   }
 
   void SetStopErrno(int error) {
@@ -1178,6 +1206,8 @@ class IsoStream {
 
   FrameSink *presenter_;
   IsoStreamConfig config_;
+  std::mutex completed_mutex_;
+  std::vector<Urb *> completed_;
   std::unique_ptr<UvcFrameAssembler> assembler_;
   std::vector<Urb> urbs_;
   std::thread thread_;
@@ -1262,11 +1292,47 @@ class StreamSession {
 
   // Starts recording to `path`. MJPEG streams feed the encoder with decoded
   // NV12 frames; H.264/H.265 streams decode into the encoder's surface with a
-  // second decoder instance (no passthrough, same as Android). Returns 0 or a
-  // negative error code.
-  int32_t StartRecording(const std::string &path, int32_t fps, int64_t bitrate) {
+  // second decoder instance (no passthrough, same as Android). With `audio`
+  // the camera's microphone is captured on its (already configured) endpoint
+  // into an AAC track; like Android, the real sample rate is measured over a
+  // short window first, descriptor rates being estimates. Returns 0 or a
+  // negative error code; a microphone that fails to start fails the call
+  // (the caller may retry without audio).
+  int32_t StartRecording(const std::string &path, int32_t fps, int64_t bitrate, const UacCaptureConfig *audio) {
     if (recorder_ != nullptr) {
       return kErrorRecorderBusy;
+    }
+    std::unique_ptr<UacCapture> capture;
+    AudioTrackConfig track;
+    if (audio != nullptr) {
+      capture = std::make_unique<UacCapture>();
+      const int ret = capture->Start(*audio);
+      if (ret != 0) {
+        OH_LOG_WARN(LOG_APP, "microphone capture failed to start: %{public}d", ret);
+        return kErrorRecorderMicrophone;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(kAudioMeasureMs));
+      const UacCaptureStats stats = capture->Stats();
+      if (!stats.running || stats.bytes == 0) {
+        OH_LOG_WARN(LOG_APP, "microphone delivered nothing in %{public}d ms (errno %{public}d)", kAudioMeasureMs,
+                    stats.stop_errno);
+        return kErrorRecorderMicrophone;
+      }
+      track.channels = audio->channels;
+      track.sample_rate = audio->sample_rate;
+      const int64_t frame_bytes = static_cast<int64_t>(audio->channels) * ((audio->bits + 7) / 8);
+      const int32_t measured = frame_bytes > 0 ? static_cast<int32_t>(static_cast<int64_t>(stats.bytes) * 1000 /
+                                                                      kAudioMeasureMs / frame_bytes)
+                                               : 0;
+      const int32_t snapped = SnapSampleRate(measured);
+      if (snapped > 0) {
+        track.sample_rate = snapped;
+      }
+      OH_LOG_INFO(LOG_APP,
+                  "microphone: %{public}llu bytes in %{public}d ms -> %{public}d Hz measured, %{public}d Hz used "
+                  "(descriptor %{public}d), %{public}d ch, bad packets %{public}llu",
+                  static_cast<unsigned long long>(stats.bytes), kAudioMeasureMs, measured, track.sample_rate,
+                  audio->sample_rate, audio->channels, static_cast<unsigned long long>(stats.bad_packets));
     }
     int32_t width = 0;
     int32_t height = 0;
@@ -1288,11 +1354,16 @@ class StreamSession {
       return kErrorRecorderNoFrames;
     }
     auto recorder = std::make_shared<VideoRecorder>();
-    const int32_t ret = recorder->Start(path, width, height, fps, bitrate, /*external_producer=*/h26x_ != nullptr);
+    const int32_t ret = recorder->Start(path, width, height, fps, bitrate, /*external_producer=*/h26x_ != nullptr,
+                                        capture != nullptr ? &track : nullptr);
     if (ret != 0) {
       return ret;
     }
     recorder_ = recorder;
+    if (capture != nullptr) {
+      capture->SetSink(recorder.get());
+      capture_ = std::move(capture);
+    }
     if (jpeg_ != nullptr) {
       jpeg_->SetRecorder(recorder);
     } else if (raw_ != nullptr) {
@@ -1310,6 +1381,12 @@ class StreamSession {
     if (recorder == nullptr) {
       return kErrorRecorderNoFrames;
     }
+    // The microphone first: its thread writes into the recorder.
+    if (capture_ != nullptr) {
+      capture_->SetSink(nullptr);
+      capture_->Stop();
+      capture_.reset();
+    }
     // Detaching first stops the producer before the encoder's surface goes.
     if (jpeg_ != nullptr) {
       jpeg_->SetRecorder(nullptr);
@@ -1322,6 +1399,9 @@ class StreamSession {
   }
 
   bool IsRecording() const { return recorder_ != nullptr; }
+
+  // Counters of the microphone capture while recording with audio.
+  UacCaptureStats AudioStats() { return capture_ != nullptr ? capture_->Stats() : UacCaptureStats(); }
 
   StreamStats Stats() {
     StreamStats stats;
@@ -1351,9 +1431,24 @@ class StreamSession {
     }
   }
 
+  static constexpr int kAudioMeasureMs = 300;
+
+  // The nearest standard rate within ~3 %, or 0.
+  static int32_t SnapSampleRate(int32_t estimate) {
+    static constexpr int32_t kRates[] = {8000,  11025, 12000, 16000, 22050, 24000,  32000,
+                                         44100, 48000, 64000, 88200, 96000, 176400, 192000};
+    for (const int32_t rate : kRates) {
+      if (std::abs(estimate - rate) <= rate / 32) {
+        return rate;
+      }
+    }
+    return 0;
+  }
+
   StreamCodec codec_ = StreamCodec::kMjpeg;
   std::unique_ptr<FramePresenter> jpeg_;
   std::unique_ptr<RawPresenter> raw_;
+  std::unique_ptr<UacCapture> capture_;
   std::unique_ptr<H26xPresenter> h26x_;
   std::unique_ptr<IsoStream> stream_;
   std::shared_ptr<VideoRecorder> recorder_;

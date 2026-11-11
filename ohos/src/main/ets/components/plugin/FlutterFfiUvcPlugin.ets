@@ -244,7 +244,8 @@ UvcSessionListener {
       }
       case 'startVideoRecording': {
         const path = session.startRecording(
-          this.captureDirectory, numberArg(call, 'frameRate', 0), numberArg(call, 'bitRate', 0));
+          this.captureDirectory, numberArg(call, 'frameRate', 0), numberArg(call, 'bitRate', 0),
+          call.argument('withAudio') !== false);
         if (path.length === 0) {
           result.error('capture', session.lastError(), null);
         } else {

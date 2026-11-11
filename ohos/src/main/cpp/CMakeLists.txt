@@ -23,6 +23,7 @@ target_link_libraries(flutter_ffi_uvc_preview PUBLIC
   libnative_media_venc.so
   libnative_media_vdec.so
   libnative_media_avmuxer.so
+  libnative_media_acodec.so
   libimage_source.so
   libpixelmap.so
   libimage_packer.so
