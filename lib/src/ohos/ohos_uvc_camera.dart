@@ -131,8 +131,9 @@ class OhosUvcCamera implements UvcCamera {
   @override
   Future<bool> ensureCameraPermission() async => true;
 
-  /// The gallery asks for consent when a capture is saved (once, then for
-  /// five minutes), so there is nothing to request up front.
+  /// The application's gallery permission (ohos.permission.WRITE_IMAGEVIDEO)
+  /// is checked, and requested if needed, when a capture is saved, so there
+  /// is nothing to request up front.
   @override
   Future<bool> ensureGalleryPermission() async => true;
 
@@ -405,8 +406,9 @@ class OhosUvcCamera implements UvcCamera {
       null;
 
   /// Saves the latest camera frame as it was sent (MJPEG, so [quality] is not
-  /// used). The gallery asks the user for consent the first time and then
-  /// allows saving for five minutes; the result carries the gallery URI. When
+  /// used). Saving to the gallery needs the application's
+  /// ohos.permission.WRITE_IMAGEVIDEO, which is requested the first time if
+  /// it is not granted yet; the result carries the gallery URI. When
   /// the user declines, the file stays in the app's files directory and the
   /// result carries its path instead.
   @override

@@ -2,7 +2,7 @@
 // usbManager-based camera session; see lib/src/ohos/ohos_uvc_camera.dart for
 // the Dart side of this channel.
 
-import { common } from '@kit.AbilityKit';
+import { abilityAccessCtrl, bundleManager, common, Permissions } from '@kit.AbilityKit';
 import { fileIo } from '@kit.CoreFileKit';
 import { photoAccessHelper } from '@kit.MediaLibraryKit';
 import {
@@ -30,6 +30,12 @@ import { NO_WINDOW, UvcPreviewRenderer } from '../../camera/UvcPreviewRenderer';
 const METHOD_CHANNEL: string = 'flutter_ffi_uvc/ohos';
 const EVENT_CHANNEL: string = 'flutter_ffi_uvc/ohos_events';
 const STATS_INTERVAL_MS: number = 250;
+/**
+ * Saving to the gallery uses the host application's own gallery permission.
+ * The plugin does not declare it: the application lists it in its
+ * module.json5 (and has it in its signing profile's ACL).
+ */
+const GALLERY_WRITE_PERMISSION: Permissions = 'ohos.permission.WRITE_IMAGEVIDEO';
 
 function numberArg(call: MethodCall, key: string, fallback: number): number {
   const value: Any = call.argument(key);
@@ -419,10 +425,11 @@ UvcSessionListener {
 
   /**
    * Moves a finished capture into the system gallery and answers with its
-   * URI. The gallery asks the user once and then allows saving for five
-   * minutes (ohos.permission.SHORT_TERM_WRITE_IMAGEVIDEO); when the user
-   * declines, or no ability is attached to show the dialog, the file stays
-   * in the app's directory and its path is returned instead.
+   * URI. Writing needs the application's ohos.permission.WRITE_IMAGEVIDEO,
+   * which is requested here when it has not been granted yet; when the user
+   * declines, the application does not declare the permission, or no ability
+   * is attached to show the dialog, the file stays in the app's directory
+   * and its path is returned instead.
    */
   private publish(path: string, isVideo: boolean, result: MethodResult): void {
     this.saveToGallery(path, isVideo).then((uri: string): void => {
@@ -438,24 +445,23 @@ UvcSessionListener {
     if (context === null) {
       return '';
     }
+    if (!await this.ensureGalleryWriteRight(context)) {
+      return '';
+    }
     const helper = photoAccessHelper.getPhotoAccessHelper(context);
     const fileName = path.substring(path.lastIndexOf('/') + 1);
-    const config: photoAccessHelper.PhotoCreationConfig = {
-      title: fileName.substring(0, fileName.lastIndexOf('.')),
-      fileNameExtension: isVideo ? 'mp4' : 'jpg',
-      photoType: isVideo ? photoAccessHelper.PhotoType.VIDEO : photoAccessHelper.PhotoType.IMAGE,
-      subtype: photoAccessHelper.PhotoSubtype.DEFAULT
+    const options: photoAccessHelper.CreateOptions = {
+      title: fileName.substring(0, fileName.lastIndexOf('.'))
     };
     let uri = '';
     try {
-      uri = await helper.createAssetWithShortTermPermission(config);
+      uri = await helper.createAsset(
+        isVideo ? photoAccessHelper.PhotoType.VIDEO : photoAccessHelper.PhotoType.IMAGE,
+        isVideo ? 'mp4' : 'jpg',
+        options);
     } catch (e) {
       const error = e as BusinessError;
-      // 201: the user declined. Anything else is a real failure.
-      if (error.code !== 201) {
-        throw new Error(`createAssetWithShortTermPermission failed: code=${error.code} message=${error.message}`);
-      }
-      return '';
+      throw new Error(`createAsset failed: code=${error.code} message=${error.message}`);
     }
     if (!uri) {
       return '';
@@ -468,6 +474,32 @@ UvcSessionListener {
     }
     fileIo.unlinkSync(path);
     return uri;
+  }
+
+  /**
+   * True when the application may write to the gallery. Asks the user when
+   * the permission has not been granted yet; a permission the application
+   * does not declare, or one the user has refused for good, answers false
+   * without a dialog.
+   */
+  private async ensureGalleryWriteRight(context: common.UIAbilityContext): Promise<boolean> {
+    try {
+      const atManager = abilityAccessCtrl.createAtManager();
+      const bundleInfo = await bundleManager.getBundleInfoForSelf(
+        bundleManager.BundleFlag.GET_BUNDLE_INFO_WITH_APPLICATION);
+      const status = atManager.checkAccessTokenSync(bundleInfo.appInfo.accessTokenId, GALLERY_WRITE_PERMISSION);
+      if (status === abilityAccessCtrl.GrantStatus.PERMISSION_GRANTED) {
+        return true;
+      }
+      const outcome = await atManager.requestPermissionsFromUser(context, [GALLERY_WRITE_PERMISSION]);
+      return outcome.authResults.length > 0 &&
+        outcome.authResults[0] === abilityAccessCtrl.GrantStatus.PERMISSION_GRANTED;
+    } catch (e) {
+      const error = e as BusinessError;
+      hilog.warn(0x0001, 'FlutterFfiUvc', 'gallery permission check failed: code=%{public}d %{public}s',
+        error.code, error.message);
+      return false;
+    }
   }
 
   private mediaToMap(path: string | null, uri: string | null): Map<string, Any> {

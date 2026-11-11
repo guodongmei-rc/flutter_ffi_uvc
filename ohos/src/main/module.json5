@@ -5,15 +5,6 @@
     "deviceTypes": [
       "default",
       "tablet"
-    ],
-    "requestPermissions": [
-      {
-        "name": "ohos.permission.SHORT_TERM_WRITE_IMAGEVIDEO",
-        "reason": "$string:short_term_write_reason",
-        "usedScene": {
-          "when": "inuse"
-        }
-      }
     ]
   }
 }
