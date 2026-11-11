@@ -62,8 +62,12 @@ class VideoRecorder : public PcmSink {
  public:
   ~VideoRecorder() override { Stop(); }
 
-  // Opens `path` for writing and starts an H.264 encoder for `width` x
+  // Opens `path` for writing and starts a video encoder for `width` x
   // `height` frames at `fps`. Returns 0 or a negative error code.
+  //
+  // The output codec follows the camera stream the same way the Android
+  // plugin does: with `prefer_hevc` (camera streams H.265) the recording is
+  // H.265 when the device has an HEVC encoder, otherwise H.264.
   //
   // With `external_producer` the frames are not copied in through
   // WriteFrame(): another component (a video decoder rendering into
@@ -73,7 +77,8 @@ class VideoRecorder : public PcmSink {
   //
   // With `audio` the file also gets an AAC track fed through WritePcm().
   int32_t Start(const std::string &path, int32_t width, int32_t height, int32_t fps, int64_t bitrate,
-                bool external_producer = false, const AudioTrackConfig *audio = nullptr) {
+                bool external_producer = false, const AudioTrackConfig *audio = nullptr,
+                bool prefer_hevc = false) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (encoder_ != nullptr) {
       return kErrorRecorderBusy;
@@ -85,11 +90,24 @@ class VideoRecorder : public PcmSink {
     path_ = path;
     width_ = width;
     height_ = height;
-    encoder_ = OH_VideoEncoder_CreateByMime(OH_AVCODEC_MIMETYPE_VIDEO_AVC);
+    video_mime_ = OH_AVCODEC_MIMETYPE_VIDEO_AVC;
+    if (prefer_hevc) {
+      encoder_ = OH_VideoEncoder_CreateByMime(OH_AVCODEC_MIMETYPE_VIDEO_HEVC);
+      if (encoder_ != nullptr) {
+        video_mime_ = OH_AVCODEC_MIMETYPE_VIDEO_HEVC;
+      } else {
+        OH_LOG_WARN(LOG_APP, "no HEVC encoder on this device; recording H.265 camera as H.264");
+      }
+    }
+    if (encoder_ == nullptr) {
+      encoder_ = OH_VideoEncoder_CreateByMime(OH_AVCODEC_MIMETYPE_VIDEO_AVC);
+    }
     if (encoder_ == nullptr) {
       Release();
       return kErrorRecorderEncoder;
     }
+    OH_LOG_INFO(LOG_APP, "recorder video codec %{public}s %{public}dx%{public}d @%{public}d fps %{public}lld bps",
+                video_mime_, width, height, fps, static_cast<long long>(bitrate));
     OH_AVCodecCallback callback = {OnError, OnStreamChanged, OnNeedInputBuffer, OnNewOutputBuffer};
     if (OH_VideoEncoder_RegisterCallback(encoder_, callback, this) != AV_ERR_OK) {
       Release();
@@ -125,7 +143,7 @@ class VideoRecorder : public PcmSink {
       Release();
       return kErrorRecorderMuxer;
     }
-    OH_AVFormat *track = OH_AVFormat_CreateVideoFormat(OH_AVCODEC_MIMETYPE_VIDEO_AVC, width, height);
+    OH_AVFormat *track = OH_AVFormat_CreateVideoFormat(video_mime_, width, height);
     OH_AVFormat_SetDoubleValue(track, OH_MD_KEY_FRAME_RATE, static_cast<double>(fps));
     const bool track_added = OH_AVMuxer_AddTrack(muxer_, &track_, track) == AV_ERR_OK;
     OH_AVFormat_Destroy(track);
@@ -678,6 +696,8 @@ class VideoRecorder : public PcmSink {
   int32_t track_ = -1;
   int fd_ = -1;
   std::string path_;
+  // OH_AVCODEC_MIMETYPE_VIDEO_AVC or _HEVC (static strings from the SDK).
+  const char *video_mime_ = OH_AVCODEC_MIMETYPE_VIDEO_AVC;
   int32_t width_ = 0;
   int32_t height_ = 0;
   int64_t started_at_us_ = 0;

@@ -26,7 +26,7 @@ import {
 } from '../uvc/UacDescriptor';
 import {
   UvcStreamCtrl, streamCtrlLength, encodeStreamCtrl, decodeStreamCtrl, describeStreamCtrl,
-  UVC_SET_CUR, UVC_GET_CUR, UVC_REQ_TYPE_SET, UVC_REQ_TYPE_GET,
+  UVC_SET_CUR, UVC_GET_CUR, UVC_GET_MAX, UVC_REQ_TYPE_SET, UVC_REQ_TYPE_GET,
   UVC_VS_PROBE_CONTROL, UVC_VS_COMMIT_CONTROL,
 } from '../uvc/UvcStreamControl';
 
@@ -981,10 +981,19 @@ export class UvcCameraSession {
     }
   }
 
-  /** PROBE and COMMIT for one mode; returns what the device committed to, or null. */
+  /**
+   * PROBE and COMMIT for one mode; returns what the device committed to, or null.
+   *
+   * Same sequence as libuvc's uvc_get_stream_ctrl_format_size(): the PROBE is
+   * built on top of the device's own GET_MAX block (dwMaxVideoFrameSize,
+   * dwMaxPayloadTransferSize, wCompQuality, ...) with only hint, format, frame
+   * and interval overwritten. A mostly-zero block is legal, but some firmware
+   * (RunCam) treats it as invalid and falls back to the frame's default
+   * interval, silently ignoring the requested fps.
+   */
   private negotiate(fd: number, info: UvcDeviceInfo, stream: UvcStreamInterface, mode: UvcMode): UvcStreamCtrl | null {
     const length = streamCtrlLength(info.bcdUVC);
-    const wanted = new UvcStreamCtrl();
+    const wanted = this.probeBaseline(fd, stream, length);
     wanted.bmHint = 1;
     wanted.bFormatIndex = mode.formatIndex;
     wanted.bFrameIndex = mode.frameIndex;
@@ -1023,6 +1032,28 @@ export class UvcCameraSession {
       return null;
     }
     return ctrl;
+  }
+
+  /**
+   * The device's GET_MAX PROBE block, falling back to GET_CUR and then to an
+   * all-zero block. Pure best effort: a failure here only costs the prefill.
+   */
+  private probeBaseline(fd: number, stream: UvcStreamInterface, length: number): UvcStreamCtrl {
+    const requests: number[] = [UVC_GET_MAX, UVC_GET_CUR];
+    for (let i = 0; i < requests.length; i++) {
+      const answer: Uint8Array = new Uint8Array(length);
+      const got = native.usbControlTransfer(fd, UVC_REQ_TYPE_GET, requests[i], UVC_VS_PROBE_CONTROL << 8,
+        stream.interfaceNumber, answer.buffer as ArrayBuffer, CONTROL_TIMEOUT_MS);
+      if (got >= 26) {
+        const baseline = decodeStreamCtrl(answer, got);
+        hilog.info(DOMAIN, TAG, 'probe baseline (%{public}s): %{public}s',
+          requests[i] === UVC_GET_MAX ? 'GET_MAX' : 'GET_CUR', describeStreamCtrl(baseline));
+        return baseline;
+      }
+      hilog.warn(DOMAIN, TAG, 'probe %{public}s failed: %{public}s',
+        requests[i] === UVC_GET_MAX ? 'GET_MAX' : 'GET_CUR', got < 0 ? errnoText(got) : `${got} bytes`);
+    }
+    return new UvcStreamCtrl();
   }
 
   /** Puts the streaming interface back on alt 0 so the camera stops sending. */

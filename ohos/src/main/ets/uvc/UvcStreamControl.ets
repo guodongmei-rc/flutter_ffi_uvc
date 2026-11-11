@@ -6,6 +6,7 @@
 
 export const UVC_SET_CUR: number = 0x01;
 export const UVC_GET_CUR: number = 0x81;
+export const UVC_GET_MAX: number = 0x83;
 export const UVC_REQ_TYPE_SET: number = 0x21;
 export const UVC_REQ_TYPE_GET: number = 0xa1;
 export const UVC_VS_PROBE_CONTROL: number = 0x01;

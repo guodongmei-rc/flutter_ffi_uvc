@@ -1354,8 +1354,11 @@ class StreamSession {
       return kErrorRecorderNoFrames;
     }
     auto recorder = std::make_shared<VideoRecorder>();
+    // Like Android: an H.265 camera is recorded as H.265 when the device can
+    // encode it, everything else (and the fallback) as H.264.
     const int32_t ret = recorder->Start(path, width, height, fps, bitrate, /*external_producer=*/h26x_ != nullptr,
-                                        capture != nullptr ? &track : nullptr);
+                                        capture != nullptr ? &track : nullptr,
+                                        /*prefer_hevc=*/codec_ == StreamCodec::kH265);
     if (ret != 0) {
       return ret;
     }
