@@ -632,10 +632,14 @@ class FlutterFfiUvcPlugin :
     // first — the kernel USB audio driver does the isochronous streaming
     // itself, which is immune to the userspace usbfs starvation some phones
     // show on raw isoc reads (a steady 1/16 of the nominal rate on a Huawei
-    // nova 12). Without mic permission or a USB audio input device, the
-    // native libusb UAC capture is used instead; startDetected() measures
-    // the real capture format while starting (the descriptor rate is only
-    // an estimate).
+    // nova 12). That path is only kept when a short probe read shows it
+    // really delivers PCM: on other phones it opens fine yet yields nothing
+    // but digital silence while this app holds the camera (a OnePlus), and
+    // there the libusb capture is the one that works. Without mic permission,
+    // a USB audio input device or a live AudioRecord signal, the native
+    // libusb UAC capture is used instead; startDetected() measures the real
+    // capture format while starting (the descriptor rate is only an
+    // estimate).
     private fun createAudioEncoder(): AacAudioEncoder? {
         val context = appContext
         if (context != null && hasRecordAudioPermission()) {
@@ -644,15 +648,20 @@ class FlutterFfiUvcPlugin :
             val usbInput = UsbMicCapture.findUsbInput(audioManager)
             if (usbInput != null) {
                 val capture = UsbMicCapture.open(usbInput)
-                if (capture != null) {
+                if (capture == null) {
+                    Log.w(TAG, "USB audio input found but AudioRecord failed; using libusb UAC")
+                } else if (capture.deliversSignal()) {
                     Log.i(TAG, "Audio source: AudioRecord USB mic @ ${capture.sampleRate} Hz")
                     // The kernel path already applies sane gain; keep PCM
                     // as-is (fixed unity gain, no AGC).
                     return AacAudioEncoder(
                         capture.sampleRate, capture.channelCount, 1f, capture,
                     )
+                } else {
+                    // Release before libusb claims the audio interface.
+                    capture.release()
+                    Log.w(TAG, "AudioRecord USB mic is silent; using libusb UAC")
                 }
-                Log.w(TAG, "USB audio input found but AudioRecord failed; using libusb UAC")
             } else {
                 Log.i(TAG, "No USB audio input device; using libusb UAC capture")
             }

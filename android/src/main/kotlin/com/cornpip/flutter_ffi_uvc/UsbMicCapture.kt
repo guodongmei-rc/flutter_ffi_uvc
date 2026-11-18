@@ -49,8 +49,74 @@ internal class UsbMicCapture(
         } catch (_: Exception) {}
     }
 
+    /**
+     * Runs the capture for up to [PROBE_WINDOW_MS] and reports whether it
+     * delivers real PCM, leaving the capture stopped either way.
+     *
+     * An AudioRecord that opens and starts cleanly is no proof of a working
+     * path: on some phones the kernel USB audio stream yields only digital
+     * silence while this app drives the same camera through usbfs (observed
+     * on a OnePlus: every sample exactly 0, at under half the nominal rate,
+     * while the libusb capture ran at full rate). A live microphone always
+     * carries a noise floor, so a window without a single non-zero sample —
+     * or without any data — marks the path as dead. Returns as soon as a
+     * non-zero sample shows up, so a healthy path costs far less than the
+     * full window.
+     */
+    fun deliversSignal(): Boolean {
+        val buffer = ByteBuffer.allocateDirect(PROBE_CHUNK_BYTES)
+        val deadlineNanos = System.nanoTime() + PROBE_WINDOW_MS * 1_000_000L
+        var totalBytes = 0
+        var signal = false
+        try {
+            audioRecord.startRecording()
+            // Non-blocking reads: a dead path may never fill a blocking read,
+            // and this runs on the caller's thread.
+            while (!signal && System.nanoTime() < deadlineNanos) {
+                val bytes = audioRecord.read(
+                    buffer, buffer.capacity(), AudioRecord.READ_NON_BLOCKING,
+                )
+                if (bytes < 0) {
+                    break
+                }
+                if (bytes == 0) {
+                    Thread.sleep(PROBE_POLL_MS)
+                    continue
+                }
+                totalBytes += bytes
+                signal = hasNonZeroByte(buffer, bytes)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "USB mic probe failed", e)
+        } finally {
+            stopCapture()
+        }
+        if (!signal) {
+            Log.w(
+                TAG,
+                "USB mic via AudioRecord delivered no signal " +
+                    "($totalBytes bytes, all zero, within $PROBE_WINDOW_MS ms)",
+            )
+        }
+        return signal
+    }
+
+    /** True when any of the first [bytes] bytes of [buffer] is non-zero. */
+    private fun hasNonZeroByte(buffer: ByteBuffer, bytes: Int): Boolean {
+        for (i in 0 until bytes) {
+            if (buffer.get(i).toInt() != 0) {
+                return true
+            }
+        }
+        return false
+    }
+
     companion object {
         private const val TAG = "flutter_ffi_uvc"
+
+        private const val PROBE_WINDOW_MS = 400L
+        private const val PROBE_POLL_MS = 10L
+        private const val PROBE_CHUNK_BYTES = 4096
 
         // 48 kHz first: USB audio devices almost always support it, and the
         // fewer resample hops AudioFlinger inserts, the better.
