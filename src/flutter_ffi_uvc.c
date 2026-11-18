@@ -3342,8 +3342,8 @@ Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_start(
 }
 
 // Starts PCM capture like NativeAudio_start and returns {sampleRate,
-// channels, bits} measured during calibration, or NULL on failure. The
-// returned rate is the real one — descriptor rates are estimates.
+// channels, bits, starved} measured during calibration, or NULL on failure.
+// The returned rate is the real one — descriptor rates are estimates.
 JNIEXPORT jintArray JNICALL
 Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_startDetected(
     JNIEnv *env,
@@ -3354,12 +3354,14 @@ Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_startDetected(
   if (native_audio_start_internal(&detected) != UVC_SUCCESS) {
     return NULL;
   }
-  jintArray result = (*env)->NewIntArray(env, 3);
+  jintArray result = (*env)->NewIntArray(env, 4);
   if (result == NULL) {
     return NULL;
   }
-  const jint values[3] = {detected.sample_rate, detected.channels, detected.bits};
-  (*env)->SetIntArrayRegion(env, result, 0, 3, values);
+  const jint values[4] = {
+      detected.sample_rate, detected.channels, detected.bits, detected.starved,
+  };
+  (*env)->SetIntArrayRegion(env, result, 0, 4, values);
   return result;
 }
 

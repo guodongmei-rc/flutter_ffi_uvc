@@ -23,7 +23,9 @@ internal object NativeAudio {
      * capture format: the native layer streams each altsetting briefly and
      * keeps the one that actually delivers data, so the returned rate is the
      * measured truth (descriptor rates are only estimates). Returns
-     * {sampleRate, channels, bits}, or null on failure.
+     * {sampleRate, channels, bits, starved}, or null on failure; starved is
+     * non-zero when the same measurement shows the host delivering only a
+     * fraction of the nominal rate.
      */
     external fun startDetected(): IntArray?
 
