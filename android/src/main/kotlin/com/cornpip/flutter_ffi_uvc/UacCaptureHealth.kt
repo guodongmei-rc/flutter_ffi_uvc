@@ -13,11 +13,13 @@ import android.hardware.usb.UsbDevice
  * libusb capture silent as well until the camera is re-plugged. So the
  * libusb capture always goes first, and only a camera whose capture the
  * native start-up measurement reports as starved (a steady 1/16 of the
- * nominal rate on a Huawei nova 12) is remembered here and recorded through
- * the Android USB audio path from then on.
+ * nominal rate on a Huawei nova 12) is remembered here. From then on it is
+ * recorded through the Android USB audio path, or treated as having no
+ * microphone when the platform exposes none for it.
  *
  * The verdict is kept per camera model: a slow delivery can also be a trait
- * of one camera firmware, and must not reroute every other camera.
+ * of one camera firmware (an iCatch V37 answers one poll in four with a
+ * quarter-size packet), and must not reroute every other camera.
  */
 internal object UacCaptureHealth {
     private const val PREFS_NAME = "flutter_ffi_uvc_audio"

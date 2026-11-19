@@ -590,11 +590,17 @@ class FlutterFfiUvcPlugin :
             }
 
             "probeAudioInterface" -> {
-                val info = try {
-                    NativeAudio.probe()
-                } catch (e: Throwable) {
-                    Log.w(TAG, "probeAudioInterface failed", e)
+                // A camera whose audio stream is known to be unusable here
+                // reports no audio interface at all.
+                val info = if (isAudioCaptureUnusable()) {
                     null
+                } else {
+                    try {
+                        NativeAudio.probe()
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "probeAudioInterface failed", e)
+                        null
+                    }
                 }
                 result.success(
                     info?.let {
@@ -688,11 +694,15 @@ class FlutterFfiUvcPlugin :
     // camera, and having opened it leaves the libusb capture silent too
     // until the camera is re-plugged. startDetected() measures the real
     // capture format while starting (the descriptor rate is only an
-    // estimate) and reports from that same measurement whether the usbfs
-    // isochronous reads are starved (a steady 1/16 of the nominal rate on a
-    // Huawei nova 12). Such a camera is remembered and records through
-    // AudioRecord from the next recording on — there the kernel USB audio
-    // driver does the streaming and is immune to that starvation.
+    // estimate) and reports from that same measurement whether the stream
+    // delivers only a fraction of its nominal rate — usbfs isochronous reads
+    // starved by the host (a steady 1/16 on a Huawei nova 12), or a camera
+    // firmware that answers one poll in four with a quarter-size packet (an
+    // iCatch V37). Such a capture is dropped: the recording goes video-only
+    // and the camera is remembered. From then on it records through
+    // AudioRecord when the platform exposes its microphone (the kernel USB
+    // audio driver does the streaming there), and counts as having no audio
+    // at all when the platform does not — see isAudioCaptureUnusable().
     //
     // Blocks for the native measurement window; call off the main thread.
     private fun createAudioEncoder(): AacAudioEncoder? {
@@ -701,10 +711,7 @@ class FlutterFfiUvcPlugin :
         if (context != null && device != null &&
             UacCaptureHealth.isLibusbStarved(context, device)
         ) {
-            val encoder = createUsbMicEncoder(context)
-            if (encoder != null) {
-                return encoder
-            }
+            return createUsbMicEncoder(context)
         }
         val info = try {
             NativeAudio.startDetected()
@@ -721,12 +728,16 @@ class FlutterFfiUvcPlugin :
             stopAudioCaptureQuietly()
             return null
         }
-        if (context != null && device != null && info.size > 3 && info[3] != 0) {
-            // This recording keeps the starved capture; the native stop
-            // hands the interface back to the kernel audio driver and later
-            // recordings use AudioRecord.
-            UacCaptureHealth.markLibusbStarved(context, device)
-            Log.w(TAG, "libusb UAC capture is starved; later recordings use AudioRecord")
+        if (info.size > 3 && info[3] != 0) {
+            // A fraction of the nominal rate is no audio track worth
+            // keeping. The native stop hands the interface back to the
+            // kernel audio driver for the AudioRecord path.
+            if (context != null && device != null) {
+                UacCaptureHealth.markLibusbStarved(context, device)
+            }
+            stopAudioCaptureQuietly()
+            Log.w(TAG, "libusb UAC capture is starved; recording video-only")
+            return null
         }
         Log.i(TAG, "Audio source: libusb UAC @ ${info[0]} Hz")
         return AacAudioEncoder(info[0], info[1])
@@ -735,28 +746,43 @@ class FlutterFfiUvcPlugin :
     /**
      * Encoder fed by the Android USB audio path, or null when that path is
      * unavailable (no mic permission, no USB audio input, AudioRecord
-     * refusing every rate) — the caller then falls back to libusb.
+     * refusing every rate) — the recording then goes video-only.
      */
     private fun createUsbMicEncoder(context: Context): AacAudioEncoder? {
         if (!hasRecordAudioPermission()) {
-            Log.i(TAG, "No RECORD_AUDIO permission; using libusb UAC capture")
+            Log.i(TAG, "No RECORD_AUDIO permission; recording video-only")
             return null
         }
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         val usbInput = UsbMicCapture.findUsbInput(audioManager)
         if (usbInput == null) {
-            Log.i(TAG, "No USB audio input device; using libusb UAC capture")
+            Log.i(TAG, "No USB audio input device; recording video-only")
             return null
         }
         val capture = UsbMicCapture.open(usbInput)
         if (capture == null) {
-            Log.w(TAG, "USB audio input found but AudioRecord failed; using libusb UAC")
+            Log.w(TAG, "USB audio input found but AudioRecord failed; recording video-only")
             return null
         }
         Log.i(TAG, "Audio source: AudioRecord USB mic @ ${capture.sampleRate} Hz")
         // The kernel path already applies sane gain; keep PCM as-is (fixed
         // unity gain, no AGC).
         return AacAudioEncoder(capture.sampleRate, capture.channelCount, 1f, capture)
+    }
+
+    /**
+     * True when the opened camera has no usable microphone on this phone:
+     * its libusb capture was measured as starved and the platform exposes
+     * no USB audio input for it either.
+     */
+    private fun isAudioCaptureUnusable(): Boolean {
+        val context = appContext ?: return false
+        val device = currentDevice ?: return false
+        if (!UacCaptureHealth.isLibusbStarved(context, device)) {
+            return false
+        }
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        return UsbMicCapture.findUsbInput(audioManager) == null
     }
 
     private fun hasRecordAudioPermission(): Boolean {
