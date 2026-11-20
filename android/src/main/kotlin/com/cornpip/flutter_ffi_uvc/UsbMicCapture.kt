@@ -5,6 +5,7 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.os.SystemClock
 import android.util.Log
 import java.nio.ByteBuffer
 
@@ -24,7 +25,43 @@ internal class UsbMicCapture(
     val sampleRate: Int get() = audioRecord.sampleRate
     val channelCount: Int get() = audioRecord.channelCount
 
-    fun start() = audioRecord.startRecording()
+    private var started = false
+
+    /** Starts the recording. Idempotent. */
+    fun start() {
+        if (started) {
+            return
+        }
+        audioRecord.startRecording()
+        started = true
+    }
+
+    /**
+     * Starts the recording and waits until it delivers PCM. Returns false
+     * when nothing arrives within [timeoutMs]: the platform lists the
+     * camera's microphone, yet the camera sends no audio (observed on a
+     * RunCam firmware, where the audio HAL read blocks for seconds). The PCM
+     * read while waiting is discarded.
+     */
+    fun awaitFirstData(timeoutMs: Long): Boolean {
+        start()
+        val scratch = ByteBuffer.allocateDirect(PROBE_CHUNK_BYTES)
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        while (SystemClock.elapsedRealtime() < deadline) {
+            scratch.clear()
+            val bytes = audioRecord.read(
+                scratch, scratch.remaining(), AudioRecord.READ_NON_BLOCKING,
+            )
+            if (bytes > 0) {
+                return true
+            }
+            if (bytes < 0) {
+                return false
+            }
+            Thread.sleep(PROBE_POLL_MS)
+        }
+        return false
+    }
 
     /**
      * Reads 16-bit PCM into [buffer] (must be direct). Blocks until data is
@@ -51,6 +88,8 @@ internal class UsbMicCapture(
 
     companion object {
         private const val TAG = "flutter_ffi_uvc"
+        private const val PROBE_CHUNK_BYTES = 4096
+        private const val PROBE_POLL_MS = 20L
 
         // 48 kHz first: USB audio devices almost always support it, and the
         // fewer resample hops AudioFlinger inserts, the better.

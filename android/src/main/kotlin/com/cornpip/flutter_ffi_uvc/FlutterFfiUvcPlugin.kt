@@ -60,6 +60,7 @@ class FlutterFfiUvcPlugin :
         // outcome is known within about one GOP.
         private const val RECORDING_SURFACE_WAIT_MS = 1500L
         private const val RECORDING_SURFACE_POLL_MS = 50L
+        private const val USB_MIC_FIRST_DATA_WAIT_MS = 1000L
 
         init {
             System.loadLibrary("flutter_ffi_uvc")
@@ -752,6 +753,9 @@ class FlutterFfiUvcPlugin :
     //
     // Blocks for the native measurement window; call off the main thread.
     private fun createAudioEncoder(): AacAudioEncoder? {
+        if (UacCaptureHealth.isMicSilent()) {
+            return null
+        }
         if (UacCaptureHealth.isLibusbStarved()) {
             return createUsbMicEncoder()
         }
@@ -809,18 +813,49 @@ class FlutterFfiUvcPlugin :
             Log.w(TAG, "USB audio input found but AudioRecord failed; recording video-only")
             return null
         }
+        if (!deliversAudio(capture)) {
+            UacCaptureHealth.markMicSilent()
+            releaseUsbMicInBackground(capture)
+            Log.w(TAG, "USB mic delivers no audio; recording video-only")
+            return null
+        }
         Log.i(TAG, "Audio source: AudioRecord USB mic @ ${capture.sampleRate} Hz")
         // The kernel path already applies sane gain; keep PCM as-is (fixed
         // unity gain, no AGC).
         return AacAudioEncoder(capture.sampleRate, capture.channelCount, 1f, capture)
     }
 
+    /** Whether [capture] delivers PCM; a capture that fails to start does not. */
+    private fun deliversAudio(capture: UsbMicCapture): Boolean =
+        try {
+            capture.awaitFirstData(USB_MIC_FIRST_DATA_WAIT_MS)
+        } catch (e: Exception) {
+            Log.w(TAG, "USB mic capture failed to start", e)
+            false
+        }
+
+    /**
+     * Stops and releases [capture] off the calling thread: stopping an
+     * AudioRecord whose HAL read is stuck waiting for a silent camera takes
+     * seconds, and must not delay the start of the recording.
+     */
+    private fun releaseUsbMicInBackground(capture: UsbMicCapture) {
+        Thread({
+            capture.stopCapture()
+            capture.release()
+        }, "uvc-usb-mic-release").start()
+    }
+
     /**
      * True when the opened camera has no usable microphone on this phone:
-     * its libusb capture was measured as starved and the platform exposes
-     * no USB audio input for it either.
+     * its microphone delivered no audio on any path, or its libusb capture
+     * was measured as starved and the platform exposes no USB audio input
+     * for it either.
      */
     private fun isAudioCaptureUnusable(): Boolean {
+        if (UacCaptureHealth.isMicSilent()) {
+            return true
+        }
         val context = appContext ?: return false
         if (!UacCaptureHealth.isLibusbStarved()) {
             return false

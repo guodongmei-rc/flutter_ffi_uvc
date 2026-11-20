@@ -14,8 +14,12 @@ package com.cornpip.flutter_ffi_uvc
  * nothing at all on a RunCam firmware) falls back to the Android USB audio
  * path. This flag lets the following recordings skip the measurement.
  *
- * The verdict lives in memory and is cleared with the connection. It is not
- * kept per camera model: units of one model differ by firmware, and a
+ * A camera whose microphone delivers nothing through the Android USB audio
+ * path either is remembered as silent: its recordings carry no audio track
+ * instead of an empty one.
+ *
+ * The verdicts live in memory and are cleared with the connection. They are
+ * not kept per camera model: units of one model differ by firmware, and a
  * verdict stored for one would reroute a healthy unit as well.
  */
 internal object UacCaptureHealth {
@@ -29,8 +33,19 @@ internal object UacCaptureHealth {
         libusbStarved = true
     }
 
-    /** Forgets the verdict; call whenever the camera connection changes. */
+    @Volatile
+    private var micSilent = false
+
+    /** Whether this connection's microphone delivered no audio on any path. */
+    fun isMicSilent(): Boolean = micSilent
+
+    fun markMicSilent() {
+        micSilent = true
+    }
+
+    /** Forgets the verdicts; call whenever the camera connection changes. */
     fun reset() {
         libusbStarved = false
+        micSilent = false
     }
 }
