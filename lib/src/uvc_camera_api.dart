@@ -1422,6 +1422,16 @@ abstract interface class UvcCamera {
   /// device; returns null when none is open.
   Future<UvcAudioInfo?> queryAudioInterface();
 
+  /// Whether the opened device's microphone was found to deliver no audio.
+  /// Android only.
+  ///
+  /// [queryAudioInterface] only reports what the descriptors declare. Whether
+  /// the stream carries audio is measured when [startVideoRecording] starts
+  /// with `withAudio` true, so this is meaningful once that call returned:
+  /// true means neither capture path yielded audio and the recording is
+  /// video-only. The verdict is kept until the device is closed.
+  Future<bool> isAudioCaptureSilent();
+
   /// Returns all controls supported by the currently opened device.
   List<UvcCameraControl> supportedControls();
 

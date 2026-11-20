@@ -439,6 +439,14 @@ class _FlutterFfiUvcCamera implements UvcCamera {
     return UvcAudioInfo.fromMap(info);
   }
 
+  @override
+  Future<bool> isAudioCaptureSilent() async {
+    _ensureAndroid();
+    final bool? silent =
+        await _textureChannel.invokeMethod<bool>('isAudioCaptureSilent');
+    return silent ?? false;
+  }
+
   bool _videoRecording = false;
 
   @override

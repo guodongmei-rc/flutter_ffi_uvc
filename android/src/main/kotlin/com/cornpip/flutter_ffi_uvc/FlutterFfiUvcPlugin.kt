@@ -602,17 +602,14 @@ class FlutterFfiUvcPlugin :
             }
 
             "probeAudioInterface" -> {
-                // A camera whose audio stream is known to be unusable here
-                // reports no audio interface at all.
-                val info = if (isAudioCaptureUnusable()) {
+                // Reports what the descriptors declare; whether the stream
+                // actually delivers audio is a separate question, answered
+                // by isAudioCaptureSilent once a recording has started.
+                val info = try {
+                    NativeAudio.probe()
+                } catch (e: Throwable) {
+                    Log.w(TAG, "probeAudioInterface failed", e)
                     null
-                } else {
-                    try {
-                        NativeAudio.probe()
-                    } catch (e: Throwable) {
-                        Log.w(TAG, "probeAudioInterface failed", e)
-                        null
-                    }
                 }
                 result.success(
                     info?.let {
@@ -624,6 +621,8 @@ class FlutterFfiUvcPlugin :
                     },
                 )
             }
+
+            "isAudioCaptureSilent" -> result.success(isAudioCaptureSilent())
 
             else -> result.notImplemented()
         }
@@ -747,9 +746,9 @@ class FlutterFfiUvcPlugin :
     // AudioRecord when the platform exposes the camera's microphone (the
     // kernel USB audio driver does the streaming there). The verdict holds
     // for the current connection only — see UacCaptureHealth — so later
-    // recordings skip the measurement, and the camera counts as having no
-    // audio at all when the platform exposes no microphone for it — see
-    // isAudioCaptureUnusable().
+    // recordings skip the measurement. A camera that delivers nothing
+    // through AudioRecord either is recorded video-only, without an empty
+    // audio track — see isAudioCaptureSilent().
     //
     // Blocks for the native measurement window; call off the main thread.
     private fun createAudioEncoder(): AacAudioEncoder? {
@@ -847,12 +846,12 @@ class FlutterFfiUvcPlugin :
     }
 
     /**
-     * True when the opened camera has no usable microphone on this phone:
-     * its microphone delivered no audio on any path, or its libusb capture
+     * True when the opened camera's microphone was found to deliver no
+     * audio on this phone: neither path yielded PCM, or its libusb capture
      * was measured as starved and the platform exposes no USB audio input
-     * for it either.
+     * for it either. Known only after a recording with audio has started.
      */
-    private fun isAudioCaptureUnusable(): Boolean {
+    private fun isAudioCaptureSilent(): Boolean {
         if (UacCaptureHealth.isMicSilent()) {
             return true
         }
