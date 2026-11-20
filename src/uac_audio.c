@@ -589,7 +589,8 @@ static void LIBUSB_CALL uac_audio_transfer_cb(struct libusb_transfer *transfer) 
 #define UAC_MEASURE_WINDOW_MS 300
 /* A capture delivering less than 1/UAC_STARVED_DIVISOR of the descriptor
  * rate counts as starved: far below any healthy stream, well above the 1/16
- * starvation, so a momentary hiccup never flips the verdict. */
+ * starvation, so a momentary hiccup never flips the verdict. No delivery at
+ * all (observed on a RunCam firmware) is the limiting case. */
 #define UAC_STARVED_DIVISOR 4
 
 /* UAC1 sampling-frequency control (spec 5.2.1.1): a class request on the
@@ -831,7 +832,10 @@ uac_audio_t *uac_audio_start(
 
   uac_audio_info_t final = *info;
   const int frame_bytes = final.channels * ((final.bits + 7) / 8);
-  if (frame_bytes > 0 && bps > 0) {
+  /* A window that delivered nothing at all is measured too: it snaps to no
+   * rate and is below every threshold, so a camera streaming zero bytes
+   * counts as starved instead of passing for a healthy capture. */
+  if (frame_bytes > 0) {
     const int measured = (int)(bps / (uint64_t)frame_bytes);
     const int snapped = uac_snap_sample_rate(measured);
     if (snapped > 0) {

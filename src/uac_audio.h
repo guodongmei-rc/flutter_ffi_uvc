@@ -34,7 +34,7 @@ typedef struct {
   /* Set by uac_audio_start(): non-zero when the measured delivery is far
    * below the descriptor rate and matches no standard sample rate — the
    * host starves the isochronous reads (a steady 1/16 of the nominal rate
-   * on a Huawei nova 12). */
+   * on a Huawei nova 12) or the camera delivers nothing at all. */
   int starved;
 } uac_audio_info_t;
 
@@ -90,7 +90,7 @@ int uac_audio_read(uac_audio_t *audio, uint8_t *dst, int max_bytes, int timeout_
 
 /* Stops transfers, releases the interface and frees the session. A starved
  * session hands the interface back to the kernel audio driver it detached,
- * so the platform audio path can take over for later recordings. Blocks
+ * so the platform audio path can take over. Blocks
  * until in-flight callbacks and active readers have left the session, so
  * the caller must not hold a lock those threads need. Safe on NULL. */
 void uac_audio_stop(uac_audio_t *audio);

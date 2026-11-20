@@ -741,20 +741,19 @@ class FlutterFfiUvcPlugin :
     // delivers only a fraction of its nominal rate — usbfs isochronous reads
     // starved by the host (a steady 1/16 on a Huawei nova 12), or a camera
     // firmware that answers one poll in four with a quarter-size packet (an
-    // iCatch V37). Such a capture is dropped: the recording goes video-only
-    // and the camera is remembered. From then on it records through
-    // AudioRecord when the platform exposes its microphone (the kernel USB
-    // audio driver does the streaming there), and counts as having no audio
-    // at all when the platform does not — see isAudioCaptureUnusable().
+    // iCatch V37), or a firmware that delivers nothing at all (a RunCam).
+    // Such a capture is dropped and the same recording carries on through
+    // AudioRecord when the platform exposes the camera's microphone (the
+    // kernel USB audio driver does the streaming there). The verdict holds
+    // for the current connection only — see UacCaptureHealth — so later
+    // recordings skip the measurement, and the camera counts as having no
+    // audio at all when the platform exposes no microphone for it — see
+    // isAudioCaptureUnusable().
     //
     // Blocks for the native measurement window; call off the main thread.
     private fun createAudioEncoder(): AacAudioEncoder? {
-        val context = appContext
-        val device = currentDevice
-        if (context != null && device != null &&
-            UacCaptureHealth.isLibusbStarved(context, device)
-        ) {
-            return createUsbMicEncoder(context)
+        if (UacCaptureHealth.isLibusbStarved()) {
+            return createUsbMicEncoder()
         }
         val info = try {
             NativeAudio.startDetected()
@@ -775,12 +774,10 @@ class FlutterFfiUvcPlugin :
             // A fraction of the nominal rate is no audio track worth
             // keeping. The native stop hands the interface back to the
             // kernel audio driver for the AudioRecord path.
-            if (context != null && device != null) {
-                UacCaptureHealth.markLibusbStarved(context, device)
-            }
+            UacCaptureHealth.markLibusbStarved()
             stopAudioCaptureQuietly()
-            Log.w(TAG, "libusb UAC capture is starved; recording video-only")
-            return null
+            Log.w(TAG, "libusb UAC capture is starved; switching to AudioRecord")
+            return createUsbMicEncoder()
         }
         Log.i(TAG, "Audio source: libusb UAC @ ${info[0]} Hz")
         return AacAudioEncoder(info[0], info[1])
@@ -791,7 +788,12 @@ class FlutterFfiUvcPlugin :
      * unavailable (no mic permission, no USB audio input, AudioRecord
      * refusing every rate) — the recording then goes video-only.
      */
-    private fun createUsbMicEncoder(context: Context): AacAudioEncoder? {
+    private fun createUsbMicEncoder(): AacAudioEncoder? {
+        val context = appContext
+        if (context == null) {
+            Log.w(TAG, "Context not available; recording video-only")
+            return null
+        }
         if (!hasRecordAudioPermission()) {
             Log.i(TAG, "No RECORD_AUDIO permission; recording video-only")
             return null
@@ -820,8 +822,7 @@ class FlutterFfiUvcPlugin :
      */
     private fun isAudioCaptureUnusable(): Boolean {
         val context = appContext ?: return false
-        val device = currentDevice ?: return false
-        if (!UacCaptureHealth.isLibusbStarved(context, device)) {
+        if (!UacCaptureHealth.isLibusbStarved()) {
             return false
         }
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -950,6 +951,7 @@ class FlutterFfiUvcPlugin :
             return
         }
         logUsbDeviceLayout(device, connection)
+        UacCaptureHealth.reset()
         currentDevice = device
         currentConnection = connection
         result.success(mapOf("fileDescriptor" to connection.fileDescriptor))
@@ -959,6 +961,7 @@ class FlutterFfiUvcPlugin :
         currentConnection?.close()
         currentConnection = null
         currentDevice = null
+        UacCaptureHealth.reset()
     }
 
     private fun deviceToMap(device: UsbDevice): Map<String, Any> = mapOf(
