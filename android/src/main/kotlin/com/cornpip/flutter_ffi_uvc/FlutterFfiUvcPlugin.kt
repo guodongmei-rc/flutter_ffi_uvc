@@ -12,6 +12,7 @@ import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
+import android.media.MediaCodec
 import android.media.MediaCodecList
 import android.media.AudioManager
 import android.media.MediaFormat
@@ -663,6 +664,12 @@ class FlutterFfiUvcPlugin :
             // paths; NativeAudio.stop is idempotent.
             if (audioEncoder != null) {
                 stopAudioCaptureQuietly()
+            }
+            // The phone's codec refused this recording (e.g. a hardware
+            // encoder that cannot run next to the preview decoder at this
+            // size), as opposed to any other start-up failure.
+            if (e is MediaCodec.CodecException) {
+                errorCode = "encoder_unavailable"
             }
             errorMessage = e.message ?: "Failed to start recording"
         }
