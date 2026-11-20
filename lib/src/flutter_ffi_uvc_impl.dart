@@ -19,19 +19,80 @@ import 'uvc_camera_api.dart';
 /// native state is process-global and mutex-protected, so the calls are safe
 /// from a helper isolate; the queue keeps them from overlapping or reordering
 /// now that callers no longer block until each one returns.
+///
+/// One worker isolate serves every call. Spawning an isolate per call is not
+/// an option: with a debugger attached each spawn was measured at about 1.4
+/// seconds, which delayed every open, stop and close by that much.
 class _NativeCallQueue {
   Future<void> _tail = Future<void>.value();
+  Future<SendPort>? _worker;
 
   /// Completes once every call queued so far has finished.
   Future<void> get idle => _tail;
 
+  /// Starts the worker isolate ahead of the first call. Idempotent.
+  void warmUp() {
+    _ensureWorker();
+  }
+
   /// Queues [call]. It must be a top-level function or a closure created by
-  /// one, so that nothing but its arguments is sent to the helper isolate.
+  /// one, so that nothing but its arguments is sent to the worker isolate.
   Future<T> run<T>(T Function() call) {
-    final Future<T> result = _tail.then((_) => Isolate.run(call));
+    final Future<T> result = _tail.then((_) => _dispatch(call));
     _tail = result.then<void>((_) {}, onError: (Object _) {});
     return result;
   }
+
+  Future<SendPort> _ensureWorker() => _worker ??= _spawnWorker();
+
+  Future<SendPort> _spawnWorker() async {
+    final ReceivePort handshake = ReceivePort();
+    await Isolate.spawn(
+      _nativeCallWorkerMain,
+      handshake.sendPort,
+      debugName: 'flutter_ffi_uvc native calls',
+    );
+    return await handshake.first as SendPort;
+  }
+
+  Future<T> _dispatch<T>(T Function() call) async {
+    final SendPort worker = await _ensureWorker();
+    final ReceivePort reply = ReceivePort();
+    worker.send(_NativeCallRequest(call, reply.sendPort));
+    final Object? response = await reply.first;
+    if (response is _NativeCallFailure) {
+      throw StateError('Native call failed: ${response.message}');
+    }
+    return response as T;
+  }
+}
+
+class _NativeCallRequest {
+  const _NativeCallRequest(this.call, this.replyPort);
+
+  final Object? Function() call;
+  final SendPort replyPort;
+}
+
+class _NativeCallFailure {
+  const _NativeCallFailure(this.message);
+
+  final String message;
+}
+
+/// Entry point of the worker isolate: runs each request as it arrives and
+/// sends its result back.
+void _nativeCallWorkerMain(SendPort handshake) {
+  final ReceivePort inbox = ReceivePort();
+  handshake.send(inbox.sendPort);
+  inbox.listen((Object? message) {
+    final _NativeCallRequest request = message as _NativeCallRequest;
+    try {
+      request.replyPort.send(request.call());
+    } catch (e) {
+      request.replyPort.send(_NativeCallFailure(e.toString()));
+    }
+  });
 }
 
 void _nativeStopPreview() => _bindings.uvc_stop_preview();
@@ -44,6 +105,14 @@ int _nativeRecoverStreamInterfaces() =>
 int _nativeResetDevicePort() => _bindings.uvc_reset_device_port();
 
 int Function() _nativeOpenFd(int fd) => () => _bindings.uvc_open_fd(fd);
+
+int Function() _nativeStartPreview(
+  int frameFormat,
+  int width,
+  int height,
+  int fps,
+) =>
+    () => _bindings.uvc_start_preview(frameFormat, width, height, fps);
 
 class _PreviewRequest {
   const _PreviewRequest({
@@ -159,7 +228,12 @@ class _FlutterFfiUvcCamera implements UvcCamera {
     });
 
     try {
-      final int startResult = openPreview(mode);
+      // Stream negotiation blocks for about half a second; run it off the
+      // UI isolate like the other blocking calls.
+      _recordPreviewRequest(mode);
+      final int startResult = await _nativeCalls.run(
+        _nativeStartPreview(mode.frameFormat, mode.width, mode.height, mode.fps),
+      );
       if (startResult != 0) {
         final String error = this.lastError;
         return UvcPreviewStartResult(
@@ -493,6 +567,7 @@ class _FlutterFfiUvcCamera implements UvcCamera {
   @override
   Future<List<UvcUsbDevice>> listUsbDevices() async {
     _ensureAndroid();
+    _nativeCalls.warmUp();
     final List<Object?>? raw =
         await _usbChannel.invokeListMethod<Object?>('listUsbDevices');
     return (raw ?? <Object?>[])
@@ -504,6 +579,7 @@ class _FlutterFfiUvcCamera implements UvcCamera {
   @override
   Future<int> openUsbDevice(int deviceId) async {
     _ensureAndroid();
+    _nativeCalls.warmUp();
     // The platform side closes the previous USB connection before opening
     // the new one; a native close still queued must not find it gone.
     await _nativeCalls.idle;
@@ -541,6 +617,17 @@ class _FlutterFfiUvcCamera implements UvcCamera {
 
   @override
   int openPreview(UvcCameraMode mode) {
+    _recordPreviewRequest(mode);
+    return _bindings.uvc_start_preview(
+      mode.frameFormat,
+      mode.width,
+      mode.height,
+      mode.fps,
+    );
+  }
+
+  /// Bookkeeping shared by every preview start, done before the native call.
+  void _recordPreviewRequest(UvcCameraMode mode) {
     _resetPreviewState();
     // Record the mode so stall detection can report and restart previews
     // started through openPreview directly, using default verification.
@@ -556,12 +643,6 @@ class _FlutterFfiUvcCamera implements UvcCamera {
         timeout: const Duration(seconds: 2),
       );
     }
-    return _bindings.uvc_start_preview(
-      mode.frameFormat,
-      mode.width,
-      mode.height,
-      mode.fps,
-    );
   }
 
   @override
@@ -703,6 +784,9 @@ class _FlutterFfiUvcCamera implements UvcCamera {
   @override
   Stream<UvcDeviceEvent> get deviceEvents {
     _ensureAndroid();
+    // An app listening for cameras is about to open one: have the worker
+    // isolate ready by then.
+    _nativeCalls.warmUp();
     return _deviceEventStream ??= _deviceEventChannel
         .receiveBroadcastStream()
         .map(
