@@ -134,10 +134,14 @@ internal class VideoRecorder(
             tracksExpected = if (audioStarted) 2 else 1
 
             val encoder = MediaCodec.createEncoderByType(mimeType)
+            // Owned by the recorder from here on, so that a failing
+            // configure()/start() releases it in the catch below. A leaked
+            // encoder keeps its hardware session until the GC finalizes it,
+            // and on some phones every later video codec then fails to start.
+            codec = encoder
             if (useBufferInput) {
                 configureBufferInput(encoder)
                 encoder.start()
-                codec = encoder
 
                 drainThread = Thread({ drainLoop() }, "uvc-video-recorder").also { it.start() }
                 feedThread = Thread({ feedLoop() }, "uvc-video-feed").also { it.start() }
@@ -155,9 +159,8 @@ internal class VideoRecorder(
             }
             encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             val surface = encoder.createInputSurface()
-            encoder.start()
-            codec = encoder
             inputSurface = surface
+            encoder.start()
 
             drainThread = Thread({ drainLoop() }, "uvc-video-recorder").also { it.start() }
             return surface
