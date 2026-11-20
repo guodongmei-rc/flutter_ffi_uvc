@@ -33,6 +33,24 @@ class _NativeCallQueue {
   /// Starts the worker isolate ahead of the first call. Idempotent.
   void warmUp() {
     _ensureWorker();
+    _tempStartHeartbeat();
+  }
+
+  // TEMP-TIMING: reports whenever the UI isolate was unable to run for 150ms
+  // or more; remove after the investigation.
+  Timer? _tempHeartbeat;
+  void _tempStartHeartbeat() {
+    if (_tempHeartbeat != null) return;
+    final Stopwatch clock = Stopwatch()..start();
+    int last = 0;
+    _tempHeartbeat = Timer.periodic(const Duration(milliseconds: 50), (_) {
+      final int now = clock.elapsedMilliseconds;
+      if (now - last >= 150) {
+        // ignore: avoid_print
+        print('TEMP-TIMING UI isolate blocked ${now - last}ms');
+      }
+      last = now;
+    });
   }
 
   /// Queues [call]. It must be a top-level function or a closure created by
@@ -56,10 +74,16 @@ class _NativeCallQueue {
   }
 
   Future<T> _dispatch<T>(T Function() call) async {
+    final Stopwatch tempClock = Stopwatch()..start();
     final SendPort worker = await _ensureWorker();
+    final int tempWorkerReadyMs = tempClock.elapsedMilliseconds;
     final ReceivePort reply = ReceivePort();
     worker.send(_NativeCallRequest(call, reply.sendPort));
     final Object? response = await reply.first;
+    // TEMP-TIMING: remove after the investigation.
+    // ignore: avoid_print
+    print('TEMP-TIMING native call $call workerReady=${tempWorkerReadyMs}ms '
+        'total=${tempClock.elapsedMilliseconds}ms');
     if (response is _NativeCallFailure) {
       throw StateError('Native call failed: ${response.message}');
     }

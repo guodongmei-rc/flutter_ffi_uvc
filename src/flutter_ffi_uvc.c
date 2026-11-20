@@ -34,6 +34,39 @@
 #if defined(__ANDROID__)
 #include "uac_audio.h"
 #include "gl_blit.h"
+
+/* TEMP-TIMING: temporary diagnostics for the slow/janky open; remove after
+ * the investigation. TEMP_MARK logs a timestamped phase marker with the
+ * calling thread; TEMP_STATE_LOCK takes the state mutex and logs any wait of
+ * 50ms or more, so a UI thread stuck behind a long native call shows up. */
+#include <time.h>
+#include <unistd.h>
+static uint64_t temp_timing_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+#if defined(__ANDROID__)
+#define TEMP_MARK(...) \
+  do { \
+    char temp_mark_text[160]; \
+    snprintf(temp_mark_text, sizeof(temp_mark_text), __VA_ARGS__); \
+    __android_log_print( \
+        ANDROID_LOG_INFO, "flutter_ffi_uvc", "TEMP-TIMING t=%llu tid=%d %s", \
+        (unsigned long long)temp_timing_ms(), (int)gettid(), temp_mark_text); \
+  } while (0)
+#else
+#define TEMP_MARK(...) do { } while (0)
+#endif
+static void temp_state_lock(pthread_mutex_t *mutex, const char *func, int line) {
+  const uint64_t t0 = temp_timing_ms();
+  pthread_mutex_lock(mutex);
+  const uint64_t waited = temp_timing_ms() - t0;
+  if (waited >= 50) {
+    TEMP_MARK("lock waited %llums at %s:%d", (unsigned long long)waited, func, line);
+  }
+}
+#define TEMP_STATE_LOCK() temp_state_lock(&g_uvc_state.mutex, __func__, __LINE__)
 #endif
 
 int g_uvc_native_log_level = UVC_LOG_LEVEL_DEFAULT;
@@ -1033,7 +1066,7 @@ static uint64_t render_frame_to_target(
 
 static void *render_thread_main(void *arg) {
   (void)arg;
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   for (;;) {
     while (!g_uvc_state.render_thread_stop &&
            !g_uvc_state.preview_producer_release_requested &&
@@ -1060,7 +1093,7 @@ static void *render_thread_main(void *arg) {
       g_uvc_state.preview_producer_release_requested = 0;
       pthread_mutex_unlock(&g_uvc_state.mutex);
       gl_blit_destroy(stale_blit);
-      pthread_mutex_lock(&g_uvc_state.mutex);
+      TEMP_STATE_LOCK();
       g_uvc_state.preview_producer_release_done = 1;
       pthread_cond_broadcast(&g_uvc_state.render_cond);
       continue;
@@ -1107,7 +1140,7 @@ static void *render_thread_main(void *arg) {
       ANativeWindow_release(windows[i]);
     }
 
-    pthread_mutex_lock(&g_uvc_state.mutex);
+    TEMP_STATE_LOCK();
     if (cycle_render_ns > 0) {
       g_uvc_state.stats.il_render_sum_ns += cycle_render_ns;
       g_uvc_state.stats.il_render_count += 1;
@@ -1144,7 +1177,7 @@ static void *render_thread_main(void *arg) {
       g_uvc_state.render_targets[i].blit_failed = 0;
     }
   }
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   for (int i = 0; i < RENDER_TARGET_COUNT; i++) {
     if (g_uvc_state.render_targets[i].window != NULL) {
       ANativeWindow_release(g_uvc_state.render_targets[i].window);
@@ -1222,7 +1255,7 @@ static void render_set_target_locked(int index, ANativeWindow *window) {
 // g_uvc_state.mutex held: the thread takes that mutex in every cycle.
 // Idempotent.
 static void render_thread_stop(void) {
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   if (!g_uvc_state.render_thread_started) {
     pthread_mutex_unlock(&g_uvc_state.mutex);
     return;
@@ -1233,7 +1266,7 @@ static void render_thread_stop(void) {
 
   pthread_join(g_uvc_state.render_thread, NULL);
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   g_uvc_state.render_thread_started = 0;
   g_uvc_state.render_thread_stop = 0;
   pthread_mutex_unlock(&g_uvc_state.mutex);
@@ -1444,7 +1477,7 @@ FFI_PLUGIN_EXPORT int uvc_rec_start_queue(
     return UVC_ERROR_INVALID_PARAM;
   }
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   if (g_uvc_state.rec_queue_active) {
     pthread_mutex_unlock(&g_uvc_state.mutex);
     set_last_error("uvc_rec_start_queue: queue already active");
@@ -1510,7 +1543,7 @@ FFI_PLUGIN_EXPORT int uvc_rec_read_yuv(
     return UVC_ERROR_INVALID_PARAM;
   }
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   if (!g_uvc_state.rec_queue_active) {
     pthread_mutex_unlock(&g_uvc_state.mutex);
     return -1;
@@ -1615,7 +1648,7 @@ FFI_PLUGIN_EXPORT int uvc_rec_read_yuv(
     convert_ns = monotonic_time_ns() - convert_start_ns;
   }
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   if (convert_ns > 0) {
     g_uvc_state.stats.il_rec_convert_sum_ns += convert_ns;
     g_uvc_state.stats.il_rec_convert_count += 1;
@@ -1675,7 +1708,7 @@ FFI_PLUGIN_EXPORT int uvc_rec_read_yuv(
 }
 
 FFI_PLUGIN_EXPORT void uvc_rec_stop_queue(void) {
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   const int was_active = g_uvc_state.rec_queue_active;
   const uint64_t dropped = g_uvc_state.rec_dropped_frames;
   g_uvc_state.rec_queue_active = 0;
@@ -2125,7 +2158,7 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
           rec_window,
           (const uint8_t *)frame->data,
           frame->data_bytes);
-      pthread_mutex_lock(&g_uvc_state.mutex);
+      TEMP_STATE_LOCK();
       if (rec_feed_result == H26X_FEED_ERROR) {
         if (g_uvc_state.h26x_rec_decoder == rec_decoder) {
           h26x_decoder_destroy(g_uvc_state.h26x_rec_decoder);
@@ -2143,7 +2176,7 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
       ANativeWindow_release(rec_window);
     }
 
-    pthread_mutex_lock(&g_uvc_state.mutex);
+    TEMP_STATE_LOCK();
     if (feed_result == H26X_FEED_ERROR) {
       g_uvc_state.stats.decode_failure_count += 1;
       set_last_error("H.264/H.265 hardware decode failed");
@@ -2274,7 +2307,7 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
           width,
           height,
           uvc_strerror(decode_result));
-      pthread_mutex_lock(&g_uvc_state.mutex);
+      TEMP_STATE_LOCK();
       if (decode_result == UVC_ERROR_NO_MEM) {
         g_uvc_state.stats.buffer_allocation_failure_count += 1;
       } else {
@@ -2297,7 +2330,7 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
           width,
           height,
           required_rgb_bytes);
-      pthread_mutex_lock(&g_uvc_state.mutex);
+      TEMP_STATE_LOCK();
       g_uvc_state.stats.buffer_allocation_failure_count += 1;
       g_uvc_state.stats.decode_failure_count += 1;
       set_last_error("Failed to allocate RGB frame buffer (%zu bytes)", required_rgb_bytes);
@@ -2315,7 +2348,7 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
           width,
           height,
           uvc_strerror(convert_result));
-      pthread_mutex_lock(&g_uvc_state.mutex);
+      TEMP_STATE_LOCK();
       g_uvc_state.stats.conversion_failure_count += 1;
       g_uvc_state.stats.decode_failure_count += 1;
       set_last_error("uvc_any2rgb failed: %s", uvc_strerror(convert_result));
@@ -2324,7 +2357,7 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
     }
 
     if (!convert_rgb_frame_to_staging()) {
-      pthread_mutex_lock(&g_uvc_state.mutex);
+      TEMP_STATE_LOCK();
       g_uvc_state.stats.buffer_allocation_failure_count += 1;
       g_uvc_state.stats.decode_failure_count += 1;
       set_last_error(
@@ -2348,7 +2381,7 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
   uvc_frame_listener_t frame_listener = NULL;
   const uint64_t phase2_ns = monotonic_time_ns() - phase2_start_ns;
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   if (g_uvc_state.stopping_preview) {
     finish_callback_locked();
     pthread_mutex_unlock(&g_uvc_state.mutex);
@@ -2530,17 +2563,20 @@ static void reset_usb_device_by_fd(int fd) {
   libusb_device_handle *reset_handle = NULL;
 
   int rc = libusb_init(&reset_ctx);
+  TEMP_MARK("reset: libusb_init rc=%d", rc);
   if (rc != 0) {
     UVC_LOGW("UVC_NATIVE", "usb reset: libusb_init failed rc=%d", rc);
     return;
   }
   rc = libusb_wrap_sys_device(reset_ctx, (intptr_t)fd, &reset_handle);
+  TEMP_MARK("reset: wrap_sys_device rc=%d", rc);
   if (rc != 0) {
     UVC_LOGW("UVC_NATIVE", "usb reset: wrap_sys_device failed rc=%d", rc);
     libusb_exit(reset_ctx);
     return;
   }
   rc = libusb_reset_device(reset_handle);
+  TEMP_MARK("reset: libusb_reset_device rc=%d", rc);
   if (rc != 0) {
     UVC_LOGW("UVC_NATIVE", "usb reset: libusb_reset_device failed rc=%d", rc);
   } else {
@@ -2555,10 +2591,11 @@ static void reset_usb_device_by_fd(int fd) {
   // this is only a minimum settle — the first stream probe after open
   // should still use a generous timeout.
   usleep(500 * 1000);
+  TEMP_MARK("reset: settle sleep done");
 }
 
 FFI_PLUGIN_EXPORT int uvc_recover_stream_interfaces(void) {
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   if (g_uvc_state.devh == NULL) {
     pthread_mutex_unlock(&g_uvc_state.mutex);
     set_last_error("uvc_recover_stream_interfaces: no open device");
@@ -2571,7 +2608,7 @@ FFI_PLUGIN_EXPORT int uvc_recover_stream_interfaces(void) {
 }
 
 FFI_PLUGIN_EXPORT int uvc_reset_device_port(void) {
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   const int fd = g_uvc_state.device_fd;
   if (fd < 0) {
     pthread_mutex_unlock(&g_uvc_state.mutex);
@@ -2593,7 +2630,8 @@ FFI_PLUGIN_EXPORT int uvc_open_fd(int fd) {
   uvc_device_handle_t *devh_to_stop = NULL;
   int should_stop_streaming = 0;
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_MARK("open: enter fd=%d", fd);
+  TEMP_STATE_LOCK();
   should_stop_streaming = begin_stop_preview_locked(&devh_to_stop);
   pthread_mutex_unlock(&g_uvc_state.mutex);
 
@@ -2601,12 +2639,13 @@ FFI_PLUGIN_EXPORT int uvc_open_fd(int fd) {
     uvc_stop_streaming(devh_to_stop);
   }
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   if (should_stop_streaming) {
     finish_stop_preview_locked();
   }
   close_device_resources_locked();
   clear_last_error();
+  TEMP_MARK("open: old session closed");
 
   // Full port-level reset before wrapping: firmware left streaming by a
   // dead process can otherwise keep ignoring new negotiations. Held under
@@ -2614,6 +2653,7 @@ FFI_PLUGIN_EXPORT int uvc_open_fd(int fd) {
   reset_usb_device_by_fd(fd);
 
   uvc_error_t result = uvc_init(&g_uvc_state.ctx, NULL);
+  TEMP_MARK("open: uvc_init result=%d", (int)result);
   if (result != UVC_SUCCESS) {
     set_last_error("uvc_init failed: %s", uvc_strerror(result));
     close_device_resources_locked();
@@ -2622,6 +2662,7 @@ FFI_PLUGIN_EXPORT int uvc_open_fd(int fd) {
   }
 
   result = uvc_wrap(fd, g_uvc_state.ctx, &g_uvc_state.devh);
+  TEMP_MARK("open: uvc_wrap result=%d", (int)result);
   if (result != UVC_SUCCESS) {
     set_last_error("uvc_wrap failed: %s", uvc_strerror(result));
     close_device_resources_locked();
@@ -2633,6 +2674,7 @@ FFI_PLUGIN_EXPORT int uvc_open_fd(int fd) {
   // A previous process may have died mid-stream, leaving the camera in a
   // stale streaming state. Reset the streaming interfaces before use.
   reset_streaming_interfaces_locked(g_uvc_state.devh);
+  TEMP_MARK("open: streaming interfaces reset, done");
 
   UVC_LOGI("UVC_NATIVE", "uvc_open_fd success fd=%d", fd);
   uvc_device_t *device = uvc_get_device(g_uvc_state.devh);
@@ -2684,7 +2726,8 @@ FFI_PLUGIN_EXPORT int uvc_start_preview(
   uvc_device_handle_t *devh_to_stop = NULL;
   int should_stop_streaming = 0;
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_MARK("start_preview: enter %dx%d", width, height);
+  TEMP_STATE_LOCK();
 
   if (g_uvc_state.devh == NULL) {
     set_last_error("Camera is not open");
@@ -2699,7 +2742,7 @@ FFI_PLUGIN_EXPORT int uvc_start_preview(
     uvc_stop_streaming(devh_to_stop);
   }
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   if (should_stop_streaming) {
     finish_stop_preview_locked();
 #if defined(__ANDROID__)
@@ -2776,7 +2819,7 @@ FFI_PLUGIN_EXPORT int uvc_get_supported_modes_json(uint8_t *buffer, int buffer_l
     return 0;
   }
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   if (g_uvc_state.devh == NULL) {
     UVC_LOGD("UVC_NATIVE", "uvc_get_supported_modes_json called without open device");
     pthread_mutex_unlock(&g_uvc_state.mutex);
@@ -2886,7 +2929,7 @@ FFI_PLUGIN_EXPORT int uvc_get_stream_stats_json(uint8_t *buffer, int buffer_leng
     return 0;
   }
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   const ffi_uvc_stream_stats_t stats = g_uvc_state.stats;
   const uint64_t now_ns = monotonic_time_ns();
   const uint64_t end_ns =
@@ -2987,8 +3030,9 @@ FFI_PLUGIN_EXPORT void uvc_stop_preview(void) {
   uvc_device_handle_t *devh_to_stop = NULL;
   int should_stop_streaming = 0;
 
+  TEMP_MARK("stop_preview: enter");
   UVC_LOGD("UVC_NATIVE", "uvc_stop_preview begin");
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   UVC_LOGD(
       "UVC_NATIVE",
       "uvc_stop_preview locked previewing=%d devh=%p",
@@ -3003,7 +3047,7 @@ FFI_PLUGIN_EXPORT void uvc_stop_preview(void) {
     UVC_LOGD("UVC_NATIVE", "uvc_stop_preview after uvc_stop_streaming");
   }
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   if (g_uvc_state.stats.start_monotonic_ns != 0 &&
       g_uvc_state.stats.stop_monotonic_ns == 0) {
     g_uvc_state.stats.stop_monotonic_ns = monotonic_time_ns();
@@ -3019,13 +3063,14 @@ FFI_PLUGIN_EXPORT void uvc_stop_preview(void) {
 #endif
   pthread_mutex_unlock(&g_uvc_state.mutex);
   UVC_LOGD("UVC_NATIVE", "uvc_stop_preview end");
+  TEMP_MARK("stop_preview: done");
 }
 
 FFI_PLUGIN_EXPORT void uvc_close_device(void) {
   uvc_device_handle_t *devh_to_stop = NULL;
   int should_stop_streaming = 0;
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   UVC_LOGD(
       "UVC_NATIVE",
       "uvc_close_device begin previewing=%d devh=%p ctx=%p",
@@ -3046,7 +3091,7 @@ FFI_PLUGIN_EXPORT void uvc_close_device(void) {
   render_thread_stop();
 #endif
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   if (should_stop_streaming) {
     finish_stop_preview_locked();
   }
@@ -3054,6 +3099,7 @@ FFI_PLUGIN_EXPORT void uvc_close_device(void) {
   UVC_LOGI("UVC_NATIVE", "uvc_close_device success");
   UVC_LOGD("UVC_NATIVE", "uvc_close_device end");
   pthread_mutex_unlock(&g_uvc_state.mutex);
+  TEMP_MARK("close_device: done");
 }
 
 // Atomic read — see uvc_latest_frame_sequence.
@@ -3079,7 +3125,7 @@ Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeAttachSurface(
     return UVC_ERROR_IO;
   }
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   release_preview_window_locked();
   g_uvc_state.preview_window = window;
   render_set_target_locked(RENDER_TARGET_PREVIEW, window);
@@ -3095,7 +3141,7 @@ Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeDetachSurface(
   (void)env;
   (void)thiz;
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   render_set_target_locked(RENDER_TARGET_PREVIEW, NULL);
   release_preview_window_locked();
   pthread_mutex_unlock(&g_uvc_state.mutex);
@@ -3118,7 +3164,7 @@ Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeRawRecStart(
     return UVC_ERROR_INVALID_PARAM;
   }
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   int result = UVC_ERROR_OTHER;
   int codec = 0;
   const uint8_t *csd = NULL;
@@ -3164,7 +3210,7 @@ Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeRawRecStop(
   (void)env;
   (void)thiz;
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   jint count = 0;
   if (g_uvc_state.h26x_rawrec != NULL) {
     count = (jint)rec_writer_stop();
@@ -3195,7 +3241,7 @@ Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeAttachRecordingSurf
   // decoder renders into it directly). Uncompressed/MJPEG recordings feed
   // the encoder through the recording frame queue instead (NativeRecording
   // JNI), which never touches a window.
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   release_recording_window_locked();
   g_uvc_state.recording_window = window;
   g_uvc_state.recording_surface_state = RECORDING_SURFACE_PENDING;
@@ -3212,7 +3258,7 @@ Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeRecordingSurfaceSta
   (void)env;
   (void)thiz;
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   const int state = g_uvc_state.recording_surface_state;
   pthread_mutex_unlock(&g_uvc_state.mutex);
   return state;
@@ -3225,7 +3271,7 @@ Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeDetachRecordingSurf
   (void)env;
   (void)thiz;
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   release_recording_window_locked();
   pthread_mutex_unlock(&g_uvc_state.mutex);
 }
@@ -3303,7 +3349,7 @@ Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_probe(
     jobject thiz) {
   (void)thiz;
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   uac_audio_info_t info;
   int probe_result = UVC_ERROR_NO_DEVICE;
   if (g_uvc_state.devh != NULL) {
@@ -3328,7 +3374,7 @@ Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_probe(
 // some altsettings deliver only a trickle). UVC_SUCCESS on success; when
 // detected is non-NULL it receives the measured real capture format.
 static jint native_audio_start_internal(uac_audio_info_t *detected) {
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   jint result = UVC_ERROR_OTHER;
   libusb_device_handle *usb_devh = NULL;
   int video_streaming = 0;
@@ -3368,7 +3414,7 @@ static jint native_audio_start_internal(uac_audio_info_t *detected) {
     }
   }
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   g_uvc_state.audio_starting = 0;
   pthread_cond_broadcast(&g_uvc_state.callback_cond);
   if (audio != NULL) {
@@ -3438,7 +3484,7 @@ Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_read(
   // g_uvc_state.mutex (NativeAudio_stop, preview stop, device close), so
   // fetching + retaining under the mutex keeps the session alive for this
   // read even though the actual stop/free runs outside the mutex.
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   uac_audio_t *audio = g_uvc_state.audio;
   if (audio != NULL) {
     uac_audio_retain(audio);
@@ -3468,7 +3514,7 @@ Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_stop(
   // none of which should hold back frame callbacks. Readers that already
   // retained the session keep it alive until they leave (uac_audio_retain);
   // new readers see NULL.
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   uac_audio_t *audio = g_uvc_state.audio;
   g_uvc_state.audio = NULL;
   pthread_mutex_unlock(&g_uvc_state.mutex);
@@ -3502,7 +3548,7 @@ FFI_PLUGIN_EXPORT int uvc_copy_latest_frame_rgba_with_metadata(
     return 0;
   }
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   if (g_uvc_state.latest_rgba == NULL || g_uvc_state.latest_rgba_bytes == 0) {
     pthread_mutex_unlock(&g_uvc_state.mutex);
     return 0;
@@ -3544,7 +3590,7 @@ FFI_PLUGIN_EXPORT int uvc_copy_latest_frame_rgba_transformed(
   const int fh = flip_h ? 1 : 0;
   const int fv = flip_v ? 1 : 0;
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   if (g_uvc_state.latest_rgba == NULL || g_uvc_state.latest_rgba_bytes == 0) {
     pthread_mutex_unlock(&g_uvc_state.mutex);
     return 0;
@@ -3655,7 +3701,7 @@ FFI_PLUGIN_EXPORT int uvc_capture_jpeg(
   int q = quality <= 0 ? 90 : quality;
   if (q > 100) q = 100;
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
 
   // MJPEG passthrough: the raw camera frame is already a complete JPEG.
   if (g_uvc_state.latest_jpeg != NULL && g_uvc_state.latest_jpeg_bytes > 0) {
@@ -3721,13 +3767,13 @@ FFI_PLUGIN_EXPORT int uvc_capture_jpeg(
 }
 
 FFI_PLUGIN_EXPORT void uvc_set_frame_listener(uvc_frame_listener_t listener) {
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   g_uvc_state.frame_listener = listener;
   pthread_mutex_unlock(&g_uvc_state.mutex);
 }
 
 FFI_PLUGIN_EXPORT void uvc_set_error_listener(uvc_error_listener_t listener) {
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   g_uvc_state.error_listener = listener;
   pthread_mutex_unlock(&g_uvc_state.mutex);
 }
@@ -3740,7 +3786,7 @@ FFI_PLUGIN_EXPORT void uvc_inject_test_frame_rgba(
 
   const size_t rgba_bytes = (size_t)width * (size_t)height * 4;
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   if (g_uvc_state.latest_rgba_capacity < rgba_bytes) {
     uint8_t *new_buffer = realloc(g_uvc_state.latest_rgba, rgba_bytes);
     if (new_buffer == NULL) {
@@ -3762,7 +3808,7 @@ FFI_PLUGIN_EXPORT void uvc_inject_test_frame_rgba(
 // Not declared in the public header — accessed only via test-specific bindings.
 FFI_PLUGIN_EXPORT void uvc_trigger_test_error(const char *message) {
   const char *msg = message != NULL ? message : "test error";
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   set_last_error("%s", msg);
   uint32_t ring_idx = g_uvc_state.error_ring_next++ % 8;
   snprintf(g_uvc_state.error_ring[ring_idx], 256, "%s", msg);
@@ -3781,7 +3827,7 @@ FFI_PLUGIN_EXPORT void uvc_set_preview_transform(int rotation, int flip_h, int f
   if (r < 0) r += 360;
   if (r != 0 && r != 90 && r != 180 && r != 270) r = 0;
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   g_uvc_state.preview_rotation = r;
   g_uvc_state.preview_flip_h = flip_h ? 1 : 0;
   g_uvc_state.preview_flip_v = flip_v ? 1 : 0;
@@ -4165,7 +4211,7 @@ FFI_PLUGIN_EXPORT int uvc_ctrl_get_all_json(uint8_t *buffer, int buffer_length) 
     return 0;
   }
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   uvc_device_handle_t *devh = g_uvc_state.devh;
   pthread_mutex_unlock(&g_uvc_state.mutex);
 
@@ -4250,7 +4296,7 @@ FFI_PLUGIN_EXPORT int uvc_ctrl_get_bm_controls_json(uint8_t *buffer, int buffer_
     return 0;
   }
 
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   uvc_device_handle_t *devh = g_uvc_state.devh;
   pthread_mutex_unlock(&g_uvc_state.mutex);
 
@@ -4307,7 +4353,7 @@ FFI_PLUGIN_EXPORT int uvc_ctrl_get_bm_controls_json(uint8_t *buffer, int buffer_
 }
 
 FFI_PLUGIN_EXPORT int32_t uvc_ctrl_get(int ctrl_id) {
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   uvc_device_handle_t *devh = g_uvc_state.devh;
   pthread_mutex_unlock(&g_uvc_state.mutex);
 
@@ -4321,7 +4367,7 @@ FFI_PLUGIN_EXPORT int32_t uvc_ctrl_get(int ctrl_id) {
 }
 
 FFI_PLUGIN_EXPORT int uvc_ctrl_set(int ctrl_id, int32_t value) {
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   uvc_device_handle_t *devh = g_uvc_state.devh;
   pthread_mutex_unlock(&g_uvc_state.mutex);
 
@@ -4339,7 +4385,7 @@ FFI_PLUGIN_EXPORT int uvc_ctrl_set(int ctrl_id, int32_t value) {
 }
 
 static int with_open_device(uvc_device_handle_t **out_devh) {
-  pthread_mutex_lock(&g_uvc_state.mutex);
+  TEMP_STATE_LOCK();
   uvc_device_handle_t *devh = g_uvc_state.devh;
   pthread_mutex_unlock(&g_uvc_state.mutex);
 
