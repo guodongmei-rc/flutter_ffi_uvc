@@ -1258,7 +1258,19 @@ abstract interface class UvcCamera {
   });
 
   /// Stops the active preview stream.
+  ///
+  /// Blocks the calling isolate until the camera has stopped streaming, which
+  /// can take over a second; from UI code prefer [stopPreviewAsync].
   void stopPreview();
+
+  /// Stops the active preview stream without blocking the calling isolate.
+  /// Android only.
+  ///
+  /// The stop is queued the moment this is called, behind any open, stop or
+  /// close still in flight, and the returned future completes once the camera
+  /// has stopped streaming. [startPreview], [openUsbDevice] and
+  /// [closeUsbDevice] wait for it, so they can be called right away.
+  Future<void> stopPreviewAsync();
 
   /// Closes the native UVC session opened via [openFd].
   ///

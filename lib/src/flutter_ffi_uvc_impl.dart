@@ -2,12 +2,48 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:ffi/ffi.dart';
 import 'package:flutter/services.dart';
 
 import 'flutter_ffi_uvc_bindings_generated.dart';
 import 'uvc_camera_api.dart';
+
+/// Runs blocking native calls off the UI isolate, one at a time and in call
+/// order.
+///
+/// Opening, stopping and closing a camera each block for hundreds of
+/// milliseconds to seconds (USB port reset, waiting for transfers to cancel,
+/// joining the render thread). Called directly they freeze the UI thread. The
+/// native state is process-global and mutex-protected, so the calls are safe
+/// from a helper isolate; the queue keeps them from overlapping or reordering
+/// now that callers no longer block until each one returns.
+class _NativeCallQueue {
+  Future<void> _tail = Future<void>.value();
+
+  /// Completes once every call queued so far has finished.
+  Future<void> get idle => _tail;
+
+  /// Queues [call]. It must be a top-level function or a closure created by
+  /// one, so that nothing but its arguments is sent to the helper isolate.
+  Future<T> run<T>(T Function() call) {
+    final Future<T> result = _tail.then((_) => Isolate.run(call));
+    _tail = result.then<void>((_) {}, onError: (Object _) {});
+    return result;
+  }
+}
+
+void _nativeStopPreview() => _bindings.uvc_stop_preview();
+
+void _nativeCloseDevice() => _bindings.uvc_close_device();
+
+int _nativeRecoverStreamInterfaces() =>
+    _bindings.uvc_recover_stream_interfaces();
+
+int _nativeResetDevicePort() => _bindings.uvc_reset_device_port();
+
+int Function() _nativeOpenFd(int fd) => () => _bindings.uvc_open_fd(fd);
 
 class _PreviewRequest {
   const _PreviewRequest({
@@ -58,6 +94,7 @@ class _FlutterFfiUvcCamera implements UvcCamera {
   bool _restartInProgress = false;
   int _restartAttempts = 0;
   int _userStartInProgress = 0;
+  final _NativeCallQueue _nativeCalls = _NativeCallQueue();
   _PreviewRequest? _lastPreviewRequest;
 
   void _setupNativeErrorListener() {
@@ -95,6 +132,10 @@ class _FlutterFfiUvcCamera implements UvcCamera {
         'Must be greater than 0.',
       );
     }
+
+    // A stop or close queued earlier must finish first; otherwise it would
+    // run after this start and tear down the stream being started.
+    await _nativeCalls.idle;
 
     final Stopwatch stopwatch = Stopwatch()..start();
     final Stream<UvcStreamError> errors = streamErrors;
@@ -183,7 +224,7 @@ class _FlutterFfiUvcCamera implements UvcCamera {
       }
 
       final String error = lastError ?? this.lastError;
-      _stopPreviewNative();
+      await _stopPreviewNativeAsync();
       return UvcPreviewStartResult(
         mode: mode,
         success: false,
@@ -463,13 +504,20 @@ class _FlutterFfiUvcCamera implements UvcCamera {
   @override
   Future<int> openUsbDevice(int deviceId) async {
     _ensureAndroid();
+    // The platform side closes the previous USB connection before opening
+    // the new one; a native close still queued must not find it gone.
+    await _nativeCalls.idle;
     final Map<Object?, Object?>? result = await _usbChannel
         .invokeMapMethod<Object?, Object?>(
       'openUsbDevice',
       <String, Object?>{'deviceId': deviceId},
     );
     final int fd = result?['fileDescriptor'] as int? ?? -1;
-    return openFd(fd);
+    final int openResult = await _nativeCalls.run(_nativeOpenFd(fd));
+    if (openResult == 0) {
+      _setupNativeErrorListener();
+    }
+    return openResult;
   }
 
   @override
@@ -478,7 +526,7 @@ class _FlutterFfiUvcCamera implements UvcCamera {
     _sessionEpoch += 1;
     _resetStallTracking();
     _tearDownNativeErrorListener();
-    _bindings.uvc_close_device();
+    await _nativeCalls.run(_nativeCloseDevice);
     await _usbChannel.invokeMethod<void>('closeUsbDevice');
   }
 
@@ -610,11 +658,23 @@ class _FlutterFfiUvcCamera implements UvcCamera {
     _resetPreviewState();
   }
 
+  Future<void> _stopPreviewNativeAsync() async {
+    await _nativeCalls.run(_nativeStopPreview);
+    _resetPreviewState();
+  }
+
   @override
   void stopPreview() {
     _sessionEpoch += 1;
     _resetStallTracking();
     _stopPreviewNative();
+  }
+
+  @override
+  Future<void> stopPreviewAsync() {
+    _sessionEpoch += 1;
+    _resetStallTracking();
+    return _stopPreviewNativeAsync();
   }
 
   @override
@@ -746,16 +806,19 @@ class _FlutterFfiUvcCamera implements UvcCamera {
           await Future<void>.delayed(Duration(milliseconds: backoffMs));
           if (_sessionEpoch != epoch || _stallConfig == null) return;
         }
-        _stopPreviewNative();
+        await _stopPreviewNativeAsync();
         // Escalate recovery strength per attempt: the first retry is a plain
         // software restart; later attempts first force the device back to a
         // known state, because firmware left in a broken streaming state
         // answers negotiation but never sends frames again.
         if (attempt == 2 || attempt % 5 == 4) {
-          _bindings.uvc_recover_stream_interfaces();
+          await _nativeCalls.run(_nativeRecoverStreamInterfaces);
         } else if (attempt == 3 || attempt % 5 == 0) {
-          _bindings.uvc_reset_device_port();
+          await _nativeCalls.run(_nativeResetDevicePort);
         }
+        // The stop and the recovery no longer block the UI isolate, so the
+        // user may have started/stopped/closed the session meanwhile.
+        if (_sessionEpoch != epoch || _stallConfig == null) return;
         final UvcPreviewStartResult result = await _startPreviewInternal(
           request.mode,
           policy: request.policy,

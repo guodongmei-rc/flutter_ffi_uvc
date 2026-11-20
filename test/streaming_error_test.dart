@@ -90,6 +90,8 @@ class _FakeCamera implements UvcCamera {
   @override
   void stopPreview() {}
   @override
+  Future<void> stopPreviewAsync() async {}
+  @override
   void closeFd() {}
   @override
   @Deprecated('Use closeFd() instead.')
