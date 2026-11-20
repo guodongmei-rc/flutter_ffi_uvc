@@ -21,6 +21,7 @@ import android.os.Build
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Log
 import android.view.Surface
@@ -50,6 +51,15 @@ class FlutterFfiUvcPlugin :
         private const val GALLERY_PERMISSION_REQUEST_CODE = 9002
         private const val AUDIO_PERMISSION_REQUEST_CODE = 9003
         private const val TAG = "flutter_ffi_uvc"
+
+        // Mirrors RECORDING_SURFACE_* in flutter_ffi_uvc.c.
+        private const val RECORDING_SURFACE_PENDING = 0
+        private const val RECORDING_SURFACE_FAILED = -1
+
+        // The recording decoder starts on the camera's next keyframe, so its
+        // outcome is known within about one GOP.
+        private const val RECORDING_SURFACE_WAIT_MS = 1500L
+        private const val RECORDING_SURFACE_POLL_MS = 50L
 
         init {
             System.loadLibrary("flutter_ffi_uvc")
@@ -649,7 +659,15 @@ class FlutterFfiUvcPlugin :
             val surface = started.start()
             val attachResult =
                 if (useBufferInput) 0 else nativeAttachRecordingSurface(surface!!)
-            if (attachResult == 0) {
+            if (attachResult == 0 && !useBufferInput && !awaitRecordingSurface()) {
+                // The phone refused the decoder that feeds the encoder: no
+                // frame would ever be recorded, so fail now rather than end
+                // with an empty file at stop.
+                nativeDetachRecordingSurface()
+                started.abort()
+                errorCode = "encoder_unavailable"
+                errorMessage = "Recording decoder failed to start"
+            } else if (attachResult == 0) {
                 recorder = started
             } else {
                 started.abort()
@@ -689,6 +707,24 @@ class FlutterFfiUvcPlugin :
             videoRecorder = recorder
             result.success(null)
         }
+    }
+
+    /**
+     * Waits for the native recording decoder to render into the attached
+     * recording surface. Returns false only when it failed to start; a
+     * decoder still waiting for the camera's next keyframe when the wait
+     * runs out counts as usable.
+     */
+    private fun awaitRecordingSurface(): Boolean {
+        val deadline = SystemClock.elapsedRealtime() + RECORDING_SURFACE_WAIT_MS
+        while (SystemClock.elapsedRealtime() < deadline) {
+            val state = nativeRecordingSurfaceState()
+            if (state != RECORDING_SURFACE_PENDING) {
+                return state != RECORDING_SURFACE_FAILED
+            }
+            Thread.sleep(RECORDING_SURFACE_POLL_MS)
+        }
+        return true
     }
 
     // Audio capture for recordings. Every failure logs a warning and degrades
@@ -1007,6 +1043,7 @@ class FlutterFfiUvcPlugin :
     private external fun nativeDetachSurface()
     private external fun nativeAttachRecordingSurface(surface: Surface): Int
     private external fun nativeDetachRecordingSurface()
+    private external fun nativeRecordingSurfaceState(): Int
     private external fun nativeRawRecStart(path: String): Int
     private external fun nativeRawRecStop(): Int
 }

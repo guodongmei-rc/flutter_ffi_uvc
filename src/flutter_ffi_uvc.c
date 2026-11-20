@@ -91,6 +91,11 @@ typedef struct {
 // rebuilt. (The recording surface is NOT served here: H.264/H.265 streams
 // render into it straight from the hardware decoder, and the re-encode
 // recording path feeds the encoder through the recording frame queue.)
+/* Outcome of rendering into the attached recording surface. */
+#define RECORDING_SURFACE_PENDING 0
+#define RECORDING_SURFACE_RENDERING 1
+#define RECORDING_SURFACE_FAILED -1
+
 #define RENDER_TARGET_PREVIEW 0
 #define RENDER_TARGET_COUNT 1
 typedef struct {
@@ -210,6 +215,9 @@ typedef struct {
   // re-encode recording path never touches a window — it goes through the
   // recording frame queue (uvc_rec_read_yuv).
   ANativeWindow *recording_window;
+  /* Whether the recording decoder reached the attached recording window:
+   * RECORDING_SURFACE_PENDING until its first rendered frame or failure. */
+  int recording_surface_state;
   // Unified render thread: the ONLY thread that touches EGL/GL and window
   // buffers for the RGBA path (preview only — the recording surface is no
   // longer rendered at all, see above). Two GPU threads uploading 8MB
@@ -853,6 +861,19 @@ static void release_preview_window_locked(void) {
 
   ANativeWindow_release(g_uvc_state.preview_window);
   g_uvc_state.preview_window = NULL;
+}
+
+static void set_recording_surface_state_locked(
+    const ANativeWindow *window,
+    int state) {
+  /* A result for a window that was detached meanwhile is stale. */
+  if (g_uvc_state.recording_window != window) {
+    return;
+  }
+  if (state == RECORDING_SURFACE_FAILED) {
+    g_uvc_state.stats.recording_surface_failure_count += 1;
+  }
+  g_uvc_state.recording_surface_state = state;
 }
 
 static void release_recording_window_locked(void) {
@@ -2066,6 +2087,10 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
             (int)frame->height);
       }
       rec_decoder = g_uvc_state.h26x_rec_decoder;
+      if (rec_decoder == NULL) {
+        set_recording_surface_state_locked(
+            rec_window, RECORDING_SURFACE_FAILED);
+      }
     }
     if (g_uvc_state.h26x_decoder == NULL) {
       g_uvc_state.h26x_decoder = h26x_decoder_create(
@@ -2092,19 +2117,29 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
     }
     if (rec_decoder != NULL) {
       // Recording never breaks the preview: a recording-decoder failure only
-      // drops that decoder; the next frame lazily creates a fresh one.
-      if (h26x_decoder_feed(
-              rec_decoder,
-              rec_window,
-              (const uint8_t *)frame->data,
-              frame->data_bytes) == H26X_FEED_ERROR) {
-        pthread_mutex_lock(&g_uvc_state.mutex);
+      // drops that decoder; the next frame lazily creates a fresh one. The
+      // outcome is published so the recording start can fail right away
+      // instead of ending with an empty file.
+      const int rec_feed_result = h26x_decoder_feed(
+          rec_decoder,
+          rec_window,
+          (const uint8_t *)frame->data,
+          frame->data_bytes);
+      pthread_mutex_lock(&g_uvc_state.mutex);
+      if (rec_feed_result == H26X_FEED_ERROR) {
         if (g_uvc_state.h26x_rec_decoder == rec_decoder) {
           h26x_decoder_destroy(g_uvc_state.h26x_rec_decoder);
           g_uvc_state.h26x_rec_decoder = NULL;
         }
-        pthread_mutex_unlock(&g_uvc_state.mutex);
+        set_recording_surface_state_locked(
+            rec_window, RECORDING_SURFACE_FAILED);
+      } else if (rec_feed_result == H26X_FEED_RENDERED) {
+        set_recording_surface_state_locked(
+            rec_window, RECORDING_SURFACE_RENDERING);
       }
+      pthread_mutex_unlock(&g_uvc_state.mutex);
+    }
+    if (rec_window != NULL) {
       ANativeWindow_release(rec_window);
     }
 
@@ -3163,9 +3198,24 @@ Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeAttachRecordingSurf
   pthread_mutex_lock(&g_uvc_state.mutex);
   release_recording_window_locked();
   g_uvc_state.recording_window = window;
+  g_uvc_state.recording_surface_state = RECORDING_SURFACE_PENDING;
   pthread_mutex_unlock(&g_uvc_state.mutex);
   clear_last_error();
   return UVC_SUCCESS;
+}
+
+/* RECORDING_SURFACE_* for the attached recording surface. */
+JNIEXPORT jint JNICALL
+Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeRecordingSurfaceState(
+    JNIEnv *env,
+    jobject thiz) {
+  (void)env;
+  (void)thiz;
+
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  const int state = g_uvc_state.recording_surface_state;
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+  return state;
 }
 
 JNIEXPORT void JNICALL
