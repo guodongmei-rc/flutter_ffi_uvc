@@ -706,11 +706,55 @@ static int64_t uac_monotonic_ns(void) {
   return (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec;
 }
 
+/* Measures the real delivery rate of the freshly started stream for a short
+ * window: descriptor rates are estimates (UAC2 does not even state one), so
+ * the encoder rate is derived from measured bytes — but only when the
+ * measurement snaps cleanly to a standard rate; otherwise the descriptor
+ * estimate stands. PCM arriving during the window stays in the ring; the
+ * reader drains it once the encoder starts. Updates final->sample_rate and
+ * final->starved and returns the measured bytes per second. */
+static uint64_t uac_measure_delivery(
+    uac_audio_t *audio,
+    uac_audio_info_t *final,
+    int descriptor_rate) {
+  pthread_mutex_lock(&audio->mutex);
+  const uint64_t measure_b0 = audio->stat_bytes_total;
+  pthread_mutex_unlock(&audio->mutex);
+  const int64_t measure_t0 = uac_monotonic_ns();
+  struct timespec window = {0, UAC_MEASURE_WINDOW_MS * 1000 * 1000};
+  while (nanosleep(&window, &window) != 0 && errno == EINTR) {
+  }
+  pthread_mutex_lock(&audio->mutex);
+  const uint64_t delivered = audio->stat_bytes_total - measure_b0;
+  pthread_mutex_unlock(&audio->mutex);
+  const int64_t elapsed_ns = uac_monotonic_ns() - measure_t0;
+  const uint64_t bps = elapsed_ns > 0
+      ? delivered * 1000000000ull / (uint64_t)elapsed_ns
+      : 0;
+
+  const int frame_bytes = final->channels * ((final->bits + 7) / 8);
+  /* A window that delivered nothing at all is measured too: it snaps to no
+   * rate and is below every threshold, so a camera streaming zero bytes
+   * counts as starved instead of passing for a healthy capture. */
+  if (frame_bytes > 0) {
+    const int measured = (int)(bps / (uint64_t)frame_bytes);
+    const int snapped = uac_snap_sample_rate(measured);
+    if (snapped > 0) {
+      final->sample_rate = snapped;
+    }
+    final->starved = snapped <= 0 &&
+        bps * UAC_STARVED_DIVISOR <
+            (uint64_t)descriptor_rate * (uint64_t)frame_bytes;
+  }
+  return bps;
+}
+
 uac_audio_t *uac_audio_start(
     libusb_device_handle *usb_devh,
     uac_audio_info_t *candidates,
     int candidate_count,
-    int video_streaming) {
+    int video_streaming,
+    int known_sample_rate) {
   if (usb_devh == NULL || candidates == NULL || candidate_count <= 0) {
     return NULL;
   }
@@ -809,47 +853,21 @@ uac_audio_t *uac_audio_start(
     return NULL;
   }
 
-  /* Measure the real delivery rate for a short window: descriptor rates
-   * are estimates (UAC2 does not even state one), so the encoder rate is
-   * derived from measured bytes — but only when the measurement snaps
-   * cleanly to a standard rate; otherwise the descriptor estimate stands.
-   * PCM arriving during the window stays in the ring; the reader drains it
-   * once the encoder starts. */
-  pthread_mutex_lock(&audio->mutex);
-  const uint64_t measure_b0 = audio->stat_bytes_total;
-  pthread_mutex_unlock(&audio->mutex);
-  const int64_t measure_t0 = uac_monotonic_ns();
-  struct timespec window = {0, UAC_MEASURE_WINDOW_MS * 1000 * 1000};
-  while (nanosleep(&window, &window) != 0 && errno == EINTR) {
-  }
-  pthread_mutex_lock(&audio->mutex);
-  const uint64_t delivered = audio->stat_bytes_total - measure_b0;
-  pthread_mutex_unlock(&audio->mutex);
-  const int64_t elapsed_ns = uac_monotonic_ns() - measure_t0;
-  const uint64_t bps = elapsed_ns > 0
-      ? delivered * 1000000000ull / (uint64_t)elapsed_ns
-      : 0;
-
   uac_audio_info_t final = *info;
-  const int frame_bytes = final.channels * ((final.bits + 7) / 8);
-  /* A window that delivered nothing at all is measured too: it snaps to no
-   * rate and is below every threshold, so a camera streaming zero bytes
-   * counts as starved instead of passing for a healthy capture. */
-  if (frame_bytes > 0) {
-    const int measured = (int)(bps / (uint64_t)frame_bytes);
-    const int snapped = uac_snap_sample_rate(measured);
-    if (snapped > 0) {
-      final.sample_rate = snapped;
-    }
-    final.starved = snapped <= 0 &&
-        bps * UAC_STARVED_DIVISOR <
-            (uint64_t)descriptor_rate * (uint64_t)frame_bytes;
+  uint64_t bps = 0;
+  if (known_sample_rate > 0) {
+    /* The caller measured this connection before: trust its verdict and
+     * start without spending the measurement window again. */
+    final.sample_rate = known_sample_rate;
+    final.starved = 0;
+  } else {
+    bps = uac_measure_delivery(audio, &final, descriptor_rate);
   }
   audio->info = final;
   candidates[0] = final;
   UAC_STATS_LOGI(
       "capture started: alt=%d rate=%d descriptor_rate=%d ch=%d bits=%d "
-      "packet=%u transfers=%d bytes/s=%llu starved=%d",
+      "packet=%u transfers=%d measured=%d bytes/s=%llu starved=%d",
       final.altsetting,
       final.sample_rate,
       descriptor_rate,
@@ -857,6 +875,7 @@ uac_audio_t *uac_audio_start(
       final.bits,
       final.packet_size,
       submitted,
+      known_sample_rate <= 0,
       (unsigned long long)bps,
       final.starved);
   return audio;

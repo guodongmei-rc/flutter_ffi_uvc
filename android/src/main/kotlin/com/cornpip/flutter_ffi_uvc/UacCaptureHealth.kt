@@ -14,6 +14,10 @@ package com.cornpip.flutter_ffi_uvc
  * nothing at all on a RunCam firmware) falls back to the Android USB audio
  * path. This flag lets the following recordings skip the measurement.
  *
+ * Whatever the first recording finds is kept for the connection: a healthy
+ * libusb capture keeps its measured rate and a delivering Android USB audio
+ * path is not probed again, so only the first recording pays for detection.
+ *
  * A camera whose microphone delivers nothing through the Android USB audio
  * path either is remembered as silent: its recordings carry no audio track
  * instead of an empty one.
@@ -43,9 +47,31 @@ internal object UacCaptureHealth {
         micSilent = true
     }
 
+    @Volatile
+    private var libusbSampleRate = 0
+
+    /** The rate this connection's healthy libusb capture measured, or 0. */
+    fun libusbSampleRate(): Int = libusbSampleRate
+
+    fun markLibusbHealthy(sampleRate: Int) {
+        libusbSampleRate = sampleRate
+    }
+
+    @Volatile
+    private var micDelivers = false
+
+    /** Whether this connection's Android USB audio path delivered audio. */
+    fun isMicDelivering(): Boolean = micDelivers
+
+    fun markMicDelivering() {
+        micDelivers = true
+    }
+
     /** Forgets the verdicts; call whenever the camera connection changes. */
     fun reset() {
         libusbStarved = false
         micSilent = false
+        libusbSampleRate = 0
+        micDelivers = false
     }
 }

@@ -746,9 +746,11 @@ class FlutterFfiUvcPlugin :
     // AudioRecord when the platform exposes the camera's microphone (the
     // kernel USB audio driver does the streaming there). The verdict holds
     // for the current connection only — see UacCaptureHealth — so later
-    // recordings skip the measurement. A camera that delivers nothing
-    // through AudioRecord either is recorded video-only, without an empty
-    // audio track — see isAudioCaptureSilent().
+    // recordings skip the measurement; a healthy capture's measured rate
+    // and a delivering AudioRecord path are remembered the same way, so
+    // only the first recording of a connection detects anything. A camera
+    // that delivers nothing through AudioRecord either is recorded
+    // video-only, without an empty audio track — see isAudioCaptureSilent().
     //
     // Blocks for the native measurement window; call off the main thread.
     private fun createAudioEncoder(): AacAudioEncoder? {
@@ -759,7 +761,7 @@ class FlutterFfiUvcPlugin :
             return createUsbMicEncoder()
         }
         val info = try {
-            NativeAudio.startDetected()
+            NativeAudio.startDetected(UacCaptureHealth.libusbSampleRate())
         } catch (e: Throwable) {
             Log.w(TAG, "Audio capture start threw; recording video-only", e)
             null
@@ -782,6 +784,7 @@ class FlutterFfiUvcPlugin :
             Log.w(TAG, "libusb UAC capture is starved; switching to AudioRecord")
             return createUsbMicEncoder()
         }
+        UacCaptureHealth.markLibusbHealthy(info[0])
         Log.i(TAG, "Audio source: libusb UAC @ ${info[0]} Hz")
         return AacAudioEncoder(info[0], info[1])
     }
@@ -812,11 +815,14 @@ class FlutterFfiUvcPlugin :
             Log.w(TAG, "USB audio input found but AudioRecord failed; recording video-only")
             return null
         }
-        if (!deliversAudio(capture)) {
-            UacCaptureHealth.markMicSilent()
-            releaseUsbMicInBackground(capture)
-            Log.w(TAG, "USB mic delivers no audio; recording video-only")
-            return null
+        if (!UacCaptureHealth.isMicDelivering()) {
+            if (!deliversAudio(capture)) {
+                UacCaptureHealth.markMicSilent()
+                releaseUsbMicInBackground(capture)
+                Log.w(TAG, "USB mic delivers no audio; recording video-only")
+                return null
+            }
+            UacCaptureHealth.markMicDelivering()
         }
         Log.i(TAG, "Audio source: AudioRecord USB mic @ ${capture.sampleRate} Hz")
         // The kernel path already applies sane gain; keep PCM as-is (fixed

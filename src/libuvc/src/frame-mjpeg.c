@@ -202,6 +202,15 @@ static uvc_error_t uvc_mjpeg_convert(uvc_frame_t *in, uvc_frame_t *out) {
     goto fail;
   }
 
+  /* The JPEG can also be smaller than the negotiated frame size: some
+     firmwares advertise a mode (a RunCam "MJPEG 3840x2160") and stream a
+     lower resolution in it. Written at the negotiated stride the picture
+     would fill only the top-left corner of the buffer and leave the rest
+     stale, so report the JPEG's own geometry and pack its rows tightly. */
+  out->width = dinfo.output_width;
+  out->height = dinfo.output_height;
+  out->step = (size_t)dinfo.output_width * (size_t)dinfo.out_color_components;
+
   lines_read = 0;
   while (dinfo.output_scanline < dinfo.output_height) {
     unsigned char *buffer[1] = {( unsigned char*) out->data + lines_read * out->step };

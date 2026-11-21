@@ -66,6 +66,9 @@ int uac_audio_probe_all(
  * format is copied back to candidates[0] so the caller can configure its
  * encoder with the true rate. The same measurement sets candidates[0].starved
  * (see uac_audio_info_t), costing no extra time.
+ * known_sample_rate>0 skips that measurement: the caller already measured
+ * this connection, so the stream starts at once with that rate and
+ * starved=0. Pass 0 to measure.
  * Returns NULL on failure (fully cleaned up; the caller is expected to fall
  * back to video-only recording).
  * video_streaming!=0 skips the log-only AudioControl probes (selector-unit
@@ -75,7 +78,8 @@ uac_audio_t *uac_audio_start(
     libusb_device_handle *usb_devh,
     uac_audio_info_t *candidates,
     int candidate_count,
-    int video_streaming);
+    int video_streaming,
+    int known_sample_rate);
 
 /* Pins the session while a reader thread is inside uac_audio_read(). The
  * owner stops/frees sessions only while holding its state lock, so pairing
