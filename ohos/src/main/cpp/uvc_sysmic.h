@@ -53,6 +53,7 @@ class SystemMicCapture {
       for (uint32_t i = 0; i < inputs->size && !found; i++) {
         if (IsUsbInput(inputs->descriptors[i], product_name)) {
           found = OH_AudioDeviceDescriptor_GetDeviceId(inputs->descriptors[i], &usb_id) == AUDIOCOMMON_RESULT_SUCCESS;
+          LogDevice("USB audio input", inputs->descriptors[i]);
         }
       }
       OH_AudioRoutingManager_ReleaseDevices(routing, inputs);
@@ -68,6 +69,7 @@ class SystemMicCapture {
         route != nullptr) {
       for (uint32_t i = 0; i < route->size; i++) {
         uint32_t id = 0;
+        LogDevice("recordings use", route->descriptors[i]);
         if (OH_AudioDeviceDescriptor_GetDeviceId(route->descriptors[i], &id) == AUDIOCOMMON_RESULT_SUCCESS &&
             id == usb_id) {
           preferred = true;
@@ -147,9 +149,20 @@ class SystemMicCapture {
     OH_AudioCapturer_Stop(capturer);
     OH_AudioCapturer_Release(capturer);
     std::lock_guard<std::mutex> lock(mutex_);
-    OH_LOG_INFO(LOG_APP, "system microphone: stopped after %{public}llu bytes",
-                static_cast<unsigned long long>(bytes_));
+    // Tells real sound from a stream the system padded: padding shows as a
+    // large share of exactly-zero samples in long runs.
+    OH_LOG_INFO(LOG_APP,
+                "system microphone: stopped after %{public}llu bytes, %{public}llu samples: zero %{public}llu, "
+                "longest zero run %{public}llu, peak %{public}d/32767",
+                static_cast<unsigned long long>(bytes_), static_cast<unsigned long long>(samples_),
+                static_cast<unsigned long long>(zero_samples_), static_cast<unsigned long long>(longest_zero_run_),
+                peak_);
     bytes_ = 0;
+    samples_ = 0;
+    zero_samples_ = 0;
+    zero_run_ = 0;
+    longest_zero_run_ = 0;
+    peak_ = 0;
   }
 
  private:
@@ -168,6 +181,17 @@ class SystemMicCapture {
     char *name = nullptr;
     return OH_AudioDeviceDescriptor_GetDeviceName(device, &name) == AUDIOCOMMON_RESULT_SUCCESS && name != nullptr &&
            product_name == name;
+  }
+
+  static void LogDevice(const char *what, OH_AudioDeviceDescriptor *device) {
+    OH_AudioDevice_Type type = AUDIO_DEVICE_TYPE_INVALID;
+    uint32_t id = 0;
+    char *name = nullptr;
+    OH_AudioDeviceDescriptor_GetDeviceType(device, &type);
+    OH_AudioDeviceDescriptor_GetDeviceId(device, &id);
+    OH_AudioDeviceDescriptor_GetDeviceName(device, &name);
+    OH_LOG_INFO(LOG_APP, "system microphone: %{public}s: id %{public}u type %{public}d name %{public}s", what, id,
+                static_cast<int>(type), name != nullptr ? name : "");
   }
 
   // Same format as Android asks AudioRecord for: mono 16-bit PCM from the
@@ -207,11 +231,33 @@ class SystemMicCapture {
     }
     std::lock_guard<std::mutex> lock(self->mutex_);
     self->bytes_ += static_cast<uint64_t>(length);
+    self->Inspect(static_cast<const uint8_t *>(buffer), static_cast<size_t>(length));
     if (self->sink_ != nullptr) {
       self->sink_->WritePcm(static_cast<const uint8_t *>(buffer), static_cast<size_t>(length), NowMicros());
     }
     self->data_.notify_all();
     return 0;
+  }
+
+  // mutex_ held. Counts what the log line of Stop() reports.
+  void Inspect(const uint8_t *data, size_t length) {
+    for (size_t i = 0; i + 1 < length; i += 2) {
+      const int16_t sample = static_cast<int16_t>(data[i] | (data[i + 1] << 8));
+      const int32_t magnitude = sample < 0 ? -static_cast<int32_t>(sample) : sample;
+      samples_++;
+      if (magnitude > peak_) {
+        peak_ = magnitude;
+      }
+      if (sample != 0) {
+        zero_run_ = 0;
+        continue;
+      }
+      zero_samples_++;
+      zero_run_++;
+      if (zero_run_ > longest_zero_run_) {
+        longest_zero_run_ = zero_run_;
+      }
+    }
   }
 
   static constexpr int32_t kChannels = 1;
@@ -227,6 +273,11 @@ class SystemMicCapture {
   std::condition_variable data_;
   PcmSink *sink_ = nullptr;
   uint64_t bytes_ = 0;
+  uint64_t samples_ = 0;
+  uint64_t zero_samples_ = 0;
+  uint64_t zero_run_ = 0;
+  uint64_t longest_zero_run_ = 0;
+  int32_t peak_ = 0;
 };
 
 }  // namespace flutter_ffi_uvc
