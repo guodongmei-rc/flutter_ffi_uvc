@@ -31,6 +31,11 @@ typedef struct {
   int channels;
   int bits;
   int sample_rate;
+  /* Set by uac_audio_start(): non-zero when the measured delivery is far
+   * below the descriptor rate and matches no standard sample rate — the
+   * host starves the isochronous reads (a steady 1/16 of the nominal rate
+   * on a Huawei nova 12) or the camera delivers nothing at all. */
+  int starved;
 } uac_audio_info_t;
 
 /* Bounds the altsetting list uac_audio_probe_all() collects. */
@@ -59,7 +64,11 @@ int uac_audio_probe_all(
  * over a short window (~300ms); when it snaps cleanly to a standard sample
  * rate, that measured rate replaces the descriptor estimate — the winning
  * format is copied back to candidates[0] so the caller can configure its
- * encoder with the true rate.
+ * encoder with the true rate. The same measurement sets candidates[0].starved
+ * (see uac_audio_info_t), costing no extra time.
+ * known_sample_rate>0 skips that measurement: the caller already measured
+ * this connection, so the stream starts at once with that rate and
+ * starved=0. Pass 0 to measure.
  * Returns NULL on failure (fully cleaned up; the caller is expected to fall
  * back to video-only recording).
  * video_streaming!=0 skips the log-only AudioControl probes (selector-unit
@@ -69,7 +78,8 @@ uac_audio_t *uac_audio_start(
     libusb_device_handle *usb_devh,
     uac_audio_info_t *candidates,
     int candidate_count,
-    int video_streaming);
+    int video_streaming,
+    int known_sample_rate);
 
 /* Pins the session while a reader thread is inside uac_audio_read(). The
  * owner stops/frees sessions only while holding its state lock, so pairing
@@ -82,7 +92,9 @@ void uac_audio_release(uac_audio_t *audio);
  * timeout, or -1 once the capture is stopping and the ring is drained. */
 int uac_audio_read(uac_audio_t *audio, uint8_t *dst, int max_bytes, int timeout_ms);
 
-/* Stops transfers, releases the interface and frees the session. Blocks
+/* Stops transfers, releases the interface and frees the session. A starved
+ * session hands the interface back to the kernel audio driver it detached,
+ * so the platform audio path can take over. Blocks
  * until in-flight callbacks and active readers have left the session, so
  * the caller must not hold a lock those threads need. Safe on NULL. */
 void uac_audio_stop(uac_audio_t *audio);

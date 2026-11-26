@@ -51,6 +51,9 @@ const VERIFY_POLL_MS: number = 20;
 const NO_WINDOW: bigint = BigInt(0);
 
 const ENODEV: number = 19;
+// Recorder error codes of uvc_recorder.h that callers tell apart.
+const RECORDER_ERROR_ENCODER: number = -21;
+const RECORDER_ERROR_MICROPHONE: number = -27;
 
 // Indices into the array returned by the native streamStats(); see index.d.ts.
 const STAT_RUNNING: number = 0;
@@ -370,6 +373,14 @@ export class UvcCameraSession {
   private featureUnits: UacFeatureUnit[] = [];
   /** AudioStreaming interface claimed for the running recording, or -1. */
   private audioInterfaceClaimed: number = -1;
+  /**
+   * The microphone was measured to deliver no audio when a recording started.
+   * Kept until the device is closed, like Android: later recordings skip the
+   * microphone (and its 300 ms measurement) and stay video-only.
+   */
+  private microphoneSilent: boolean = false;
+  /** The last startRecording() failed because the video encoder refused it. */
+  private encoderRejected: boolean = false;
   private claimedInterfaces: number[] = [];
 
   private stream: UvcStreamInterface | null = null;
@@ -404,6 +415,19 @@ export class UvcCameraSession {
 
   lastError(): string {
     return this.errorMessage;
+  }
+
+  /**
+   * True once a recording found the open device's microphone delivering no
+   * audio; cleared when the device is closed.
+   */
+  isMicrophoneSilent(): boolean {
+    return this.microphoneSilent;
+  }
+
+  /** True when the last startRecording() failed in the video encoder. */
+  recordingEncoderRejected(): boolean {
+    return this.encoderRejected;
   }
 
   isOpen(): boolean {
@@ -617,6 +641,7 @@ export class UvcCameraSession {
     this.audio = null;
     this.featureUnits = [];
     this.audioInterfaceClaimed = -1;
+    this.microphoneSilent = false;
     this.stream = null;
   }
 
@@ -816,6 +841,7 @@ export class UvcCameraSession {
    * path, or '' with lastError() set. `fps` 0 means the mode's frame rate.
    */
   startRecording(directory: string, fps: number, bitRate: number, withAudio: boolean): string {
+    this.encoderRejected = false;
     if (this.streamId <= 0 || this.previewMode === null) {
       this.errorMessage = 'no preview is running';
       return '';
@@ -840,10 +866,13 @@ export class UvcCameraSession {
       return '';
     }
     let result = -1;
-    const audio = withAudio ? this.audio : null;
+    const audio = withAudio && !this.microphoneSilent ? this.audio : null;
     if (audio !== null && this.prepareMicrophone(audio)) {
       result = native.recordStartWithAudio(this.streamId, path, frameRate, rate, this.fd, audio.endpointAddress,
         audio.packetSize, audio.sampleRate, audio.channels, audio.bitsPerSample);
+      if (result === RECORDER_ERROR_MICROPHONE) {
+        this.microphoneSilent = true;
+      }
       if (result < 0) {
         // Same as Android: a microphone that will not stream makes the
         // recording video-only rather than failing it.
@@ -855,6 +884,7 @@ export class UvcCameraSession {
       result = native.recordStart(this.streamId, path, frameRate, rate);
     }
     if (result < 0) {
+      this.encoderRejected = result === RECORDER_ERROR_ENCODER;
       this.errorMessage = `starting the recording failed: ${errnoText(result)}`;
       return '';
     }

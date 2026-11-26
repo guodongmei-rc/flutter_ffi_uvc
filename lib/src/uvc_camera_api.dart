@@ -1258,7 +1258,19 @@ abstract interface class UvcCamera {
   });
 
   /// Stops the active preview stream.
+  ///
+  /// Blocks the calling isolate until the camera has stopped streaming, which
+  /// can take over a second; from UI code prefer [stopPreviewAsync].
   void stopPreview();
+
+  /// Stops the active preview stream without blocking the calling isolate.
+  /// Android and HarmonyOS.
+  ///
+  /// The stop is queued the moment this is called, behind any open, stop or
+  /// close still in flight, and the returned future completes once the camera
+  /// has stopped streaming. [startPreview], [openUsbDevice] and
+  /// [closeUsbDevice] wait for it, so they can be called right away.
+  Future<void> stopPreviewAsync();
 
   /// Closes the native UVC session opened via [openFd].
   ///
@@ -1421,6 +1433,16 @@ abstract interface class UvcCamera {
   /// which case recording silently stays video-only. Requires an opened
   /// device; returns null when none is open.
   Future<UvcAudioInfo?> queryAudioInterface();
+
+  /// Whether the opened device's microphone was found to deliver no audio.
+  /// Android and HarmonyOS.
+  ///
+  /// [queryAudioInterface] only reports what the descriptors declare. Whether
+  /// the stream carries audio is measured when [startVideoRecording] starts
+  /// with `withAudio` true, so this is meaningful once that call returned:
+  /// true means neither capture path yielded audio and the recording is
+  /// video-only. The verdict is kept until the device is closed.
+  Future<bool> isAudioCaptureSilent();
 
   /// Returns all controls supported by the currently opened device.
   List<UvcCameraControl> supportedControls();

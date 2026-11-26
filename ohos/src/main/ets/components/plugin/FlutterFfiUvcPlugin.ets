@@ -230,6 +230,9 @@ UvcSessionListener {
         }
         break;
       }
+      case 'isAudioCaptureSilent':
+        result.success(session.isMicrophoneSilent());
+        break;
       case 'startPreview':
         this.startPreview(session, call, result);
         break;
@@ -253,7 +256,10 @@ UvcSessionListener {
           this.captureDirectory, numberArg(call, 'frameRate', 0), numberArg(call, 'bitRate', 0),
           call.argument('withAudio') !== false);
         if (path.length === 0) {
-          result.error('capture', session.lastError(), null);
+          // Same code as Android, so apps can tell "this phone cannot encode
+          // the current mode" from any other start-up failure.
+          result.error(session.recordingEncoderRejected() ? 'encoder_unavailable' : 'capture',
+            session.lastError(), null);
         } else {
           result.success(this.mediaToMap(path, null));
         }

@@ -178,6 +178,24 @@ void main() {
     expect(result.mode.formatName, requested.formatName);
   });
 
+  test('stopPreviewAsync completes once the platform stream stopped', () async {
+    await camera.openUsbDevice(1003);
+    await camera.startPreview(camera.supportedModes().single);
+
+    await camera.stopPreviewAsync();
+
+    expect(camera.isPreviewing, isFalse);
+    expect(calls.last.method, 'stopPreview');
+  });
+
+  test('isAudioCaptureSilent reports the platform verdict', () async {
+    expect(await camera.isAudioCaptureSilent(), isFalse);
+    expect(calls.last.method, 'isAudioCaptureSilent');
+
+    replies['isAudioCaptureSilent'] = (_) => true;
+    expect(await camera.isAudioCaptureSilent(), isTrue);
+  });
+
   test('queryAudioInterface reports the microphone format or null', () async {
     await camera.openUsbDevice(1003);
     expect(await camera.queryAudioInterface(), isNull);

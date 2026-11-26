@@ -36,3 +36,34 @@ migrate_working_dir/
 
 *.apk
 SECRET_AGENTS_RULE.md
+
+# OpenHarmony (ohos) build outputs and local files
+/ohos/node_modules
+/ohos/oh_modules
+/ohos/local.properties
+/ohos/.preview
+/ohos/build
+/ohos/.cxx
+/ohos/.test
+/ohos/BuildProfile.ets
+/ohos/oh-package-lock.json5
+/example/ohos/node_modules
+/example/ohos/local.properties
+/example/ohos/.hvigor
+/example/ohos/.clangd
+/example/ohos/.clang-format
+/example/ohos/.clang-tidy
+/example/ohos/package.json
+/example/ohos/package-lock.json
+/example/ohos/**/oh_modules
+/example/ohos/**/build
+/example/ohos/**/.cxx
+/example/ohos/**/.test
+/example/ohos/**/.preview
+/example/ohos/**/BuildProfile.ets
+/example/ohos/**/oh-package-lock.json5
+/example/ohos/**/GeneratedPluginRegistrant.ets
+/example/ohos/**/src/main/resources/rawfile/flutter_assets/
+/example/ohos/**/libs/**/libapp.so
+/example/ohos/**/libs/**/libflutter.so
+/example/ohos/**/libs/**/libvmservice_snapshot.so

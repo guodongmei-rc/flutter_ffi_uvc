@@ -91,6 +91,11 @@ typedef struct {
 // rebuilt. (The recording surface is NOT served here: H.264/H.265 streams
 // render into it straight from the hardware decoder, and the re-encode
 // recording path feeds the encoder through the recording frame queue.)
+/* Outcome of rendering into the attached recording surface. */
+#define RECORDING_SURFACE_PENDING 0
+#define RECORDING_SURFACE_RENDERING 1
+#define RECORDING_SURFACE_FAILED -1
+
 #define RENDER_TARGET_PREVIEW 0
 #define RENDER_TARGET_COUNT 1
 typedef struct {
@@ -199,6 +204,9 @@ typedef struct {
   uvc_error_listener_t error_listener;
   uint32_t callback_count;
   uint32_t mjpeg_warmup_drop_remaining;
+  // Callback thread only: the mismatch between the negotiated and the real
+  // MJPEG picture size is logged once per preview start.
+  int mjpeg_size_mismatch_logged;
   char last_error[256];
   // Ring buffer so each pending async error callback gets its own stable slot.
   char error_ring[8][256];
@@ -210,6 +218,9 @@ typedef struct {
   // re-encode recording path never touches a window — it goes through the
   // recording frame queue (uvc_rec_read_yuv).
   ANativeWindow *recording_window;
+  /* Whether the recording decoder reached the attached recording window:
+   * RECORDING_SURFACE_PENDING until its first rendered frame or failure. */
+  int recording_surface_state;
   // Unified render thread: the ONLY thread that touches EGL/GL and window
   // buffers for the RGBA path (preview only — the recording surface is no
   // longer rendered at all, see above). Two GPU threads uploading 8MB
@@ -667,11 +678,13 @@ static int convert_rgb_frame_to_staging(void) {
 // uvc_mjpeg2rgbx (libjpeg-turbo JCS_EXT_RGBA output): no intermediate RGB
 // frame and no per-pixel scalar repack. Runs on the callback thread only,
 // outside the mutex. Returns UVC_SUCCESS, UVC_ERROR_NO_MEM when the staging
-// buffer cannot be grown, or the decoder error.
+// buffer cannot be grown, or the decoder error. *width and *height carry the
+// negotiated frame size in and the decoded picture's own size out: a firmware
+// may stream a smaller JPEG than the mode it advertises.
 static uvc_error_t decode_mjpeg_to_staging_rgba(
-    uvc_frame_t *frame, int width, int height) {
+    uvc_frame_t *frame, int *width, int *height) {
 #if defined(LIBUVC_HAS_JPEG)
-  const size_t required_bytes = (size_t)width * (size_t)height * 4;
+  const size_t required_bytes = (size_t)*width * (size_t)*height * 4;
   if (!ensure_staging_rgba(required_bytes)) {
     return UVC_ERROR_NO_MEM;
   }
@@ -683,16 +696,48 @@ static uvc_error_t decode_mjpeg_to_staging_rgba(
   memset(&out, 0, sizeof(out));
   out.data = g_uvc_state.staging_rgba;
   out.data_bytes = g_uvc_state.staging_rgba_capacity;
-  out.width = (uint32_t)width;
-  out.height = (uint32_t)height;
+  out.width = (uint32_t)*width;
+  out.height = (uint32_t)*height;
   out.frame_format = UVC_FRAME_FORMAT_RGBX;
-  out.step = (size_t)width * 4;
-  return uvc_mjpeg2rgbx(frame, &out);
+  out.step = (size_t)*width * 4;
+  const uvc_error_t result = uvc_mjpeg2rgbx(frame, &out);
+  if (result == UVC_SUCCESS) {
+    *width = (int)out.width;
+    *height = (int)out.height;
+  }
+  return result;
 #else
   (void)frame;
   (void)width;
   (void)height;
   return UVC_ERROR_NOT_SUPPORTED;
+#endif
+}
+
+// Logs, once per preview start, a camera that streams MJPEG pictures of a
+// different size than the mode it negotiated; the preview and the recording
+// then run at the picture's own size. Callback thread only. Bypasses
+// uvc_log_write (disabled project-wide in uvc_log.h): this is the only trace
+// of a firmware misreporting its resolution.
+static void log_mjpeg_size_mismatch_once(
+    const uvc_frame_t *frame, int width, int height) {
+  if (g_uvc_state.mjpeg_size_mismatch_logged) {
+    return;
+  }
+  if ((int)frame->width == width && (int)frame->height == height) {
+    return;
+  }
+  g_uvc_state.mjpeg_size_mismatch_logged = 1;
+#if defined(__ANDROID__)
+  __android_log_print(
+      ANDROID_LOG_WARN,
+      "flutter_ffi_uvc",
+      "@@@@UVC_NATIVE/W MJPEG picture is %dx%d, negotiated %ux%u; using the "
+      "picture size",
+      width,
+      height,
+      frame->width,
+      frame->height);
 #endif
 }
 
@@ -853,6 +898,19 @@ static void release_preview_window_locked(void) {
 
   ANativeWindow_release(g_uvc_state.preview_window);
   g_uvc_state.preview_window = NULL;
+}
+
+static void set_recording_surface_state_locked(
+    const ANativeWindow *window,
+    int state) {
+  /* A result for a window that was detached meanwhile is stale. */
+  if (g_uvc_state.recording_window != window) {
+    return;
+  }
+  if (state == RECORDING_SURFACE_FAILED) {
+    g_uvc_state.stats.recording_surface_failure_count += 1;
+  }
+  g_uvc_state.recording_surface_state = state;
 }
 
 static void release_recording_window_locked(void) {
@@ -2066,6 +2124,10 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
             (int)frame->height);
       }
       rec_decoder = g_uvc_state.h26x_rec_decoder;
+      if (rec_decoder == NULL) {
+        set_recording_surface_state_locked(
+            rec_window, RECORDING_SURFACE_FAILED);
+      }
     }
     if (g_uvc_state.h26x_decoder == NULL) {
       g_uvc_state.h26x_decoder = h26x_decoder_create(
@@ -2092,19 +2154,29 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
     }
     if (rec_decoder != NULL) {
       // Recording never breaks the preview: a recording-decoder failure only
-      // drops that decoder; the next frame lazily creates a fresh one.
-      if (h26x_decoder_feed(
-              rec_decoder,
-              rec_window,
-              (const uint8_t *)frame->data,
-              frame->data_bytes) == H26X_FEED_ERROR) {
-        pthread_mutex_lock(&g_uvc_state.mutex);
+      // drops that decoder; the next frame lazily creates a fresh one. The
+      // outcome is published so the recording start can fail right away
+      // instead of ending with an empty file.
+      const int rec_feed_result = h26x_decoder_feed(
+          rec_decoder,
+          rec_window,
+          (const uint8_t *)frame->data,
+          frame->data_bytes);
+      pthread_mutex_lock(&g_uvc_state.mutex);
+      if (rec_feed_result == H26X_FEED_ERROR) {
         if (g_uvc_state.h26x_rec_decoder == rec_decoder) {
           h26x_decoder_destroy(g_uvc_state.h26x_rec_decoder);
           g_uvc_state.h26x_rec_decoder = NULL;
         }
-        pthread_mutex_unlock(&g_uvc_state.mutex);
+        set_recording_surface_state_locked(
+            rec_window, RECORDING_SURFACE_FAILED);
+      } else if (rec_feed_result == H26X_FEED_RENDERED) {
+        set_recording_surface_state_locked(
+            rec_window, RECORDING_SURFACE_RENDERING);
       }
+      pthread_mutex_unlock(&g_uvc_state.mutex);
+    }
+    if (rec_window != NULL) {
       ANativeWindow_release(rec_window);
     }
 
@@ -2222,15 +2294,15 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
   // Phase 2 — no lock held: decode and convert into callback-owned staging
   // buffers. callbacks_inflight (released at the very end) keeps stop/close
   // from freeing these buffers while the lock is dropped.
-  const int width = (int)frame->width;
-  const int height = (int)frame->height;
+  int width = (int)frame->width;
+  int height = (int)frame->height;
 
   if (frame->frame_format == UVC_FRAME_FORMAT_MJPEG) {
     // MJPEG decodes straight into the RGBA staging buffer — no intermediate
     // RGB frame, no per-pixel repack (was ~2 MP of scalar work per frame at
     // 1080p, on the serial callback thread).
     const uvc_error_t decode_result =
-        decode_mjpeg_to_staging_rgba(frame, width, height);
+        decode_mjpeg_to_staging_rgba(frame, &width, &height);
     if (decode_result != UVC_SUCCESS) {
       UVC_LOGE(
           "UVC_NATIVE",
@@ -2251,6 +2323,7 @@ static void frame_callback(uvc_frame_t *frame, void *user_ptr) {
       abort_frame_callback_locked_and_notify();
       return;
     }
+    log_mjpeg_size_mismatch_once(frame, width, height);
   } else {
     const size_t required_rgb_bytes = (size_t)width * (size_t)height * 3;
 
@@ -2722,6 +2795,7 @@ FFI_PLUGIN_EXPORT int uvc_start_preview(
   g_uvc_state.previewing = 1;
   g_uvc_state.callback_count = 0;
   g_uvc_state.latest_sequence = 0;
+  g_uvc_state.mjpeg_size_mismatch_logged = 0;
   g_uvc_state.mjpeg_warmup_drop_remaining =
       frame_format == UVC_FRAME_FORMAT_MJPEG ? 3 : 0;
   clear_last_error();
@@ -3163,9 +3237,24 @@ Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeAttachRecordingSurf
   pthread_mutex_lock(&g_uvc_state.mutex);
   release_recording_window_locked();
   g_uvc_state.recording_window = window;
+  g_uvc_state.recording_surface_state = RECORDING_SURFACE_PENDING;
   pthread_mutex_unlock(&g_uvc_state.mutex);
   clear_last_error();
   return UVC_SUCCESS;
+}
+
+/* RECORDING_SURFACE_* for the attached recording surface. */
+JNIEXPORT jint JNICALL
+Java_com_cornpip_flutter_1ffi_1uvc_FlutterFfiUvcPlugin_nativeRecordingSurfaceState(
+    JNIEnv *env,
+    jobject thiz) {
+  (void)env;
+  (void)thiz;
+
+  pthread_mutex_lock(&g_uvc_state.mutex);
+  const int state = g_uvc_state.recording_surface_state;
+  pthread_mutex_unlock(&g_uvc_state.mutex);
+  return state;
 }
 
 JNIEXPORT void JNICALL
@@ -3277,7 +3366,11 @@ Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_probe(
 // altsetting candidate to find one that really streams (firmwares differ;
 // some altsettings deliver only a trickle). UVC_SUCCESS on success; when
 // detected is non-NULL it receives the measured real capture format.
-static jint native_audio_start_internal(uac_audio_info_t *detected) {
+// known_sample_rate>0 reuses a rate measured earlier on this connection and
+// skips the measurement window.
+static jint native_audio_start_internal(
+    uac_audio_info_t *detected,
+    int known_sample_rate) {
   pthread_mutex_lock(&g_uvc_state.mutex);
   jint result = UVC_ERROR_OTHER;
   libusb_device_handle *usb_devh = NULL;
@@ -3310,7 +3403,8 @@ static jint native_audio_start_internal(uac_audio_info_t *detected) {
   if (count <= 0) {
     result = UVC_ERROR_INVALID_DEVICE;
   } else {
-    audio = uac_audio_start(usb_devh, candidates, count, video_streaming);
+    audio = uac_audio_start(
+        usb_devh, candidates, count, video_streaming, known_sample_rate);
     if (audio == NULL) {
       result = UVC_ERROR_IO;
     } else if (detected != NULL) {
@@ -3338,28 +3432,33 @@ Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_start(
     jobject thiz) {
   (void)env;
   (void)thiz;
-  return native_audio_start_internal(NULL);
+  return native_audio_start_internal(NULL, 0);
 }
 
 // Starts PCM capture like NativeAudio_start and returns {sampleRate,
-// channels, bits} measured during calibration, or NULL on failure. The
-// returned rate is the real one — descriptor rates are estimates.
+// channels, bits, starved} measured during calibration, or NULL on failure.
+// The returned rate is the real one — descriptor rates are estimates.
+// known_sample_rate>0 skips the measurement and returns that rate.
 JNIEXPORT jintArray JNICALL
 Java_com_cornpip_flutter_1ffi_1uvc_NativeAudio_startDetected(
     JNIEnv *env,
-    jobject thiz) {
+    jobject thiz,
+    jint known_sample_rate) {
   (void)thiz;
 
   uac_audio_info_t detected;
-  if (native_audio_start_internal(&detected) != UVC_SUCCESS) {
+  if (native_audio_start_internal(&detected, known_sample_rate) !=
+      UVC_SUCCESS) {
     return NULL;
   }
-  jintArray result = (*env)->NewIntArray(env, 3);
+  jintArray result = (*env)->NewIntArray(env, 4);
   if (result == NULL) {
     return NULL;
   }
-  const jint values[3] = {detected.sample_rate, detected.channels, detected.bits};
-  (*env)->SetIntArrayRegion(env, result, 0, 3, values);
+  const jint values[4] = {
+      detected.sample_rate, detected.channels, detected.bits, detected.starved,
+  };
+  (*env)->SetIntArrayRegion(env, result, 0, 4, values);
   return result;
 }
 

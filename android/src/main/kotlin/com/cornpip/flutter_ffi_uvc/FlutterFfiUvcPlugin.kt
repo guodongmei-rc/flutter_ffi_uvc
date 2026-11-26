@@ -12,6 +12,7 @@ import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
+import android.media.MediaCodec
 import android.media.MediaCodecList
 import android.media.AudioManager
 import android.media.MediaFormat
@@ -20,6 +21,7 @@ import android.os.Build
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Log
 import android.view.Surface
@@ -50,6 +52,16 @@ class FlutterFfiUvcPlugin :
         private const val AUDIO_PERMISSION_REQUEST_CODE = 9003
         private const val TAG = "flutter_ffi_uvc"
 
+        // Mirrors RECORDING_SURFACE_* in flutter_ffi_uvc.c.
+        private const val RECORDING_SURFACE_PENDING = 0
+        private const val RECORDING_SURFACE_FAILED = -1
+
+        // The recording decoder starts on the camera's next keyframe, so its
+        // outcome is known within about one GOP.
+        private const val RECORDING_SURFACE_WAIT_MS = 1500L
+        private const val RECORDING_SURFACE_POLL_MS = 50L
+        private const val USB_MIC_FIRST_DATA_WAIT_MS = 1000L
+
         init {
             System.loadLibrary("flutter_ffi_uvc")
         }
@@ -77,6 +89,10 @@ class FlutterFfiUvcPlugin :
 
     // Recording
     private var videoRecorder: VideoRecorder? = null
+
+    // True while startVideoRecording prepares a recording on its worker
+    // thread; main-thread only. Blocks a second start and a premature stop.
+    private var recordingStarting = false
     private var rawRecTempFile: File? = null
     private var aacFileRecorder: AacFileRecorder? = null
     private var rawRecAudioTempFile: File? = null
@@ -459,7 +475,7 @@ class FlutterFfiUvcPlugin :
                     result.error("gallery_permission_denied", "Gallery permission not granted", null)
                     return
                 }
-                if (videoRecorder != null || rawRecTempFile != null) {
+                if (videoRecorder != null || rawRecTempFile != null || recordingStarting) {
                     result.error("already_recording", "A recording is already in progress", null)
                     return
                 }
@@ -506,39 +522,20 @@ class FlutterFfiUvcPlugin :
                 // are fed as YUV byte buffers from the native recording
                 // queue (no GL, no input Surface on that path).
                 val useBufferInput = cameraFormat != "H264" && cameraFormat != "H265"
-                val audioEncoder = if (call.argument<Boolean>("withAudio") ?: true) {
+                val withAudio = call.argument<Boolean>("withAudio") ?: true
+                if (withAudio) {
                     maybeRequestAudioPermission()
-                    createAudioEncoder()
-                } else {
-                    null
                 }
-                try {
-                    val recorder = VideoRecorder(
-                        context, width, height, bitRate, frameRate, audioEncoder,
-                        videoMime, useBufferInput,
+                recordingStarting = true
+                // The audio capture measures its real rate for a few hundred
+                // milliseconds and the encoders take time to come up; doing
+                // that here would freeze the UI on every recording start.
+                Thread({
+                    startEncodedRecording(
+                        context, width, height, bitRate, frameRate, videoMime,
+                        useBufferInput, withAudio, result,
                     )
-                    val surface = recorder.start()
-                    if (!useBufferInput) {
-                        val attachResult = nativeAttachRecordingSurface(surface!!)
-                        if (attachResult != 0) {
-                            recorder.abort()
-                            result.error(
-                                "attach_failed",
-                                "nativeAttachRecordingSurface failed with code $attachResult",
-                                attachResult,
-                            )
-                            return
-                        }
-                    }
-                    videoRecorder = recorder
-                    result.success(null)
-                } catch (e: Exception) {
-                    Log.e(TAG, "startVideoRecording failed", e)
-                    // The capture is also stopped inside VideoRecorder's
-                    // failure paths; NativeAudio.stop is idempotent.
-                    if (audioEncoder != null) stopAudioCaptureQuietly()
-                    result.error("start_failed", e.message ?: "Failed to start recording", null)
-                }
+                }, "uvc-record-start").start()
             }
 
             "stopVideoRecording" -> {
@@ -582,7 +579,10 @@ class FlutterFfiUvcPlugin :
                     return
                 }
                 val recorder = videoRecorder ?: run {
-                    result.error("not_recording", "No recording in progress", null)
+                    val message =
+                        if (recordingStarting) "Recording is still starting"
+                        else "No recording in progress"
+                    result.error("not_recording", message, null)
                     return
                 }
                 videoRecorder = null
@@ -602,6 +602,9 @@ class FlutterFfiUvcPlugin :
             }
 
             "probeAudioInterface" -> {
+                // Reports what the descriptors declare; whether the stream
+                // actually delivers audio is a separate question, answered
+                // by isAudioCaptureSilent once a recording has started.
                 val info = try {
                     NativeAudio.probe()
                 } catch (e: Throwable) {
@@ -619,46 +622,146 @@ class FlutterFfiUvcPlugin :
                 )
             }
 
+            "isAudioCaptureSilent" -> result.success(isAudioCaptureSilent())
+
             else -> result.notImplemented()
         }
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
+    /**
+     * Builds and starts the re-encoding recorder. Runs on the
+     * "uvc-record-start" worker thread; the outcome is committed and
+     * reported on the main thread.
+     */
+    private fun startEncodedRecording(
+        context: Context,
+        width: Int,
+        height: Int,
+        bitRate: Int?,
+        frameRate: Int,
+        videoMime: String,
+        useBufferInput: Boolean,
+        withAudio: Boolean,
+        result: MethodChannel.Result,
+    ) {
+        val audioEncoder = if (withAudio) createAudioEncoder() else null
+        var recorder: VideoRecorder? = null
+        var errorCode = "start_failed"
+        var errorMessage: String? = null
+        var errorDetails: Any? = null
+        try {
+            val started = VideoRecorder(
+                context, width, height, bitRate, frameRate, audioEncoder,
+                videoMime, useBufferInput,
+            )
+            val surface = started.start()
+            val attachResult =
+                if (useBufferInput) 0 else nativeAttachRecordingSurface(surface!!)
+            if (attachResult == 0 && !useBufferInput && !awaitRecordingSurface()) {
+                // The phone refused the decoder that feeds the encoder: no
+                // frame would ever be recorded, so fail now rather than end
+                // with an empty file at stop.
+                nativeDetachRecordingSurface()
+                started.abort()
+                errorCode = "encoder_unavailable"
+                errorMessage = "Recording decoder failed to start"
+            } else if (attachResult == 0) {
+                recorder = started
+            } else {
+                started.abort()
+                errorCode = "attach_failed"
+                errorMessage =
+                    "nativeAttachRecordingSurface failed with code $attachResult"
+                errorDetails = attachResult
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "startVideoRecording failed", e)
+            // The capture is also stopped inside VideoRecorder's failure
+            // paths; NativeAudio.stop is idempotent.
+            if (audioEncoder != null) {
+                stopAudioCaptureQuietly()
+            }
+            // The phone's codec refused this recording (e.g. a hardware
+            // encoder that cannot run next to the preview decoder at this
+            // size), as opposed to any other start-up failure.
+            if (e is MediaCodec.CodecException) {
+                errorCode = "encoder_unavailable"
+            }
+            errorMessage = e.message ?: "Failed to start recording"
+        }
+        mainHandler.post {
+            recordingStarting = false
+            if (recorder == null) {
+                result.error(errorCode, errorMessage, errorDetails)
+                return@post
+            }
+            if (appContext == null) {
+                // The engine detached while the recording was starting.
+                nativeDetachRecordingSurface()
+                recorder.abort()
+                result.error("unavailable", "Context not available", null)
+                return@post
+            }
+            videoRecorder = recorder
+            result.success(null)
+        }
+    }
+
+    /**
+     * Waits for the native recording decoder to render into the attached
+     * recording surface. Returns false only when it failed to start; a
+     * decoder still waiting for the camera's next keyframe when the wait
+     * runs out counts as usable.
+     */
+    private fun awaitRecordingSurface(): Boolean {
+        val deadline = SystemClock.elapsedRealtime() + RECORDING_SURFACE_WAIT_MS
+        while (SystemClock.elapsedRealtime() < deadline) {
+            val state = nativeRecordingSurfaceState()
+            if (state != RECORDING_SURFACE_PENDING) {
+                return state != RECORDING_SURFACE_FAILED
+            }
+            Thread.sleep(RECORDING_SURFACE_POLL_MS)
+        }
+        return true
+    }
+
     // Audio capture for recordings. Every failure logs a warning and degrades
     // to video-only — audio must never break a recording.
     //
-    // Source selection: the Android USB audio path (AudioRecord) is tried
-    // first — the kernel USB audio driver does the isochronous streaming
-    // itself, which is immune to the userspace usbfs starvation some phones
-    // show on raw isoc reads (a steady 1/16 of the nominal rate on a Huawei
-    // nova 12). Without mic permission or a USB audio input device, the
-    // native libusb UAC capture is used instead; startDetected() measures
-    // the real capture format while starting (the descriptor rate is only
-    // an estimate).
+    // Source selection: the native libusb UAC capture goes first, and the
+    // Android USB audio path (AudioRecord) is left untouched. Trying
+    // AudioRecord first is not safe: on some phones (a OnePlus) it opens
+    // fine yet yields nothing but digital silence while this app holds the
+    // camera, and having opened it leaves the libusb capture silent too
+    // until the camera is re-plugged. startDetected() measures the real
+    // capture format while starting (the descriptor rate is only an
+    // estimate) and reports from that same measurement whether the stream
+    // delivers only a fraction of its nominal rate — usbfs isochronous reads
+    // starved by the host (a steady 1/16 on a Huawei nova 12), or a camera
+    // firmware that answers one poll in four with a quarter-size packet (an
+    // iCatch V37), or a firmware that delivers nothing at all (a RunCam).
+    // Such a capture is dropped and the same recording carries on through
+    // AudioRecord when the platform exposes the camera's microphone (the
+    // kernel USB audio driver does the streaming there). The verdict holds
+    // for the current connection only — see UacCaptureHealth — so later
+    // recordings skip the measurement; a healthy capture's measured rate
+    // and a delivering AudioRecord path are remembered the same way, so
+    // only the first recording of a connection detects anything. A camera
+    // that delivers nothing through AudioRecord either is recorded
+    // video-only, without an empty audio track — see isAudioCaptureSilent().
+    //
+    // Blocks for the native measurement window; call off the main thread.
     private fun createAudioEncoder(): AacAudioEncoder? {
-        val context = appContext
-        if (context != null && hasRecordAudioPermission()) {
-            val audioManager =
-                context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            val usbInput = UsbMicCapture.findUsbInput(audioManager)
-            if (usbInput != null) {
-                val capture = UsbMicCapture.open(usbInput)
-                if (capture != null) {
-                    Log.i(TAG, "Audio source: AudioRecord USB mic @ ${capture.sampleRate} Hz")
-                    // The kernel path already applies sane gain; keep PCM
-                    // as-is (fixed unity gain, no AGC).
-                    return AacAudioEncoder(
-                        capture.sampleRate, capture.channelCount, 1f, capture,
-                    )
-                }
-                Log.w(TAG, "USB audio input found but AudioRecord failed; using libusb UAC")
-            } else {
-                Log.i(TAG, "No USB audio input device; using libusb UAC capture")
-            }
+        if (UacCaptureHealth.isMicSilent()) {
+            return null
+        }
+        if (UacCaptureHealth.isLibusbStarved()) {
+            return createUsbMicEncoder()
         }
         val info = try {
-            NativeAudio.startDetected()
+            NativeAudio.startDetected(UacCaptureHealth.libusbSampleRate())
         } catch (e: Throwable) {
             Log.w(TAG, "Audio capture start threw; recording video-only", e)
             null
@@ -672,8 +775,98 @@ class FlutterFfiUvcPlugin :
             stopAudioCaptureQuietly()
             return null
         }
+        if (info.size > 3 && info[3] != 0) {
+            // A fraction of the nominal rate is no audio track worth
+            // keeping. The native stop hands the interface back to the
+            // kernel audio driver for the AudioRecord path.
+            UacCaptureHealth.markLibusbStarved()
+            stopAudioCaptureQuietly()
+            Log.w(TAG, "libusb UAC capture is starved; switching to AudioRecord")
+            return createUsbMicEncoder()
+        }
+        UacCaptureHealth.markLibusbHealthy(info[0])
         Log.i(TAG, "Audio source: libusb UAC @ ${info[0]} Hz")
         return AacAudioEncoder(info[0], info[1])
+    }
+
+    /**
+     * Encoder fed by the Android USB audio path, or null when that path is
+     * unavailable (no mic permission, no USB audio input, AudioRecord
+     * refusing every rate) — the recording then goes video-only.
+     */
+    private fun createUsbMicEncoder(): AacAudioEncoder? {
+        val context = appContext
+        if (context == null) {
+            Log.w(TAG, "Context not available; recording video-only")
+            return null
+        }
+        if (!hasRecordAudioPermission()) {
+            Log.i(TAG, "No RECORD_AUDIO permission; recording video-only")
+            return null
+        }
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val usbInput = UsbMicCapture.findUsbInput(audioManager)
+        if (usbInput == null) {
+            Log.i(TAG, "No USB audio input device; recording video-only")
+            return null
+        }
+        val capture = UsbMicCapture.open(usbInput)
+        if (capture == null) {
+            Log.w(TAG, "USB audio input found but AudioRecord failed; recording video-only")
+            return null
+        }
+        if (!UacCaptureHealth.isMicDelivering()) {
+            if (!deliversAudio(capture)) {
+                UacCaptureHealth.markMicSilent()
+                releaseUsbMicInBackground(capture)
+                Log.w(TAG, "USB mic delivers no audio; recording video-only")
+                return null
+            }
+            UacCaptureHealth.markMicDelivering()
+        }
+        Log.i(TAG, "Audio source: AudioRecord USB mic @ ${capture.sampleRate} Hz")
+        // The kernel path already applies sane gain; keep PCM as-is (fixed
+        // unity gain, no AGC).
+        return AacAudioEncoder(capture.sampleRate, capture.channelCount, 1f, capture)
+    }
+
+    /** Whether [capture] delivers PCM; a capture that fails to start does not. */
+    private fun deliversAudio(capture: UsbMicCapture): Boolean =
+        try {
+            capture.awaitFirstData(USB_MIC_FIRST_DATA_WAIT_MS)
+        } catch (e: Exception) {
+            Log.w(TAG, "USB mic capture failed to start", e)
+            false
+        }
+
+    /**
+     * Stops and releases [capture] off the calling thread: stopping an
+     * AudioRecord whose HAL read is stuck waiting for a silent camera takes
+     * seconds, and must not delay the start of the recording.
+     */
+    private fun releaseUsbMicInBackground(capture: UsbMicCapture) {
+        Thread({
+            capture.stopCapture()
+            capture.release()
+        }, "uvc-usb-mic-release").start()
+    }
+
+    /**
+     * True when the opened camera's microphone was found to deliver no
+     * audio on this phone: neither path yielded PCM, or its libusb capture
+     * was measured as starved and the platform exposes no USB audio input
+     * for it either. Known only after a recording with audio has started.
+     */
+    private fun isAudioCaptureSilent(): Boolean {
+        if (UacCaptureHealth.isMicSilent()) {
+            return true
+        }
+        val context = appContext ?: return false
+        if (!UacCaptureHealth.isLibusbStarved()) {
+            return false
+        }
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        return UsbMicCapture.findUsbInput(audioManager) == null
     }
 
     private fun hasRecordAudioPermission(): Boolean {
@@ -798,6 +991,7 @@ class FlutterFfiUvcPlugin :
             return
         }
         logUsbDeviceLayout(device, connection)
+        UacCaptureHealth.reset()
         currentDevice = device
         currentConnection = connection
         result.success(mapOf("fileDescriptor" to connection.fileDescriptor))
@@ -807,6 +1001,7 @@ class FlutterFfiUvcPlugin :
         currentConnection?.close()
         currentConnection = null
         currentDevice = null
+        UacCaptureHealth.reset()
     }
 
     private fun deviceToMap(device: UsbDevice): Map<String, Any> = mapOf(
@@ -891,6 +1086,7 @@ class FlutterFfiUvcPlugin :
     private external fun nativeDetachSurface()
     private external fun nativeAttachRecordingSurface(surface: Surface): Int
     private external fun nativeDetachRecordingSurface()
+    private external fun nativeRecordingSurfaceState(): Int
     private external fun nativeRawRecStart(path: String): Int
     private external fun nativeRawRecStop(): Int
 }

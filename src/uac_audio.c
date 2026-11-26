@@ -54,6 +54,8 @@ struct uac_audio {
   int pending;   /* transfers in flight (callback guaranteed) */
   int readers;   /* threads currently inside uac_audio_read */
   int stopping;
+  /* Non-zero when claiming the interface detached a kernel audio driver. */
+  int kernel_driver_detached;
   /* Total delivered PCM bytes since start; uac_audio_start() samples it
    * twice to measure the real capture rate. Never reset while streaming. */
   uint64_t stat_bytes_total;
@@ -585,6 +587,11 @@ static void LIBUSB_CALL uac_audio_transfer_cb(struct libusb_transfer *transfer) 
 /* How long the freshly started stream is measured to learn the real PCM
  * delivery rate before reporting the capture format. */
 #define UAC_MEASURE_WINDOW_MS 300
+/* A capture delivering less than 1/UAC_STARVED_DIVISOR of the descriptor
+ * rate counts as starved: far below any healthy stream, well above the 1/16
+ * starvation, so a momentary hiccup never flips the verdict. No delivery at
+ * all (observed on a RunCam firmware) is the limiting case. */
+#define UAC_STARVED_DIVISOR 4
 
 /* UAC1 sampling-frequency control (spec 5.2.1.1): a class request on the
  * isochronous endpoint itself. Some firmwares power up on a very low
@@ -622,14 +629,18 @@ static int uac_set_sampling_freq(
 
 /* Claims an interface, detaching a kernel audio driver and retrying briefly:
  * a capture stopped moments ago can leave the interface briefly unclaimable
- * (the altsetting-0 reset is still in flight). Returns 0 on success. */
-static int uac_claim_interface(libusb_device_handle *usb_devh, int interface_no) {
+ * (the altsetting-0 reset is still in flight). Returns 0 on success;
+ * *out_detached is set when a kernel driver was detached on the way. */
+static int uac_claim_interface(
+    libusb_device_handle *usb_devh, int interface_no, int *out_detached) {
   int rc = -1;
   for (int attempt = 0; attempt < 3; attempt++) {
     rc = libusb_claim_interface(usb_devh, interface_no);
     if (rc == LIBUSB_ERROR_BUSY) {
       /* The kernel audio driver (snd-usb-audio) may hold the interface. */
-      libusb_detach_kernel_driver(usb_devh, interface_no);
+      if (libusb_detach_kernel_driver(usb_devh, interface_no) == 0) {
+        *out_detached = 1;
+      }
       rc = libusb_claim_interface(usb_devh, interface_no);
     }
     if (rc == 0) {
@@ -695,11 +706,55 @@ static int64_t uac_monotonic_ns(void) {
   return (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec;
 }
 
+/* Measures the real delivery rate of the freshly started stream for a short
+ * window: descriptor rates are estimates (UAC2 does not even state one), so
+ * the encoder rate is derived from measured bytes — but only when the
+ * measurement snaps cleanly to a standard rate; otherwise the descriptor
+ * estimate stands. PCM arriving during the window stays in the ring; the
+ * reader drains it once the encoder starts. Updates final->sample_rate and
+ * final->starved and returns the measured bytes per second. */
+static uint64_t uac_measure_delivery(
+    uac_audio_t *audio,
+    uac_audio_info_t *final,
+    int descriptor_rate) {
+  pthread_mutex_lock(&audio->mutex);
+  const uint64_t measure_b0 = audio->stat_bytes_total;
+  pthread_mutex_unlock(&audio->mutex);
+  const int64_t measure_t0 = uac_monotonic_ns();
+  struct timespec window = {0, UAC_MEASURE_WINDOW_MS * 1000 * 1000};
+  while (nanosleep(&window, &window) != 0 && errno == EINTR) {
+  }
+  pthread_mutex_lock(&audio->mutex);
+  const uint64_t delivered = audio->stat_bytes_total - measure_b0;
+  pthread_mutex_unlock(&audio->mutex);
+  const int64_t elapsed_ns = uac_monotonic_ns() - measure_t0;
+  const uint64_t bps = elapsed_ns > 0
+      ? delivered * 1000000000ull / (uint64_t)elapsed_ns
+      : 0;
+
+  const int frame_bytes = final->channels * ((final->bits + 7) / 8);
+  /* A window that delivered nothing at all is measured too: it snaps to no
+   * rate and is below every threshold, so a camera streaming zero bytes
+   * counts as starved instead of passing for a healthy capture. */
+  if (frame_bytes > 0) {
+    const int measured = (int)(bps / (uint64_t)frame_bytes);
+    const int snapped = uac_snap_sample_rate(measured);
+    if (snapped > 0) {
+      final->sample_rate = snapped;
+    }
+    final->starved = snapped <= 0 &&
+        bps * UAC_STARVED_DIVISOR <
+            (uint64_t)descriptor_rate * (uint64_t)frame_bytes;
+  }
+  return bps;
+}
+
 uac_audio_t *uac_audio_start(
     libusb_device_handle *usb_devh,
     uac_audio_info_t *candidates,
     int candidate_count,
-    int video_streaming) {
+    int video_streaming,
+    int known_sample_rate) {
   if (usb_devh == NULL || candidates == NULL || candidate_count <= 0) {
     return NULL;
   }
@@ -759,7 +814,8 @@ uac_audio_t *uac_audio_start(
    * firmwares (on a RunCam the video stream dies mid-switch and does not
    * recover until the next power cycle), and on such devices every
    * altsetting delivers the same trickle anyway, so hopping buys nothing. */
-  const int claim_rc = uac_claim_interface(usb_devh, info->interface_no);
+  const int claim_rc = uac_claim_interface(
+      usb_devh, info->interface_no, &audio->kernel_driver_detached);
   if (claim_rc != 0) {
     UAC_STATS_LOGW(
         "start: claim interface=%d failed rc=%d", info->interface_no, claim_rc);
@@ -797,41 +853,21 @@ uac_audio_t *uac_audio_start(
     return NULL;
   }
 
-  /* Measure the real delivery rate for a short window: descriptor rates
-   * are estimates (UAC2 does not even state one), so the encoder rate is
-   * derived from measured bytes — but only when the measurement snaps
-   * cleanly to a standard rate; otherwise the descriptor estimate stands.
-   * PCM arriving during the window stays in the ring; the reader drains it
-   * once the encoder starts. */
-  pthread_mutex_lock(&audio->mutex);
-  const uint64_t measure_b0 = audio->stat_bytes_total;
-  pthread_mutex_unlock(&audio->mutex);
-  const int64_t measure_t0 = uac_monotonic_ns();
-  struct timespec window = {0, UAC_MEASURE_WINDOW_MS * 1000 * 1000};
-  while (nanosleep(&window, &window) != 0 && errno == EINTR) {
-  }
-  pthread_mutex_lock(&audio->mutex);
-  const uint64_t delivered = audio->stat_bytes_total - measure_b0;
-  pthread_mutex_unlock(&audio->mutex);
-  const int64_t elapsed_ns = uac_monotonic_ns() - measure_t0;
-  const uint64_t bps = elapsed_ns > 0
-      ? delivered * 1000000000ull / (uint64_t)elapsed_ns
-      : 0;
-
   uac_audio_info_t final = *info;
-  const int frame_bytes = final.channels * ((final.bits + 7) / 8);
-  if (frame_bytes > 0 && bps > 0) {
-    const int measured = (int)(bps / (uint64_t)frame_bytes);
-    const int snapped = uac_snap_sample_rate(measured);
-    if (snapped > 0) {
-      final.sample_rate = snapped;
-    }
+  uint64_t bps = 0;
+  if (known_sample_rate > 0) {
+    /* The caller measured this connection before: trust its verdict and
+     * start without spending the measurement window again. */
+    final.sample_rate = known_sample_rate;
+    final.starved = 0;
+  } else {
+    bps = uac_measure_delivery(audio, &final, descriptor_rate);
   }
   audio->info = final;
   candidates[0] = final;
   UAC_STATS_LOGI(
       "capture started: alt=%d rate=%d descriptor_rate=%d ch=%d bits=%d "
-      "packet=%u transfers=%d bytes/s=%llu",
+      "packet=%u transfers=%d measured=%d bytes/s=%llu starved=%d",
       final.altsetting,
       final.sample_rate,
       descriptor_rate,
@@ -839,7 +875,9 @@ uac_audio_t *uac_audio_start(
       final.bits,
       final.packet_size,
       submitted,
-      (unsigned long long)bps);
+      known_sample_rate <= 0,
+      (unsigned long long)bps,
+      final.starved);
   return audio;
 }
 
@@ -933,6 +971,14 @@ void uac_audio_stop(uac_audio_t *audio) {
   if (audio->usb_devh != NULL) {
     libusb_set_interface_alt_setting(audio->usb_devh, audio->info.interface_no, 0);
     libusb_release_interface(audio->usb_devh, audio->info.interface_no);
+    /* A starved capture is useless on this host: give the interface back to
+     * the kernel audio driver so the platform audio path can record instead.
+     * Healthy captures leave it detached, as before. */
+    if (audio->kernel_driver_detached && audio->info.starved) {
+      const int attach_rc = libusb_attach_kernel_driver(
+          audio->usb_devh, audio->info.interface_no);
+      UAC_STATS_LOGW("capture starved: kernel driver re-attach rc=%d", attach_rc);
+    }
   }
   for (int i = 0; i < UAC_NUM_TRANSFERS; i++) {
     if (audio->transfers[i] != NULL) {

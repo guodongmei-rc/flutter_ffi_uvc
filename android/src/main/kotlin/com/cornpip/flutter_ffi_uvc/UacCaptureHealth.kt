@@ -1,0 +1,77 @@
+package com.cornpip.flutter_ffi_uvc
+
+/**
+ * Remembers, for the camera connection currently open, that the native
+ * libusb UAC capture ([NativeAudio]) was measured as starved.
+ *
+ * Which audio path works cannot be found out by trying both in any order:
+ * on some phones (a OnePlus) the Android USB audio path yields only digital
+ * silence while this app holds the camera, and merely opening it leaves the
+ * libusb capture silent as well until the camera is re-plugged. So the
+ * libusb capture always goes first, and only a capture the native start-up
+ * measurement reports as starved (a steady 1/16 of the nominal rate on a
+ * Huawei nova 12, one quarter-size packet per four polls on an iCatch V37,
+ * nothing at all on a RunCam firmware) falls back to the Android USB audio
+ * path. This flag lets the following recordings skip the measurement.
+ *
+ * Whatever the first recording finds is kept for the connection: a healthy
+ * libusb capture keeps its measured rate and a delivering Android USB audio
+ * path is not probed again, so only the first recording pays for detection.
+ *
+ * A camera whose microphone delivers nothing through the Android USB audio
+ * path either is remembered as silent: its recordings carry no audio track
+ * instead of an empty one.
+ *
+ * The verdicts live in memory and are cleared with the connection. They are
+ * not kept per camera model: units of one model differ by firmware, and a
+ * verdict stored for one would reroute a healthy unit as well.
+ */
+internal object UacCaptureHealth {
+    @Volatile
+    private var libusbStarved = false
+
+    /** Whether this connection's libusb capture was measured as starved. */
+    fun isLibusbStarved(): Boolean = libusbStarved
+
+    fun markLibusbStarved() {
+        libusbStarved = true
+    }
+
+    @Volatile
+    private var micSilent = false
+
+    /** Whether this connection's microphone delivered no audio on any path. */
+    fun isMicSilent(): Boolean = micSilent
+
+    fun markMicSilent() {
+        micSilent = true
+    }
+
+    @Volatile
+    private var libusbSampleRate = 0
+
+    /** The rate this connection's healthy libusb capture measured, or 0. */
+    fun libusbSampleRate(): Int = libusbSampleRate
+
+    fun markLibusbHealthy(sampleRate: Int) {
+        libusbSampleRate = sampleRate
+    }
+
+    @Volatile
+    private var micDelivers = false
+
+    /** Whether this connection's Android USB audio path delivered audio. */
+    fun isMicDelivering(): Boolean = micDelivers
+
+    fun markMicDelivering() {
+        micDelivers = true
+    }
+
+    /** Forgets the verdicts; call whenever the camera connection changes. */
+    fun reset() {
+        libusbStarved = false
+        micSilent = false
+        libusbSampleRate = 0
+        micDelivers = false
+    }
+}

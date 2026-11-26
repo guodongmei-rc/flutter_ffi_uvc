@@ -331,6 +331,18 @@ class OhosUvcCamera implements UvcCamera {
     );
   }
 
+  /// The platform side handles channel calls one at a time and in order, so
+  /// a start, open or close made right after this runs behind the stop.
+  @override
+  Future<void> stopPreviewAsync() async {
+    _previewing = false;
+    try {
+      await _channel.invokeMethod<void>('stopPreview');
+    } catch (error) {
+      _lastError = error.toString();
+    }
+  }
+
   @override
   bool get isPreviewing => _previewing;
 
@@ -467,6 +479,16 @@ class OhosUvcCamera implements UvcCamera {
     final Map<Object?, Object?>? reply =
         await _channel.invokeMapMethod<Object?, Object?>('queryAudioInterface');
     return reply == null ? null : UvcAudioInfo.fromMap(reply);
+  }
+
+  /// True once a recording found the camera's USB microphone delivering no
+  /// audio. That recording and the following ones are video-only; the verdict
+  /// is kept until the device is closed.
+  @override
+  Future<bool> isAudioCaptureSilent() async {
+    final bool? silent =
+        await _channel.invokeMethod<bool>('isAudioCaptureSilent');
+    return silent ?? false;
   }
 
   @override

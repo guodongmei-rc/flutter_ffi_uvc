@@ -23,9 +23,15 @@ internal object NativeAudio {
      * capture format: the native layer streams each altsetting briefly and
      * keeps the one that actually delivers data, so the returned rate is the
      * measured truth (descriptor rates are only estimates). Returns
-     * {sampleRate, channels, bits}, or null on failure.
+     * {sampleRate, channels, bits, starved}, or null on failure; starved is
+     * non-zero when the same measurement shows the host delivering only a
+     * fraction of the nominal rate.
+     *
+     * A positive [knownSampleRate] — the rate an earlier call measured on
+     * this connection — skips the measurement: the capture starts at once
+     * and reports that rate with starved 0.
      */
-    external fun startDetected(): IntArray?
+    external fun startDetected(knownSampleRate: Int): IntArray?
 
     /**
      * Fills [buffer] (must be direct) with captured 16-bit PCM. Returns the

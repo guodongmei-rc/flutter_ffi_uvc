@@ -43,6 +43,8 @@ class _FakeCamera implements UvcCamera {
   @override
   Future<UvcAudioInfo?> queryAudioInterface() async => null;
   @override
+  Future<bool> isAudioCaptureSilent() async => false;
+  @override
   Future<List<UvcUsbDevice>> listUsbDevices() async => const [];
   @override
   Future<int> openUsbDevice(int deviceId) async => -1;
@@ -87,6 +89,8 @@ class _FakeCamera implements UvcCamera {
   void disableStallDetection() {}
   @override
   void stopPreview() {}
+  @override
+  Future<void> stopPreviewAsync() async {}
   @override
   void closeFd() {}
   @override
