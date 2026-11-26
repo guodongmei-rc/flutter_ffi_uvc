@@ -8,6 +8,7 @@
 #ifndef FLUTTER_FFI_UVC_RECORDER_H_
 #define FLUTTER_FFI_UVC_RECORDER_H_
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -176,7 +177,11 @@ class VideoRecorder : public PcmSink {
     started_at_us_ = NowMicros();
     frames_in_ = 0;
     frames_out_ = 0;
-    first_pts_us_ = 0;
+    // Zero point of the file. Frames written here (WriteFrame) are stamped
+    // with NowMicros(), so the recording start is the base, as on Android
+    // (ptsBaseUs in VideoRecorder.kt). An external producer stamps its own
+    // frames; its base is taken from the first encoded frame instead.
+    first_pts_us_ = external_producer_ ? 0 : started_at_us_;
     last_pts_us_ = 0;
     rejected_ = 0;
     eos_seen_ = false;
@@ -568,16 +573,20 @@ class VideoRecorder : public PcmSink {
     if (self->muxer_ != nullptr && self->track_ >= 0 && attr.size > 0) {
       const bool is_frame = (attr.flags & AVCODEC_BUFFER_FLAGS_CODEC_DATA) == 0;
       if (is_frame) {
-        // The file starts at zero whatever clock the producer stamped the
-        // frames with: a decoder rendering into the surface passes the
-        // camera's monotonic capture times through, and the muxer would make
-        // those the file's duration.
-        if (self->frames_out_ == 0) {
+        // The file starts at zero whatever clock the frames were stamped
+        // with; the muxer would otherwise make the monotonic times the
+        // file's duration. Frames stamped here are rebased to the recording
+        // start, like Android: the encoder has been seen to hand out the
+        // first frame with a timestamp of 0, and taking that as the base
+        // left every later frame hours into the file. Such a frame lands on
+        // 0 instead. A decoder rendering into the surface passes the
+        // camera's capture times through, so there the first frame is the base.
+        if (self->external_producer_ && self->frames_out_ == 0) {
           self->first_pts_us_ = attr.pts;
         }
         self->last_pts_us_ = attr.pts;
         OH_AVCodecBufferAttr rebased = attr;
-        rebased.pts = attr.pts - self->first_pts_us_;
+        rebased.pts = std::max<int64_t>(attr.pts - self->first_pts_us_, 0);
         OH_AVBuffer_SetBufferAttr(buffer, &rebased);
       }
       const OH_AVErrCode wrote = OH_AVMuxer_WriteSampleBuffer(self->muxer_, static_cast<uint32_t>(self->track_), buffer);
