@@ -614,6 +614,7 @@ export class UvcCameraSession {
       }
       this.claimedInterfaces.push(wanted[i]);
     }
+    this.raiseMicrophoneGain();
     hilog.info(DOMAIN, TAG, 'opened %{public}s: bcdUVC=0x%{public}s, %{public}d usable mode(s)',
       device.name, info.bcdUVC.toString(16), usable.length);
     this.errorMessage = '';
@@ -1013,32 +1014,79 @@ export class UvcCameraSession {
       UAC_CS_SAMPLING_FREQ << 8, audio.endpointAddress, current.buffer as ArrayBuffer, CONTROL_TIMEOUT_MS);
     hilog.info(DOMAIN, TAG, 'microphone sampling freq: set %{public}d rc=%{public}d, now %{public}d rc=%{public}d',
       audio.sampleRate, setFreq, current[0] | (current[1] << 8) | (current[2] << 16), getFreq);
-    // Unmute and raise the gain of every Feature Unit channel offering it.
+    this.applyMicrophoneControls(fd);
+    return true;
+  }
+
+  /**
+   * Unmutes and raises the gain of every Feature Unit channel offering it,
+   * as Android does (uac_configure_audio_controls). The values found are
+   * logged first: a quiet recording is diagnosed from them.
+   */
+  private applyMicrophoneControls(fd: number): void {
     for (let u = 0; u < this.featureUnits.length; u++) {
       const unit = this.featureUnits[u];
       const index = (unit.unitId << 8) | unit.interfaceNumber;
       for (let ch = 0; ch < unit.controls.length; ch++) {
         const controls = unit.controls[ch];
         if ((controls & 0x01) !== 0) {
+          const was = new Uint8Array(1);
+          const got = native.usbControlTransfer(fd, UVC_REQ_TYPE_GET, UAC_GET_CUR, (UAC_CS_MUTE << 8) | ch, index,
+            was.buffer as ArrayBuffer, CONTROL_TIMEOUT_MS);
           const mute = new Uint8Array([0]);
           const rc = native.usbControlTransfer(fd, UVC_REQ_TYPE_SET, UAC_SET_CUR, (UAC_CS_MUTE << 8) | ch, index,
             mute.buffer as ArrayBuffer, CONTROL_TIMEOUT_MS);
-          hilog.info(DOMAIN, TAG, 'microphone unmute unit=%{public}d ch=%{public}d rc=%{public}d', unit.unitId, ch, rc);
+          hilog.info(DOMAIN, TAG, 'microphone unmute unit=%{public}d ch=%{public}d was=%{public}d (rc=%{public}d) rc=%{public}d',
+            unit.unitId, ch, was[0], got, rc);
         }
         if ((controls & 0x02) !== 0) {
+          const was = new Uint8Array(2);
+          const got = native.usbControlTransfer(fd, UVC_REQ_TYPE_GET, UAC_GET_CUR, (UAC_CS_VOLUME << 8) | ch, index,
+            was.buffer as ArrayBuffer, CONTROL_TIMEOUT_MS);
           const volume = new Uint8Array(2);
           const max = native.usbControlTransfer(fd, UVC_REQ_TYPE_GET, UAC_GET_MAX, (UAC_CS_VOLUME << 8) | ch, index,
             volume.buffer as ArrayBuffer, CONTROL_TIMEOUT_MS);
           if (max === 2) {
             const rc = native.usbControlTransfer(fd, UVC_REQ_TYPE_SET, UAC_SET_CUR, (UAC_CS_VOLUME << 8) | ch, index,
               volume.buffer as ArrayBuffer, CONTROL_TIMEOUT_MS);
-            hilog.info(DOMAIN, TAG, 'microphone volume unit=%{public}d ch=%{public}d max=%{public}d rc=%{public}d',
-              unit.unitId, ch, volume[0] | (volume[1] << 8), rc);
+            hilog.info(DOMAIN, TAG,
+              'microphone volume unit=%{public}d ch=%{public}d was=%{public}d (rc=%{public}d) max=%{public}d rc=%{public}d',
+              unit.unitId, ch, was[0] | (was[1] << 8), got, volume[0] | (volume[1] << 8), rc);
+          } else {
+            hilog.warn(DOMAIN, TAG, 'microphone volume GET_MAX failed unit=%{public}d ch=%{public}d rc=%{public}d',
+              unit.unitId, ch, max);
           }
         }
       }
     }
-    return true;
+  }
+
+  /**
+   * Unmutes the microphone and raises its gain right after the device is
+   * opened. The system's USB audio driver holds the AudioControl interface,
+   * which makes the requests of prepareMicrophone() fail with EBUSY and
+   * leaves a camera that powers up muted or quiet that way — for the direct
+   * capture and for the system audio path alike. The interface is taken for
+   * the moment of the requests and handed back, so that the system has its
+   * audio input again long before a recording starts.
+   */
+  private raiseMicrophoneGain(): void {
+    const fd = this.fd;
+    if (fd < 0 || this.audio === null || this.featureUnits.length === 0) {
+      return;
+    }
+    const control = this.featureUnits[0].interfaceNumber;
+    const claimed = native.usbClaimInterface(fd, control);
+    if (claimed < 0) {
+      hilog.warn(DOMAIN, TAG, 'claiming audio control interface %{public}d failed: %{public}s', control,
+        errnoText(claimed));
+      return;
+    }
+    this.applyMicrophoneControls(fd);
+    const released = native.usbReleaseInterface(fd, control);
+    const attached = native.usbAttachKernelDriver(fd, control);
+    hilog.info(DOMAIN, TAG, 'audio control interface %{public}d: released rc=%{public}d, kernel driver rc=%{public}d',
+      control, released, attached);
   }
 
   /** Puts the microphone interface back on alt 0 and releases it. */
