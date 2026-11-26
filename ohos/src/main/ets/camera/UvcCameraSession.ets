@@ -394,6 +394,12 @@ export class UvcCameraSession {
    */
   private microphoneSilent: boolean = false;
   /**
+   * The system's capture of the microphone was run once on this connection
+   * before the direct capture touched the audio interface; see
+   * primeSystemMicrophone(). Cleared when the device is closed.
+   */
+  private systemMicrophonePrimed: boolean = false;
+  /**
    * The system audio path delivered audio on this connection. Kept until the
    * device is closed, like Android: it is not checked for data again.
    */
@@ -681,6 +687,7 @@ export class UvcCameraSession {
     this.featureUnits = [];
     this.audioInterfaceClaimed = -1;
     this.microphoneStarved = false;
+    this.systemMicrophonePrimed = false;
     this.microphoneSilent = false;
     this.systemMicrophoneDelivers = false;
     this.microphoneSampleRate = 0;
@@ -913,6 +920,9 @@ export class UvcCameraSession {
     let result = -1;
     let audioSource = '';
     const audio = withAudio && !this.microphoneSilent ? this.audio : null;
+    if (audio !== null && !this.microphoneStarved) {
+      this.primeSystemMicrophone();
+    }
     if (audio !== null && !this.microphoneStarved && this.prepareMicrophone(audio)) {
       result = native.recordStartWithAudio(this.streamId, path, frameRate, rate, this.fd, audio.endpointAddress,
         audio.packetSize, audio.sampleRate, audio.channels, audio.bitsPerSample, this.microphoneSampleRate);
@@ -1090,6 +1100,26 @@ export class UvcCameraSession {
     const rc = native.usbControlTransfer(this.fd, UAC_REQ_TYPE_SET_ENDPOINT, UAC_SET_CUR,
       UAC_CS_SAMPLING_FREQ << 8, audio.endpointAddress, freq.buffer as ArrayBuffer, CONTROL_TIMEOUT_MS);
     hilog.info(DOMAIN, TAG, 'microphone sampling freq: set to the system rate %{public}d rc=%{public}d', rate, rc);
+  }
+
+  /**
+   * Lets the system set the microphone's stream up once, before the direct
+   * capture claims the audio interface for the first time on this
+   * connection. Measured on a camera whose direct capture is starved: when
+   * the system's first use of the microphone came after the direct attempt,
+   * its recordings carried a loud 1 kHz buzz until the camera was re-plugged
+   * (1 ms pattern 270-350 %), also with the sampling frequency set back;
+   * when the system had recorded from it before the direct attempt, they
+   * were clean (101 %).
+   */
+  private primeSystemMicrophone(): void {
+    if (this.systemMicrophonePrimed) {
+      return;
+    }
+    this.systemMicrophonePrimed = true;
+    const primed = native.systemMicPrime(this.productName());
+    hilog.info(DOMAIN, TAG, 'system microphone primed before the direct capture: %{public}s',
+      primed === 0 ? 'ok' : errnoText(primed));
   }
 
   /** Puts the microphone interface back on alt 0 and releases it. */

@@ -455,6 +455,22 @@ napi_value SystemMicSampleRate(napi_env env, napi_callback_info info) {
   return Number(env, flutter_ffi_uvc::SystemMicCapture::UsbInputSampleRate(std::string(product, length)));
 }
 
+// systemMicPrime(productName): number — runs the system's capture of the
+// camera's microphone for a moment and stops it. 0 or a negative error code.
+napi_value SystemMicPrime(napi_env env, napi_callback_info info) {
+  const Arguments arguments = GetArguments(env, info);
+  char product[256] = {0};
+  size_t length = 0;
+  if (arguments.count < 1 ||
+      napi_get_value_string_utf8(env, arguments.values[0], product, sizeof(product), &length) != napi_ok) {
+    return Number(env, -EINVAL);
+  }
+  flutter_ffi_uvc::SystemMicCapture capture;
+  const int32_t result = capture.Start(std::string(product, length), /*await_first_data=*/true);
+  capture.Stop();
+  return Number(env, result);
+}
+
 // usbAttachKernelDriver(fd, interfaceNumber): number
 napi_value UsbAttachKernelDriver(napi_env env, napi_callback_info info) {
   const Arguments arguments = GetArguments(env, info);
@@ -499,6 +515,7 @@ napi_value Init(napi_env env, napi_value exports) {
        nullptr},
       {"systemMicAvailable", nullptr, SystemMicAvailable, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"systemMicSampleRate", nullptr, SystemMicSampleRate, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"systemMicPrime", nullptr, SystemMicPrime, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"usbAttachKernelDriver", nullptr, UsbAttachKernelDriver, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"recordStop", nullptr, RecordStop, nullptr, nullptr, nullptr, napi_default, nullptr},
   };

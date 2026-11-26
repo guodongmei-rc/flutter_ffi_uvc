@@ -150,6 +150,14 @@ export const systemMicAvailable: (productName: string) => number;
 export const systemMicSampleRate: (productName: string) => number;
 
 /**
+ * Runs the system's capture of the camera's microphone until it delivers
+ * PCM (at most a second) and stops it, so that the system has set the
+ * microphone's stream up once. Returns 0 or the error code
+ * recordStartWithSystemMic would return.
+ */
+export const systemMicPrime: (productName: string) => number;
+
+/**
  * Hands a released interface back to the kernel so that its driver binds
  * again (the system's USB audio driver, for a microphone). Returns 0 or a
  * negative errno.
