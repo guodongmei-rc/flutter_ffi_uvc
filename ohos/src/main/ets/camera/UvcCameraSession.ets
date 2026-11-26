@@ -614,7 +614,6 @@ export class UvcCameraSession {
       }
       this.claimedInterfaces.push(wanted[i]);
     }
-    this.raiseMicrophoneGain();
     hilog.info(DOMAIN, TAG, 'opened %{public}s: bcdUVC=0x%{public}s, %{public}d usable mode(s)',
       device.name, info.bcdUVC.toString(16), usable.length);
     this.errorMessage = '';
@@ -1059,34 +1058,6 @@ export class UvcCameraSession {
         }
       }
     }
-  }
-
-  /**
-   * Unmutes the microphone and raises its gain right after the device is
-   * opened. The system's USB audio driver holds the AudioControl interface,
-   * which makes the requests of prepareMicrophone() fail with EBUSY and
-   * leaves a camera that powers up muted or quiet that way — for the direct
-   * capture and for the system audio path alike. The interface is taken for
-   * the moment of the requests and handed back, so that the system has its
-   * audio input again long before a recording starts.
-   */
-  private raiseMicrophoneGain(): void {
-    const fd = this.fd;
-    if (fd < 0 || this.audio === null || this.featureUnits.length === 0) {
-      return;
-    }
-    const control = this.featureUnits[0].interfaceNumber;
-    const claimed = native.usbClaimInterface(fd, control);
-    if (claimed < 0) {
-      hilog.warn(DOMAIN, TAG, 'claiming audio control interface %{public}d failed: %{public}s', control,
-        errnoText(claimed));
-      return;
-    }
-    this.applyMicrophoneControls(fd);
-    const released = native.usbReleaseInterface(fd, control);
-    const attached = native.usbAttachKernelDriver(fd, control);
-    hilog.info(DOMAIN, TAG, 'audio control interface %{public}d: released rc=%{public}d, kernel driver rc=%{public}d',
-      control, released, attached);
   }
 
   /** Puts the microphone interface back on alt 0 and releases it. */
