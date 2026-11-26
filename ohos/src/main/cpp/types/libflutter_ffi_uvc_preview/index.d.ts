@@ -110,14 +110,20 @@ export const recordStart: (stream: number, path: string, fps: number, bitRate: n
  * The AudioStreaming interface must already be claimed, on its streaming alt
  * setting and configured (sampling frequency, unmute); `endpoint`,
  * `packetSize`, `sampleRate`, `channels` and `bits` describe its isochronous
- * IN endpoint and PCM format. The real sample rate is measured over the first
- * 300 ms (the call blocks for that long) and used when it differs from
- * `sampleRate`. Fails with -27 when the microphone delivers nothing, without
- * starting the recording; the caller may then record without audio.
+ * IN endpoint and PCM format. With `knownSampleRate` 0 the real sample rate
+ * is measured over the first 300 ms (the call blocks for that long) and used
+ * when it snaps to a standard rate; a positive `knownSampleRate` — the value
+ * an earlier call returned for this connection — is used as is, without
+ * measuring. Returns the sample rate the audio track uses (> 0), or a
+ * negative error code without starting the recording: -27 when the
+ * microphone is starved (no standard rate and under a quarter of
+ * `sampleRate`, or nothing at all), -28 when its capture cannot be started.
+ * The caller may then record without audio.
  */
 export const recordStartWithAudio: (
   stream: number, path: string, fps: number, bitRate: number,
-  fd: number, endpoint: number, packetSize: number, sampleRate: number, channels: number, bits: number) => number;
+  fd: number, endpoint: number, packetSize: number, sampleRate: number, channels: number, bits: number,
+  knownSampleRate: number) => number;
 
 /** Finishes the recording. Returns the number of frames written, or a negative error code. */
 export const recordStop: (stream: number) => number;

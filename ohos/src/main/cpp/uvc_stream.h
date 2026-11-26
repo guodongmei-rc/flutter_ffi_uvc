@@ -20,6 +20,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
@@ -1294,11 +1295,18 @@ class StreamSession {
   // NV12 frames; H.264/H.265 streams decode into the encoder's surface with a
   // second decoder instance (no passthrough, same as Android). With `audio`
   // the camera's microphone is captured on its (already configured) endpoint
-  // into an AAC track; like Android, the real sample rate is measured over a
-  // short window first, descriptor rates being estimates. Returns 0 or a
-  // negative error code; a microphone that fails to start fails the call
-  // (the caller may retry without audio).
-  int32_t StartRecording(const std::string &path, int32_t fps, int64_t bitrate, const UacCaptureConfig *audio) {
+  // into an AAC track. Same rules as Android (uac_audio_start in
+  // src/uac_audio.c): the real sample rate is measured over a short window
+  // first, descriptor rates being estimates, and a capture delivering less
+  // than 1/kAudioStarvedDivisor of the descriptor rate counts as starved.
+  // `known_sample_rate` > 0 is the rate an earlier recording of this
+  // connection measured: it is used as is and the window is skipped.
+  // Returns 0 or a negative error code: kErrorRecorderMicrophoneStart when
+  // the capture cannot be started, kErrorRecorderMicrophone when it is
+  // starved (the caller may retry without audio in both cases). On success
+  // with `audio`, `audio_sample_rate` receives the rate the track uses.
+  int32_t StartRecording(const std::string &path, int32_t fps, int64_t bitrate, const UacCaptureConfig *audio,
+                         int32_t known_sample_rate, int32_t *audio_sample_rate) {
     if (recorder_ != nullptr) {
       return kErrorRecorderBusy;
     }
@@ -1309,30 +1317,19 @@ class StreamSession {
       const int ret = capture->Start(*audio);
       if (ret != 0) {
         OH_LOG_WARN(LOG_APP, "microphone capture failed to start: %{public}d", ret);
-        return kErrorRecorderMicrophone;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(kAudioMeasureMs));
-      const UacCaptureStats stats = capture->Stats();
-      if (!stats.running || stats.bytes == 0) {
-        OH_LOG_WARN(LOG_APP, "microphone delivered nothing in %{public}d ms (errno %{public}d)", kAudioMeasureMs,
-                    stats.stop_errno);
-        return kErrorRecorderMicrophone;
+        return kErrorRecorderMicrophoneStart;
       }
       track.channels = audio->channels;
       track.sample_rate = audio->sample_rate;
-      const int64_t frame_bytes = static_cast<int64_t>(audio->channels) * ((audio->bits + 7) / 8);
-      const int32_t measured = frame_bytes > 0 ? static_cast<int32_t>(static_cast<int64_t>(stats.bytes) * 1000 /
-                                                                      kAudioMeasureMs / frame_bytes)
-                                               : 0;
-      const int32_t snapped = SnapSampleRate(measured);
-      if (snapped > 0) {
-        track.sample_rate = snapped;
+      if (known_sample_rate > 0) {
+        // Measured before on this connection: trust that verdict and start
+        // without spending the measurement window again.
+        track.sample_rate = known_sample_rate;
+        OH_LOG_INFO(LOG_APP, "microphone: %{public}d Hz known (descriptor %{public}d), %{public}d ch",
+                    track.sample_rate, audio->sample_rate, audio->channels);
+      } else if (MeasureMicrophone(capture.get(), *audio, &track.sample_rate)) {
+        return kErrorRecorderMicrophone;
       }
-      OH_LOG_INFO(LOG_APP,
-                  "microphone: %{public}llu bytes in %{public}d ms -> %{public}d Hz measured, %{public}d Hz used "
-                  "(descriptor %{public}d), %{public}d ch, bad packets %{public}llu",
-                  static_cast<unsigned long long>(stats.bytes), kAudioMeasureMs, measured, track.sample_rate,
-                  audio->sample_rate, audio->channels, static_cast<unsigned long long>(stats.bad_packets));
     }
     int32_t width = 0;
     int32_t height = 0;
@@ -1366,6 +1363,9 @@ class StreamSession {
     if (capture != nullptr) {
       capture->SetSink(recorder.get());
       capture_ = std::move(capture);
+      if (audio_sample_rate != nullptr) {
+        *audio_sample_rate = track.sample_rate;
+      }
     }
     if (jpeg_ != nullptr) {
       jpeg_->SetRecorder(recorder);
@@ -1435,6 +1435,43 @@ class StreamSession {
   }
 
   static constexpr int kAudioMeasureMs = 300;
+  // Same threshold as Android's UAC_STARVED_DIVISOR: far below any healthy
+  // stream, so a momentary hiccup never flips the verdict.
+  static constexpr int kAudioStarvedDivisor = 4;
+
+  // Measures the real delivery rate of the freshly started capture, like
+  // Android's uac_measure_delivery: the rate is taken from the measured bytes
+  // only when it snaps cleanly to a standard rate, else `sample_rate` keeps
+  // the descriptor estimate. Returns true when the capture is starved: no
+  // standard rate and less than 1/kAudioStarvedDivisor of the descriptor
+  // rate, a window that delivered nothing at all being the limiting case.
+  static bool MeasureMicrophone(UacCapture *capture, const UacCaptureConfig &audio, int32_t *sample_rate) {
+    const uint64_t bytes_before = capture->Stats().bytes;
+    const auto started = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(kAudioMeasureMs));
+    const UacCaptureStats stats = capture->Stats();
+    const int64_t elapsed_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
+    const uint64_t delivered = stats.bytes - bytes_before;
+    const uint64_t bps = elapsed_ns > 0 ? delivered * 1000000000ull / static_cast<uint64_t>(elapsed_ns) : 0;
+    const uint64_t frame_bytes = static_cast<uint64_t>(audio.channels) * static_cast<uint64_t>((audio.bits + 7) / 8);
+    int32_t measured = 0;
+    bool starved = false;
+    if (frame_bytes > 0) {
+      measured = static_cast<int32_t>(bps / frame_bytes);
+      const int32_t snapped = SnapSampleRate(measured);
+      if (snapped > 0) {
+        *sample_rate = snapped;
+      }
+      starved = snapped <= 0 && bps * kAudioStarvedDivisor < static_cast<uint64_t>(audio.sample_rate) * frame_bytes;
+    }
+    OH_LOG_INFO(LOG_APP,
+                "microphone: %{public}llu bytes/s -> %{public}d Hz measured, %{public}d Hz used (descriptor "
+                "%{public}d), %{public}d ch, bad packets %{public}llu, starved %{public}d (errno %{public}d)",
+                static_cast<unsigned long long>(bps), measured, *sample_rate, audio.sample_rate, audio.channels,
+                static_cast<unsigned long long>(stats.bad_packets), starved ? 1 : 0, stats.stop_errno);
+    return starved;
+  }
 
   // The nearest standard rate within ~3 %, or 0.
   static int32_t SnapSampleRate(int32_t estimate) {

@@ -270,6 +270,8 @@ function errnoText(result: number): string {
     case 26:
       return 'the AAC audio encoder failed';
     case 27:
+      return 'the microphone stream is starved';
+    case 28:
       return 'the microphone stream could not be started';
     case 12:
       return 'out of USB transfer memory (ENOMEM)';
@@ -374,11 +376,18 @@ export class UvcCameraSession {
   /** AudioStreaming interface claimed for the running recording, or -1. */
   private audioInterfaceClaimed: number = -1;
   /**
-   * The microphone was measured to deliver no audio when a recording started.
-   * Kept until the device is closed, like Android: later recordings skip the
-   * microphone (and its 300 ms measurement) and stay video-only.
+   * The microphone was measured as starved (under a quarter of its nominal
+   * rate, or nothing at all) when a recording started. Kept until the device
+   * is closed, like Android: later recordings skip the microphone (and its
+   * 300 ms measurement) and stay video-only.
    */
   private microphoneSilent: boolean = false;
+  /**
+   * Sample rate a healthy capture measured on this connection, or 0. Kept
+   * until the device is closed, like Android: later recordings use it
+   * without measuring again.
+   */
+  private microphoneSampleRate: number = 0;
   /** The last startRecording() failed because the video encoder refused it. */
   private encoderRejected: boolean = false;
   private claimedInterfaces: number[] = [];
@@ -642,6 +651,7 @@ export class UvcCameraSession {
     this.featureUnits = [];
     this.audioInterfaceClaimed = -1;
     this.microphoneSilent = false;
+    this.microphoneSampleRate = 0;
     this.stream = null;
   }
 
@@ -869,9 +879,14 @@ export class UvcCameraSession {
     const audio = withAudio && !this.microphoneSilent ? this.audio : null;
     if (audio !== null && this.prepareMicrophone(audio)) {
       result = native.recordStartWithAudio(this.streamId, path, frameRate, rate, this.fd, audio.endpointAddress,
-        audio.packetSize, audio.sampleRate, audio.channels, audio.bitsPerSample);
+        audio.packetSize, audio.sampleRate, audio.channels, audio.bitsPerSample, this.microphoneSampleRate);
       if (result === RECORDER_ERROR_MICROPHONE) {
+        // Starved. Android would now try its platform USB audio path; there
+        // is none here, which is Android's "no USB audio input" case: silent.
         this.microphoneSilent = true;
+      }
+      if (result > 0) {
+        this.microphoneSampleRate = result;
       }
       if (result < 0) {
         // Same as Android: a microphone that will not stream makes the

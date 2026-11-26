@@ -346,6 +346,8 @@ napi_value StreamLatestJpeg(napi_env env, napi_callback_info info) {
 }
 
 // recordStart(stream, path, fps, bitRate): number — 0 or a negative error code.
+// recordStartWithAudio(..., knownSampleRate): number — the sample rate the
+// audio track uses, or a negative error code.
 napi_value RecordStart(napi_env env, napi_callback_info info) {
   const Arguments arguments = GetArguments(env, info);
   int64_t stream_id = 0;
@@ -362,9 +364,14 @@ napi_value RecordStart(napi_env env, napi_callback_info info) {
   if (session == nullptr) {
     return Number(env, flutter_ffi_uvc::kErrorRecorderNoFrames);
   }
-  // Optional microphone: fd, endpoint, packetSize, sampleRate, channels, bits.
+  // Optional microphone: fd, endpoint, packetSize, sampleRate, channels, bits,
+  // then the sample rate an earlier recording measured (0 when unknown).
   flutter_ffi_uvc::UacCaptureConfig audio;
   bool with_audio = false;
+  int64_t known_sample_rate = 0;
+  if (arguments.count >= 11) {
+    GetInt(env, arguments, 10, &known_sample_rate);
+  }
   if (arguments.count >= 10) {
     int64_t fd = -1;
     int64_t endpoint = 0;
@@ -385,7 +392,11 @@ napi_value RecordStart(napi_env env, napi_callback_info info) {
       with_audio = true;
     }
   }
-  return Number(env, session->StartRecording(path, static_cast<int32_t>(fps), bitrate, with_audio ? &audio : nullptr));
+  int32_t audio_sample_rate = 0;
+  const int32_t result =
+      session->StartRecording(path, static_cast<int32_t>(fps), bitrate, with_audio ? &audio : nullptr,
+                              static_cast<int32_t>(known_sample_rate), &audio_sample_rate);
+  return Number(env, result == 0 && with_audio ? audio_sample_rate : result);
 }
 
 // recordStop(stream): number — frames written, or a negative error code.

@@ -43,7 +43,10 @@ inline constexpr int32_t kErrorRecorderFile = -23;
 inline constexpr int32_t kErrorRecorderNoFrames = -24;
 inline constexpr int32_t kErrorRecorderFormat = -25;
 inline constexpr int32_t kErrorRecorderAudio = -26;
+// The microphone streams, but was measured as starved (or delivering nothing).
 inline constexpr int32_t kErrorRecorderMicrophone = -27;
+// The microphone capture could not be started at all; nothing was measured.
+inline constexpr int32_t kErrorRecorderMicrophoneStart = -28;
 
 // PCM format of the audio track; 16-bit little-endian samples.
 struct AudioTrackConfig {
