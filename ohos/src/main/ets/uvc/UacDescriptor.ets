@@ -33,6 +33,12 @@ export class UacCaptureInfo {
   channels: number = 0;
   bitsPerSample: number = 0;
   sampleRate: number = 0;
+  /**
+   * The alternate setting's descriptor states [sampleRate]. False when it
+   * states none (0 Hz, or a UAC2 format) and the rate is an estimate from the
+   * packet size.
+   */
+  sampleRateDeclared: boolean = false;
   /** bTerminalLink from AS_GENERAL; 0 when absent. */
   terminalLink: number = 0;
 }
@@ -159,6 +165,7 @@ export function listUacCaptureCandidates(raw: Uint8Array): UacCaptureInfo[] {
         info.channels = channels;
         info.bitsPerSample = bits;
         info.sampleRate = rate;
+        info.sampleRateDeclared = rate > 0;
         info.terminalLink = terminalLink;
         estimateFormat(info);
         found.push(info);
@@ -177,7 +184,8 @@ export function probeUacCapture(raw: Uint8Array): UacCaptureInfo | null {
 
 export function describeUacCapture(info: UacCaptureInfo): string {
   return `interface=${info.interfaceNumber} alt=${info.altSetting} ep=0x${info.endpointAddress.toString(16)} ` +
-    `packet=${info.packetSize} interval=${info.endpointInterval} rate=${info.sampleRate} ` +
+    `packet=${info.packetSize} interval=${info.endpointInterval} rate=${info.sampleRate}` +
+    `${info.sampleRateDeclared ? '' : ' (estimated)'} ` +
     `ch=${info.channels} bits=${info.bitsPerSample} terminal_link=${info.terminalLink}`;
 }
 

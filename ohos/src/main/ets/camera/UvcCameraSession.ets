@@ -381,24 +381,26 @@ export class UvcCameraSession {
   /** AudioStreaming interface claimed for the running recording, or -1. */
   private audioInterfaceClaimed: number = -1;
   /**
-   * The microphone's direct capture was measured as starved (under a quarter
-   * of its nominal rate, or nothing at all) when a recording started. Kept
-   * until the device is closed, like Android's UacCaptureHealth: later
-   * recordings skip it (and its 300 ms measurement) and record the
-   * microphone through the system audio framework instead.
+   * The direct capture was measured as starved (under a quarter of its
+   * nominal rate, or nothing at all) when a recording started. Kept until
+   * the device is closed, like Android's UacCaptureHealth: later recordings
+   * skip it and its 300 ms measurement.
    */
   private microphoneStarved: boolean = false;
   /**
-   * The system audio path delivered no audio either. Kept until the device
-   * is closed, like Android: later recordings stay video-only.
+   * The direct capture was tried on this connection. For a microphone the
+   * system audio path goes first for (see systemMicrophoneFirst()), that
+   * path is not used any more from then on. Cleared when the device is
+   * closed.
+   */
+  private directMicrophoneTried: boolean = false;
+  /** Which microphone path the running recording uses, for the log; '' for none. */
+  private recordingAudioSource: string = '';
+  /**
+   * Neither path delivers the microphone on this connection. Kept until the
+   * device is closed, like Android: later recordings stay video-only.
    */
   private microphoneSilent: boolean = false;
-  /**
-   * The system's capture of the microphone was run once on this connection
-   * before the direct capture touched the audio interface; see
-   * primeSystemMicrophone(). Cleared when the device is closed.
-   */
-  private systemMicrophonePrimed: boolean = false;
   /**
    * The system audio path delivered audio on this connection. Kept until the
    * device is closed, like Android: it is not checked for data again.
@@ -450,18 +452,43 @@ export class UvcCameraSession {
 
   /**
    * True once a recording found the open device's microphone delivering no
-   * audio on this phone, same rule as Android: neither path yielded audio,
-   * or the direct capture is starved and the system lists no audio input
-   * for the camera either. Cleared when the device is closed.
+   * audio on this phone. Where the direct capture goes first that is
+   * Android's rule: neither path yielded audio, or the direct capture is
+   * starved and the system lists no audio input for the camera either.
+   * Cleared when the device is closed.
    */
   isMicrophoneSilent(): boolean {
     if (this.microphoneSilent) {
       return true;
     }
-    if (!this.microphoneStarved) {
+    if (!this.microphoneStarved || this.systemMicrophoneFirst()) {
       return false;
     }
     return native.systemMicAvailable(this.productName()) === 0;
+  }
+
+  /**
+   * Which path records the open camera's microphone first.
+   *
+   * False — the direct capture, then the system audio path when it is
+   * starved: Android's order, for a microphone whose alternate setting
+   * states its sampling frequency. Measured on such a camera (48 kHz
+   * stereo): the direct capture delivers the full rate.
+   *
+   * True — the system audio path, then the direct capture: for a microphone
+   * whose alternate setting states no frequency, so that the direct
+   * capture's format is an estimate from the packet size. Measured on such a
+   * camera (alternate settings of 0 Hz, 16 kHz estimated): the direct
+   * capture gets a twelfth of the estimated rate, and once it has claimed
+   * the audio interface the system's recordings carry a loud 1 kHz buzz or
+   * nothing at all until the camera is re-plugged — whether or not the
+   * sampling frequency is set back, and whether or not the system streamed
+   * just before. Recorded through the system without that claim, the same
+   * camera is clean.
+   */
+  private systemMicrophoneFirst(): boolean {
+    const audio = this.audio;
+    return audio !== null && !audio.sampleRateDeclared;
   }
 
   /** USB product name of the open camera; '' when none is open. */
@@ -687,7 +714,7 @@ export class UvcCameraSession {
     this.featureUnits = [];
     this.audioInterfaceClaimed = -1;
     this.microphoneStarved = false;
-    this.systemMicrophonePrimed = false;
+    this.directMicrophoneTried = false;
     this.microphoneSilent = false;
     this.systemMicrophoneDelivers = false;
     this.microphoneSampleRate = 0;
@@ -914,46 +941,34 @@ export class UvcCameraSession {
       this.errorMessage = `creating ${directory} failed: ${errorText(e)}`;
       return '';
     }
-    // Same order as Android (createAudioEncoder): the direct capture always
-    // goes first, and only one measured as starved falls back to the system
-    // audio path, which the following recordings then use right away.
+    // The order of the two microphone paths depends on the camera; see
+    // systemMicrophoneFirst().
     let result = -1;
-    let audioSource = '';
     const audio = withAudio && !this.microphoneSilent ? this.audio : null;
-    if (audio !== null && !this.microphoneStarved) {
-      this.primeSystemMicrophone();
-    }
-    if (audio !== null && !this.microphoneStarved && this.prepareMicrophone(audio)) {
-      result = native.recordStartWithAudio(this.streamId, path, frameRate, rate, this.fd, audio.endpointAddress,
-        audio.packetSize, audio.sampleRate, audio.channels, audio.bitsPerSample, this.microphoneSampleRate);
-      if (result >= 0) {
-        if (result > 0) {
-          this.microphoneSampleRate = result;
-        }
-        audioSource = ' with audio (USB)';
-      } else {
-        hilog.warn(DOMAIN, TAG, 'microphone unusable (%{public}s)', errnoText(result));
-        if (result === RECORDER_ERROR_MICROPHONE) {
-          this.microphoneStarved = true;
-        }
-        // A starved capture is useless on this phone: the interface goes
-        // back to the kernel audio driver for the system audio path.
-        this.releaseMicrophone(this.microphoneStarved);
+    if (audio !== null && this.systemMicrophoneFirst()) {
+      if (!this.directMicrophoneTried) {
+        result = this.recordWithSystemMicrophone(path, frameRate, rate);
+      }
+      if (result < 0) {
+        result = this.recordWithDirectMicrophone(audio, path, frameRate, rate, false);
+        // The system path is spent once the direct capture has run, so a
+        // starved direct capture leaves nothing to record the microphone with.
+        this.microphoneSilent = this.microphoneStarved;
+      }
+    } else if (audio !== null) {
+      // Same as Android (createAudioEncoder): the direct capture first, and
+      // only one measured as starved falls back to the system audio path,
+      // which the following recordings then use right away.
+      if (!this.microphoneStarved) {
+        result = this.recordWithDirectMicrophone(audio, path, frameRate, rate, true);
+      }
+      if (result < 0 && this.microphoneStarved) {
+        result = this.recordWithSystemMicrophone(path, frameRate, rate);
+        this.microphoneSilent = result === RECORDER_ERROR_MICROPHONE_SILENT;
       }
     }
-    if (audio !== null && result < 0 && this.microphoneStarved) {
-      result = native.recordStartWithSystemMic(this.streamId, path, frameRate, rate, this.productName(),
-        this.systemMicrophoneDelivers ? 0 : 1);
-      if (result >= 0) {
-        this.systemMicrophoneDelivers = true;
-        audioSource = ' with audio (system)';
-      } else {
-        if (result === RECORDER_ERROR_MICROPHONE_SILENT) {
-          this.microphoneSilent = true;
-        }
-        hilog.warn(DOMAIN, TAG, 'system microphone unusable (%{public}s)', errnoText(result));
-      }
-    }
+    this.recordingAudioSource = result < 0 || audio === null ? '' :
+      this.audioInterfaceClaimed >= 0 ? ' with audio (USB)' : ' with audio (system)';
     if (result < 0) {
       // Same as Android: a microphone that will not stream makes the
       // recording video-only rather than failing it.
@@ -966,7 +981,7 @@ export class UvcCameraSession {
     }
     this.recordingPath = path;
     hilog.info(DOMAIN, TAG, 'recording to %{public}s at %{public}d fps, %{public}d bps%{public}s', path, frameRate, rate,
-      audioSource);
+      this.recordingAudioSource);
     return path;
   }
 
@@ -1077,62 +1092,58 @@ export class UvcCameraSession {
   }
 
   /**
-   * Sets the microphone endpoint to the sampling frequency the system's
-   * audio driver streams it at, before the interface goes back to that
-   * driver. prepareMicrophone() set the direct capture's own frequency, and
-   * the system does not set its own again: recorded through the system on
-   * the direct capture's 16 kHz, every 1 ms packet of the 48 kHz stream
-   * repeated the same step pattern — a loud 1 kHz buzz that lasted until
-   * the camera was re-plugged, and was absent when the interface had never
-   * been touched.
+   * Starts the recording with the microphone captured on its USB endpoint.
+   * Returns the native result: negative when the recording did not start,
+   * with microphoneStarved set when the capture was measured as starved.
+   * `handBackWhenStarved` gives a starved capture's interface back to the
+   * system's audio driver, as Android does before its system audio path.
    */
-  private setSystemSamplingFrequency(): void {
-    const audio = this.audio;
-    if (audio === null) {
-      return;
+  private recordWithDirectMicrophone(audio: UacCaptureInfo, path: string, frameRate: number, rate: number,
+    handBackWhenStarved: boolean): number {
+    this.directMicrophoneTried = true;
+    if (!this.prepareMicrophone(audio)) {
+      return -1;
     }
-    const rate = native.systemMicSampleRate(this.productName());
-    if (rate <= 0 || rate === audio.sampleRate) {
-      hilog.info(DOMAIN, TAG, 'microphone sampling freq: system rate %{public}d, left as is', rate);
-      return;
+    const result = native.recordStartWithAudio(this.streamId, path, frameRate, rate, this.fd, audio.endpointAddress,
+      audio.packetSize, audio.sampleRate, audio.channels, audio.bitsPerSample, this.microphoneSampleRate);
+    if (result >= 0) {
+      if (result > 0) {
+        this.microphoneSampleRate = result;
+      }
+      return result;
     }
-    const freq = new Uint8Array([rate & 0xff, (rate >> 8) & 0xff, (rate >> 16) & 0xff]);
-    const rc = native.usbControlTransfer(this.fd, UAC_REQ_TYPE_SET_ENDPOINT, UAC_SET_CUR,
-      UAC_CS_SAMPLING_FREQ << 8, audio.endpointAddress, freq.buffer as ArrayBuffer, CONTROL_TIMEOUT_MS);
-    hilog.info(DOMAIN, TAG, 'microphone sampling freq: set to the system rate %{public}d rc=%{public}d', rate, rc);
+    hilog.warn(DOMAIN, TAG, 'microphone unusable (%{public}s)', errnoText(result));
+    if (result === RECORDER_ERROR_MICROPHONE) {
+      this.microphoneStarved = true;
+    }
+    this.releaseMicrophone(handBackWhenStarved && this.microphoneStarved);
+    return result;
   }
 
   /**
-   * Lets the system set the microphone's stream up once, before the direct
-   * capture claims the audio interface for the first time on this
-   * connection. Measured on a camera whose direct capture is starved: when
-   * the system's first use of the microphone came after the direct attempt,
-   * its recordings carried a loud 1 kHz buzz until the camera was re-plugged
-   * (1 ms pattern 270-350 %), also with the sampling frequency set back;
-   * when the system had recorded from it before the direct attempt, they
-   * were clean (101 %).
+   * Starts the recording with the microphone captured through the system
+   * audio framework. Returns the native result, negative when the recording
+   * did not start.
    */
-  private primeSystemMicrophone(): void {
-    if (this.systemMicrophonePrimed) {
-      return;
+  private recordWithSystemMicrophone(path: string, frameRate: number, rate: number): number {
+    const result = native.recordStartWithSystemMic(this.streamId, path, frameRate, rate, this.productName(),
+      this.systemMicrophoneDelivers ? 0 : 1);
+    if (result >= 0) {
+      this.systemMicrophoneDelivers = true;
+    } else {
+      hilog.warn(DOMAIN, TAG, 'system microphone unusable (%{public}s)', errnoText(result));
     }
-    this.systemMicrophonePrimed = true;
-    const primed = native.systemMicPrime(this.productName());
-    hilog.info(DOMAIN, TAG, 'system microphone primed before the direct capture: %{public}s',
-      primed === 0 ? 'ok' : errnoText(primed));
+    return result;
   }
 
   /** Puts the microphone interface back on alt 0 and releases it. */
-  private releaseMicrophone(handBackToSystem: boolean = false): void {
+  private releaseMicrophone(attachKernelDriver: boolean = false): void {
     const interfaceNumber = this.audioInterfaceClaimed;
     this.audioInterfaceClaimed = -1;
     if (this.fd >= 0 && interfaceNumber >= 0) {
-      if (handBackToSystem) {
-        this.setSystemSamplingFrequency();
-      }
       native.usbSetInterface(this.fd, interfaceNumber, 0);
       native.usbReleaseInterface(this.fd, interfaceNumber);
-      if (handBackToSystem) {
+      if (attachKernelDriver) {
         // Claiming the interface took it from the system's USB audio driver.
         const attached = native.usbAttachKernelDriver(this.fd, interfaceNumber);
         hilog.info(DOMAIN, TAG, 'audio interface %{public}d handed back to the kernel driver: rc=%{public}d',
