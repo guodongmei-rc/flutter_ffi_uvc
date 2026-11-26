@@ -55,11 +55,6 @@ const ENODEV: number = 19;
 const RECORDER_ERROR_ENCODER: number = -21;
 const RECORDER_ERROR_MICROPHONE: number = -27;
 const RECORDER_ERROR_MICROPHONE_SILENT: number = -30;
-// EXPERIMENT, to be removed: record through the system audio path without
-// ever trying the direct capture, so that this app never claims the camera's
-// audio interface or changes its settings. Tells whether the 1 kHz buzz in
-// system-path recordings comes from what the direct attempt leaves behind.
-const EXPERIMENT_SYSTEM_MICROPHONE_FIRST: boolean = true;
 
 // Indices into the array returned by the native streamStats(); see index.d.ts.
 const STAT_RUNNING: number = 0;
@@ -918,10 +913,6 @@ export class UvcCameraSession {
     let result = -1;
     let audioSource = '';
     const audio = withAudio && !this.microphoneSilent ? this.audio : null;
-    if (EXPERIMENT_SYSTEM_MICROPHONE_FIRST && audio !== null && !this.microphoneStarved) {
-      hilog.warn(DOMAIN, TAG, 'EXPERIMENT: direct microphone capture skipped, audio interface left untouched');
-      this.microphoneStarved = true;
-    }
     if (audio !== null && !this.microphoneStarved && this.prepareMicrophone(audio)) {
       result = native.recordStartWithAudio(this.streamId, path, frameRate, rate, this.fd, audio.endpointAddress,
         audio.packetSize, audio.sampleRate, audio.channels, audio.bitsPerSample, this.microphoneSampleRate);
@@ -1075,14 +1066,43 @@ export class UvcCameraSession {
     }
   }
 
+  /**
+   * Sets the microphone endpoint to the sampling frequency the system's
+   * audio driver streams it at, before the interface goes back to that
+   * driver. prepareMicrophone() set the direct capture's own frequency, and
+   * the system does not set its own again: recorded through the system on
+   * the direct capture's 16 kHz, every 1 ms packet of the 48 kHz stream
+   * repeated the same step pattern — a loud 1 kHz buzz that lasted until
+   * the camera was re-plugged, and was absent when the interface had never
+   * been touched.
+   */
+  private setSystemSamplingFrequency(): void {
+    const audio = this.audio;
+    if (audio === null) {
+      return;
+    }
+    const rate = native.systemMicSampleRate(this.productName());
+    if (rate <= 0 || rate === audio.sampleRate) {
+      hilog.info(DOMAIN, TAG, 'microphone sampling freq: system rate %{public}d, left as is', rate);
+      return;
+    }
+    const freq = new Uint8Array([rate & 0xff, (rate >> 8) & 0xff, (rate >> 16) & 0xff]);
+    const rc = native.usbControlTransfer(this.fd, UAC_REQ_TYPE_SET_ENDPOINT, UAC_SET_CUR,
+      UAC_CS_SAMPLING_FREQ << 8, audio.endpointAddress, freq.buffer as ArrayBuffer, CONTROL_TIMEOUT_MS);
+    hilog.info(DOMAIN, TAG, 'microphone sampling freq: set to the system rate %{public}d rc=%{public}d', rate, rc);
+  }
+
   /** Puts the microphone interface back on alt 0 and releases it. */
-  private releaseMicrophone(attachKernelDriver: boolean = false): void {
+  private releaseMicrophone(handBackToSystem: boolean = false): void {
     const interfaceNumber = this.audioInterfaceClaimed;
     this.audioInterfaceClaimed = -1;
     if (this.fd >= 0 && interfaceNumber >= 0) {
+      if (handBackToSystem) {
+        this.setSystemSamplingFrequency();
+      }
       native.usbSetInterface(this.fd, interfaceNumber, 0);
       native.usbReleaseInterface(this.fd, interfaceNumber);
-      if (attachKernelDriver) {
+      if (handBackToSystem) {
         // Claiming the interface took it from the system's USB audio driver.
         const attached = native.usbAttachKernelDriver(this.fd, interfaceNumber);
         hilog.info(DOMAIN, TAG, 'audio interface %{public}d handed back to the kernel driver: rc=%{public}d',

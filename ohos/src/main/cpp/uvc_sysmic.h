@@ -84,6 +84,36 @@ class SystemMicCapture {
     return preferred;
   }
 
+  // The sample rate the system's audio driver streams the camera's microphone
+  // at (the first one it reports for that input), or 0 when the system lists
+  // no such input.
+  static int32_t UsbInputSampleRate(const std::string &product_name) {
+    OH_AudioRoutingManager *routing = nullptr;
+    if (OH_AudioManager_GetAudioRoutingManager(&routing) != AUDIOCOMMON_RESULT_SUCCESS || routing == nullptr) {
+      return 0;
+    }
+    int32_t rate = 0;
+    OH_AudioDeviceDescriptorArray *inputs = nullptr;
+    if (OH_AudioRoutingManager_GetDevices(routing, AUDIO_DEVICE_FLAG_INPUT, &inputs) == AUDIOCOMMON_RESULT_SUCCESS &&
+        inputs != nullptr) {
+      for (uint32_t i = 0; i < inputs->size && rate == 0; i++) {
+        if (!IsUsbInput(inputs->descriptors[i], product_name)) {
+          continue;
+        }
+        // Owned by the descriptor; must not be freed here.
+        uint32_t *rates = nullptr;
+        uint32_t count = 0;
+        if (OH_AudioDeviceDescriptor_GetDeviceSampleRates(inputs->descriptors[i], &rates, &count) ==
+                AUDIOCOMMON_RESULT_SUCCESS &&
+            rates != nullptr && count > 0) {
+          rate = static_cast<int32_t>(rates[0]);
+        }
+      }
+      OH_AudioRoutingManager_ReleaseDevices(routing, inputs);
+    }
+    return rate;
+  }
+
   // Opens a capturer at the first sample rate the system accepts and starts
   // it. With `await_first_data` the call then waits up to kFirstDataWaitMs
   // for PCM, as Android does the first time: the system may list the
@@ -154,10 +184,11 @@ class SystemMicCapture {
     // large share of exactly-zero samples in long runs.
     OH_LOG_INFO(LOG_APP,
                 "system microphone: stopped after %{public}llu bytes, %{public}llu samples: zero %{public}llu, "
-                "longest zero run %{public}llu, peak %{public}d/32767",
+                "longest zero run %{public}llu, peak %{public}d/32767, 1 ms pattern %{public}d%% "
+                "(100 = none; a camera left on another sampling frequency measured 270)",
                 static_cast<unsigned long long>(bytes_), static_cast<unsigned long long>(samples_),
                 static_cast<unsigned long long>(zero_samples_), static_cast<unsigned long long>(longest_zero_run_),
-                peak_);
+                peak_, FramePatternPercent());
     bytes_ = 0;
     samples_ = 0;
     zero_samples_ = 0;
@@ -165,6 +196,10 @@ class SystemMicCapture {
     longest_zero_run_ = 0;
     peak_ = 0;
     gain_ = 8.0f;
+    last_sample_ = 0;
+    for (uint64_t &step : steps_) {
+      step = 0;
+    }
   }
 
  private:
@@ -249,6 +284,12 @@ class SystemMicCapture {
     for (size_t i = 0; i + 1 < length; i += 2) {
       const int16_t sample = static_cast<int16_t>(data[i] | (data[i + 1] << 8));
       const int32_t magnitude = sample < 0 ? -static_cast<int32_t>(sample) : sample;
+      // Sample-to-sample change by position inside each 1 ms USB frame: an
+      // even spread is sound, one position standing out is a pattern
+      // repeating with every packet.
+      const int32_t step = static_cast<int32_t>(sample) - last_sample_;
+      steps_[samples_ % kFrameSamples] += static_cast<uint64_t>(step < 0 ? -step : step);
+      last_sample_ = sample;
       samples_++;
       if (magnitude > peak_) {
         peak_ = magnitude;
@@ -311,6 +352,19 @@ class SystemMicCapture {
     }
   }
 
+  // mutex_ held. Largest per-position step sum over their mean, in percent.
+  int32_t FramePatternPercent() const {
+    uint64_t total = 0;
+    uint64_t largest = 0;
+    for (const uint64_t step : steps_) {
+      total += step;
+      if (step > largest) {
+        largest = step;
+      }
+    }
+    return total > 0 ? static_cast<int32_t>(largest * kFrameSamples * 100 / total) : 0;
+  }
+
   static constexpr float kAgcTargetPeak = 12000.0f;
   static constexpr float kAgcMaxGain = 32.0f;
   static constexpr float kAgcMinGain = 2.0f;
@@ -338,6 +392,11 @@ class SystemMicCapture {
   int32_t peak_ = 0;
   float gain_ = 8.0f;
   std::vector<uint8_t> amplified_;
+  // Samples per 1 ms at the capture rates used here (48 kHz); other rates
+  // only blur the pattern measurement, which is a diagnostic.
+  static constexpr uint64_t kFrameSamples = 48;
+  uint64_t steps_[kFrameSamples] = {};
+  int32_t last_sample_ = 0;
 };
 
 }  // namespace flutter_ffi_uvc

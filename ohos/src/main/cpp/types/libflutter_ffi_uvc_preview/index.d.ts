@@ -144,6 +144,12 @@ export const recordStartWithSystemMic: (
 export const systemMicAvailable: (productName: string) => number;
 
 /**
+ * The sample rate the system's audio driver streams the camera's microphone
+ * at, or 0 when the system lists no audio input for it.
+ */
+export const systemMicSampleRate: (productName: string) => number;
+
+/**
  * Hands a released interface back to the kernel so that its driver binds
  * again (the system's USB audio driver, for a microphone). Returns 0 or a
  * negative errno.
