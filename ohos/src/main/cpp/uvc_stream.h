@@ -39,6 +39,7 @@
 #include "uvc_h26x.h"
 #include "uvc_raw.h"
 #include "uvc_recorder.h"
+#include "uvc_sysmic.h"
 #include "uvc_uac.h"
 #include "uvc_urb.h"
 #include "uvc_surface.h"
@@ -66,6 +67,16 @@ inline int UsbClaimInterface(int fd, unsigned int interface_number) {
 
 inline int UsbReleaseInterface(int fd, unsigned int interface_number) {
   return ioctl(fd, USBDEVFS_RELEASEINTERFACE, &interface_number) < 0 ? -errno : 0;
+}
+
+// Hands a released interface back to the kernel, which binds its driver
+// again — what libusb's attach_kernel_driver does for the Android side.
+inline int UsbAttachKernelDriver(int fd, unsigned int interface_number) {
+  struct usbdevfs_ioctl command = {};
+  command.ifno = static_cast<int>(interface_number);
+  command.ioctl_code = USBDEVFS_CONNECT;
+  command.data = nullptr;
+  return ioctl(fd, USBDEVFS_IOCTL, &command) < 0 ? -errno : 0;
 }
 
 inline int UsbSetInterface(int fd, unsigned int interface_number, unsigned int alt_setting) {
@@ -1303,15 +1314,32 @@ class StreamSession {
   // connection measured: it is used as is and the window is skipped.
   // Returns 0 or a negative error code: kErrorRecorderMicrophoneStart when
   // the capture cannot be started, kErrorRecorderMicrophone when it is
-  // starved (the caller may retry without audio in both cases). On success
-  // with `audio`, `audio_sample_rate` receives the rate the track uses.
+  // starved (the caller may retry without audio in both cases).
+  // With `system_mic` instead, the microphone is recorded through the system
+  // audio framework (uvc_sysmic.h), Android's fallback for a starved capture;
+  // the string is the camera's USB product name and `system_mic_await_data`
+  // asks for the first-data check. Its error codes are those of
+  // SystemMicCapture::Start.
+  // On success with a microphone, `audio_sample_rate` receives the rate the
+  // track uses.
   int32_t StartRecording(const std::string &path, int32_t fps, int64_t bitrate, const UacCaptureConfig *audio,
-                         int32_t known_sample_rate, int32_t *audio_sample_rate) {
+                         int32_t known_sample_rate, const std::string *system_mic, bool system_mic_await_data,
+                         int32_t *audio_sample_rate) {
     if (recorder_ != nullptr) {
       return kErrorRecorderBusy;
     }
     std::unique_ptr<UacCapture> capture;
+    std::unique_ptr<SystemMicCapture> system_capture;
     AudioTrackConfig track;
+    if (audio == nullptr && system_mic != nullptr) {
+      system_capture = std::make_unique<SystemMicCapture>();
+      const int32_t ret = system_capture->Start(*system_mic, system_mic_await_data);
+      if (ret != 0) {
+        return ret;
+      }
+      track.channels = system_capture->channels();
+      track.sample_rate = system_capture->sample_rate();
+    }
     if (audio != nullptr) {
       capture = std::make_unique<UacCapture>();
       const int ret = capture->Start(*audio);
@@ -1354,7 +1382,7 @@ class StreamSession {
     // Like Android: an H.265 camera is recorded as H.265 when the device can
     // encode it, everything else (and the fallback) as H.264.
     const int32_t ret = recorder->Start(path, width, height, fps, bitrate, /*external_producer=*/h26x_ != nullptr,
-                                        capture != nullptr ? &track : nullptr,
+                                        capture != nullptr || system_capture != nullptr ? &track : nullptr,
                                         /*prefer_hevc=*/codec_ == StreamCodec::kH265);
     if (ret != 0) {
       return ret;
@@ -1363,9 +1391,13 @@ class StreamSession {
     if (capture != nullptr) {
       capture->SetSink(recorder.get());
       capture_ = std::move(capture);
-      if (audio_sample_rate != nullptr) {
-        *audio_sample_rate = track.sample_rate;
-      }
+    }
+    if (system_capture != nullptr) {
+      system_capture->SetSink(recorder.get());
+      system_capture_ = std::move(system_capture);
+    }
+    if ((capture_ != nullptr || system_capture_ != nullptr) && audio_sample_rate != nullptr) {
+      *audio_sample_rate = track.sample_rate;
     }
     if (jpeg_ != nullptr) {
       jpeg_->SetRecorder(recorder);
@@ -1389,6 +1421,11 @@ class StreamSession {
       capture_->SetSink(nullptr);
       capture_->Stop();
       capture_.reset();
+    }
+    if (system_capture_ != nullptr) {
+      system_capture_->SetSink(nullptr);
+      system_capture_->Stop();
+      system_capture_.reset();
     }
     // Detaching first stops the producer before the encoder's surface goes.
     if (jpeg_ != nullptr) {
@@ -1489,6 +1526,7 @@ class StreamSession {
   std::unique_ptr<FramePresenter> jpeg_;
   std::unique_ptr<RawPresenter> raw_;
   std::unique_ptr<UacCapture> capture_;
+  std::unique_ptr<SystemMicCapture> system_capture_;
   std::unique_ptr<H26xPresenter> h26x_;
   std::unique_ptr<IsoStream> stream_;
   std::shared_ptr<VideoRecorder> recorder_;

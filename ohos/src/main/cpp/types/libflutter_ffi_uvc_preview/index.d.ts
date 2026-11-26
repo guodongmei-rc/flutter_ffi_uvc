@@ -125,5 +125,30 @@ export const recordStartWithAudio: (
   fd: number, endpoint: number, packetSize: number, sampleRate: number, channels: number, bits: number,
   knownSampleRate: number) => number;
 
+/**
+ * Like recordStart, with the camera's microphone recorded through the system
+ * audio framework instead of its USB endpoint: the fallback for a camera
+ * whose direct capture is starved. `productName` is the camera's USB product
+ * name, used to recognise its audio input when the system reports it under a
+ * device type of its own. With `awaitFirstData` 1 the call waits up to a
+ * second for PCM. Needs ohos.permission.MICROPHONE. Returns the sample rate
+ * the audio track uses (> 0), or a negative error code without starting the
+ * recording: -29 when the system lists no USB audio input it would record
+ * from, -28 when the capturer cannot be started (also without the
+ * permission), -30 when it delivers nothing.
+ */
+export const recordStartWithSystemMic: (
+  stream: number, path: string, fps: number, bitRate: number, productName: string, awaitFirstData: number) => number;
+
+/** 1 when the system lists the camera's microphone as the audio input recordings use, else 0. */
+export const systemMicAvailable: (productName: string) => number;
+
+/**
+ * Hands a released interface back to the kernel so that its driver binds
+ * again (the system's USB audio driver, for a microphone). Returns 0 or a
+ * negative errno.
+ */
+export const usbAttachKernelDriver: (fd: number, interfaceNumber: number) => number;
+
 /** Finishes the recording. Returns the number of frames written, or a negative error code. */
 export const recordStop: (stream: number) => number;

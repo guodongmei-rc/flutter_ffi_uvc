@@ -54,6 +54,7 @@ const ENODEV: number = 19;
 // Recorder error codes of uvc_recorder.h that callers tell apart.
 const RECORDER_ERROR_ENCODER: number = -21;
 const RECORDER_ERROR_MICROPHONE: number = -27;
+const RECORDER_ERROR_MICROPHONE_SILENT: number = -30;
 
 // Indices into the array returned by the native streamStats(); see index.d.ts.
 const STAT_RUNNING: number = 0;
@@ -273,6 +274,10 @@ function errnoText(result: number): string {
       return 'the microphone stream is starved';
     case 28:
       return 'the microphone stream could not be started';
+    case 29:
+      return 'the system lists no USB audio input for the camera';
+    case 30:
+      return 'the system audio path delivered nothing';
     case 12:
       return 'out of USB transfer memory (ENOMEM)';
     case 13:
@@ -376,12 +381,23 @@ export class UvcCameraSession {
   /** AudioStreaming interface claimed for the running recording, or -1. */
   private audioInterfaceClaimed: number = -1;
   /**
-   * The microphone was measured as starved (under a quarter of its nominal
-   * rate, or nothing at all) when a recording started. Kept until the device
-   * is closed, like Android: later recordings skip the microphone (and its
-   * 300 ms measurement) and stay video-only.
+   * The microphone's direct capture was measured as starved (under a quarter
+   * of its nominal rate, or nothing at all) when a recording started. Kept
+   * until the device is closed, like Android's UacCaptureHealth: later
+   * recordings skip it (and its 300 ms measurement) and record the
+   * microphone through the system audio framework instead.
+   */
+  private microphoneStarved: boolean = false;
+  /**
+   * The system audio path delivered no audio either. Kept until the device
+   * is closed, like Android: later recordings stay video-only.
    */
   private microphoneSilent: boolean = false;
+  /**
+   * The system audio path delivered audio on this connection. Kept until the
+   * device is closed, like Android: it is not checked for data again.
+   */
+  private systemMicrophoneDelivers: boolean = false;
   /**
    * Sample rate a healthy capture measured on this connection, or 0. Kept
    * until the device is closed, like Android: later recordings use it
@@ -428,10 +444,24 @@ export class UvcCameraSession {
 
   /**
    * True once a recording found the open device's microphone delivering no
-   * audio; cleared when the device is closed.
+   * audio on this phone, same rule as Android: neither path yielded audio,
+   * or the direct capture is starved and the system lists no audio input
+   * for the camera either. Cleared when the device is closed.
    */
   isMicrophoneSilent(): boolean {
-    return this.microphoneSilent;
+    if (this.microphoneSilent) {
+      return true;
+    }
+    if (!this.microphoneStarved) {
+      return false;
+    }
+    return native.systemMicAvailable(this.productName()) === 0;
+  }
+
+  /** USB product name of the open camera; '' when none is open. */
+  private productName(): string {
+    const device = this.device;
+    return device !== null && device.productName !== undefined ? device.productName : '';
   }
 
   /** True when the last startRecording() failed in the video encoder. */
@@ -650,7 +680,9 @@ export class UvcCameraSession {
     this.audio = null;
     this.featureUnits = [];
     this.audioInterfaceClaimed = -1;
+    this.microphoneStarved = false;
     this.microphoneSilent = false;
+    this.systemMicrophoneDelivers = false;
     this.microphoneSampleRate = 0;
     this.stream = null;
   }
@@ -875,27 +907,46 @@ export class UvcCameraSession {
       this.errorMessage = `creating ${directory} failed: ${errorText(e)}`;
       return '';
     }
+    // Same order as Android (createAudioEncoder): the direct capture always
+    // goes first, and only one measured as starved falls back to the system
+    // audio path, which the following recordings then use right away.
     let result = -1;
+    let audioSource = '';
     const audio = withAudio && !this.microphoneSilent ? this.audio : null;
-    if (audio !== null && this.prepareMicrophone(audio)) {
+    if (audio !== null && !this.microphoneStarved && this.prepareMicrophone(audio)) {
       result = native.recordStartWithAudio(this.streamId, path, frameRate, rate, this.fd, audio.endpointAddress,
         audio.packetSize, audio.sampleRate, audio.channels, audio.bitsPerSample, this.microphoneSampleRate);
-      if (result === RECORDER_ERROR_MICROPHONE) {
-        // Starved. Android would now try its platform USB audio path; there
-        // is none here, which is Android's "no USB audio input" case: silent.
-        this.microphoneSilent = true;
+      if (result >= 0) {
+        if (result > 0) {
+          this.microphoneSampleRate = result;
+        }
+        audioSource = ' with audio (USB)';
+      } else {
+        hilog.warn(DOMAIN, TAG, 'microphone unusable (%{public}s)', errnoText(result));
+        if (result === RECORDER_ERROR_MICROPHONE) {
+          this.microphoneStarved = true;
+        }
+        // A starved capture is useless on this phone: the interface goes
+        // back to the kernel audio driver for the system audio path.
+        this.releaseMicrophone(this.microphoneStarved);
       }
-      if (result > 0) {
-        this.microphoneSampleRate = result;
-      }
-      if (result < 0) {
-        // Same as Android: a microphone that will not stream makes the
-        // recording video-only rather than failing it.
-        hilog.warn(DOMAIN, TAG, 'microphone unusable (%{public}s); recording without audio', errnoText(result));
-        this.releaseMicrophone();
+    }
+    if (audio !== null && result < 0 && this.microphoneStarved) {
+      result = native.recordStartWithSystemMic(this.streamId, path, frameRate, rate, this.productName(),
+        this.systemMicrophoneDelivers ? 0 : 1);
+      if (result >= 0) {
+        this.systemMicrophoneDelivers = true;
+        audioSource = ' with audio (system)';
+      } else {
+        if (result === RECORDER_ERROR_MICROPHONE_SILENT) {
+          this.microphoneSilent = true;
+        }
+        hilog.warn(DOMAIN, TAG, 'system microphone unusable (%{public}s)', errnoText(result));
       }
     }
     if (result < 0) {
+      // Same as Android: a microphone that will not stream makes the
+      // recording video-only rather than failing it.
       result = native.recordStart(this.streamId, path, frameRate, rate);
     }
     if (result < 0) {
@@ -905,7 +956,7 @@ export class UvcCameraSession {
     }
     this.recordingPath = path;
     hilog.info(DOMAIN, TAG, 'recording to %{public}s at %{public}d fps, %{public}d bps%{public}s', path, frameRate, rate,
-      this.audioInterfaceClaimed >= 0 ? ' with audio' : '');
+      audioSource);
     return path;
   }
 
@@ -991,12 +1042,18 @@ export class UvcCameraSession {
   }
 
   /** Puts the microphone interface back on alt 0 and releases it. */
-  private releaseMicrophone(): void {
+  private releaseMicrophone(attachKernelDriver: boolean = false): void {
     const interfaceNumber = this.audioInterfaceClaimed;
     this.audioInterfaceClaimed = -1;
     if (this.fd >= 0 && interfaceNumber >= 0) {
       native.usbSetInterface(this.fd, interfaceNumber, 0);
       native.usbReleaseInterface(this.fd, interfaceNumber);
+      if (attachKernelDriver) {
+        // Claiming the interface took it from the system's USB audio driver.
+        const attached = native.usbAttachKernelDriver(this.fd, interfaceNumber);
+        hilog.info(DOMAIN, TAG, 'audio interface %{public}d handed back to the kernel driver: rc=%{public}d',
+          interfaceNumber, attached);
+      }
     }
   }
 

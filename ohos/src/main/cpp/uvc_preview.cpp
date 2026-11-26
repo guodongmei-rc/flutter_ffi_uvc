@@ -395,8 +395,63 @@ napi_value RecordStart(napi_env env, napi_callback_info info) {
   int32_t audio_sample_rate = 0;
   const int32_t result =
       session->StartRecording(path, static_cast<int32_t>(fps), bitrate, with_audio ? &audio : nullptr,
-                              static_cast<int32_t>(known_sample_rate), &audio_sample_rate);
+                              static_cast<int32_t>(known_sample_rate), nullptr, false, &audio_sample_rate);
   return Number(env, result == 0 && with_audio ? audio_sample_rate : result);
+}
+
+// recordStartWithSystemMic(stream, path, fps, bitRate, productName, awaitFirstData): number —
+// the sample rate the audio track uses, or a negative error code.
+napi_value RecordStartWithSystemMic(napi_env env, napi_callback_info info) {
+  const Arguments arguments = GetArguments(env, info);
+  int64_t stream_id = 0;
+  int64_t fps = 0;
+  int64_t bitrate = 0;
+  int64_t await_first_data = 1;
+  char path[1024] = {0};
+  char product[256] = {0};
+  size_t length = 0;
+  size_t product_length = 0;
+  if (!GetInt(env, arguments, 0, &stream_id) || arguments.count < 6 ||
+      napi_get_value_string_utf8(env, arguments.values[1], path, sizeof(path), &length) != napi_ok || length == 0 ||
+      !GetInt(env, arguments, 2, &fps) || !GetInt(env, arguments, 3, &bitrate) || fps <= 0 || bitrate <= 0 ||
+      napi_get_value_string_utf8(env, arguments.values[4], product, sizeof(product), &product_length) != napi_ok ||
+      !GetInt(env, arguments, 5, &await_first_data)) {
+    return Number(env, -EINVAL);
+  }
+  std::shared_ptr<StreamSession> session = FindStream(stream_id);
+  if (session == nullptr) {
+    return Number(env, flutter_ffi_uvc::kErrorRecorderNoFrames);
+  }
+  const std::string product_name(product, product_length);
+  int32_t audio_sample_rate = 0;
+  const int32_t result = session->StartRecording(path, static_cast<int32_t>(fps), bitrate, nullptr, 0, &product_name,
+                                                 await_first_data != 0, &audio_sample_rate);
+  return Number(env, result == 0 ? audio_sample_rate : result);
+}
+
+// systemMicAvailable(productName): number — 1 when the system lists the
+// camera's microphone as the audio input recordings use, else 0.
+napi_value SystemMicAvailable(napi_env env, napi_callback_info info) {
+  const Arguments arguments = GetArguments(env, info);
+  char product[256] = {0};
+  size_t length = 0;
+  if (arguments.count < 1 ||
+      napi_get_value_string_utf8(env, arguments.values[0], product, sizeof(product), &length) != napi_ok) {
+    return Number(env, 0);
+  }
+  return Number(env, flutter_ffi_uvc::SystemMicCapture::FindUsbInput(std::string(product, length)) ? 1 : 0);
+}
+
+// usbAttachKernelDriver(fd, interfaceNumber): number
+napi_value UsbAttachKernelDriver(napi_env env, napi_callback_info info) {
+  const Arguments arguments = GetArguments(env, info);
+  int64_t fd = -1;
+  int64_t interface_number = 0;
+  if (!GetInt(env, arguments, 0, &fd) || !GetInt(env, arguments, 1, &interface_number)) {
+    return Number(env, -EINVAL);
+  }
+  return Number(env,
+                flutter_ffi_uvc::UsbAttachKernelDriver(static_cast<int>(fd), static_cast<unsigned int>(interface_number)));
 }
 
 // recordStop(stream): number — frames written, or a negative error code.
@@ -427,6 +482,10 @@ napi_value Init(napi_env env, napi_value exports) {
       {"streamLatestJpeg", nullptr, StreamLatestJpeg, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"recordStart", nullptr, RecordStart, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"recordStartWithAudio", nullptr, RecordStart, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"recordStartWithSystemMic", nullptr, RecordStartWithSystemMic, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
+      {"systemMicAvailable", nullptr, SystemMicAvailable, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"usbAttachKernelDriver", nullptr, UsbAttachKernelDriver, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"recordStop", nullptr, RecordStop, nullptr, nullptr, nullptr, napi_default, nullptr},
   };
   napi_define_properties(env, exports, sizeof(descriptors) / sizeof(descriptors[0]), descriptors);

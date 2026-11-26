@@ -48,6 +48,10 @@ inline constexpr int32_t kErrorRecorderAudio = -26;
 inline constexpr int32_t kErrorRecorderMicrophone = -27;
 // The microphone capture could not be started at all; nothing was measured.
 inline constexpr int32_t kErrorRecorderMicrophoneStart = -28;
+// The system lists no USB audio input it would record the camera from.
+inline constexpr int32_t kErrorRecorderNoUsbMic = -29;
+// The system audio path was started, yet delivered no PCM.
+inline constexpr int32_t kErrorRecorderMicrophoneSilent = -30;
 
 // PCM format of the audio track; 16-bit little-endian samples.
 struct AudioTrackConfig {
