@@ -195,7 +195,7 @@ class SystemMicCapture {
     zero_run_ = 0;
     longest_zero_run_ = 0;
     peak_ = 0;
-    gain_ = 8.0f;
+    agc_.Reset();
     last_sample_ = 0;
     for (uint64_t &step : steps_) {
       step = 0;
@@ -272,7 +272,9 @@ class SystemMicCapture {
     if (self->sink_ != nullptr) {
       const auto *bytes = static_cast<const uint8_t *>(buffer);
       self->amplified_.assign(bytes, bytes + length);
-      self->ApplyGain(self->amplified_.data(), self->amplified_.size());
+      // The system hands this PCM on as the camera sends it, where Android's
+      // audio framework delivers the same camera some thirty times louder.
+      self->agc_.Apply(self->amplified_.data(), self->amplified_.size());
       self->sink_->WritePcm(self->amplified_.data(), self->amplified_.size(), NowMicros());
     }
     self->data_.notify_all();
@@ -306,52 +308,6 @@ class SystemMicCapture {
     }
   }
 
-  // mutex_ held. Automatic gain control, the one Android applies to a camera
-  // microphone it reads at a low level (AacAudioEncoder.kt, same constants).
-  // The system hands this camera's PCM on as the camera sends it — peaks of a
-  // few hundred on a 32767 full scale were measured, where Android's audio
-  // framework delivers the same camera some thirty times louder. Fast attack
-  // when speech would clip, slow release upward, and a slow decay toward the
-  // minimum gain while the input sits at the noise floor.
-  void ApplyGain(uint8_t *data, size_t length) {
-    int32_t peak = 0;
-    for (size_t i = 0; i + 1 < length; i += 2) {
-      const int16_t sample = static_cast<int16_t>(data[i] | (data[i + 1] << 8));
-      const int32_t magnitude = sample < 0 ? -static_cast<int32_t>(sample) : sample;
-      if (magnitude > peak) {
-        peak = magnitude;
-      }
-    }
-    if (peak > kAgcNoiseFloor) {
-      float desired = kAgcTargetPeak / static_cast<float>(peak);
-      if (desired < kAgcMinGain) {
-        desired = kAgcMinGain;
-      }
-      if (desired > kAgcMaxGain) {
-        desired = kAgcMaxGain;
-      }
-      // Attack at once: clipping sounds worse than a dip.
-      gain_ = desired < gain_ ? desired : gain_ + (desired - gain_) * kAgcRelease;
-    } else {
-      gain_ *= kAgcSilenceDecay;
-      if (gain_ < kAgcMinGain) {
-        gain_ = kAgcMinGain;
-      }
-    }
-    for (size_t i = 0; i + 1 < length; i += 2) {
-      const int16_t sample = static_cast<int16_t>(data[i] | (data[i + 1] << 8));
-      int32_t amplified = static_cast<int32_t>(static_cast<float>(sample) * gain_);
-      if (amplified > 32767) {
-        amplified = 32767;
-      }
-      if (amplified < -32768) {
-        amplified = -32768;
-      }
-      data[i] = static_cast<uint8_t>(amplified & 0xff);
-      data[i + 1] = static_cast<uint8_t>((amplified >> 8) & 0xff);
-    }
-  }
-
   // mutex_ held. Largest per-position step sum over their mean, in percent.
   int32_t FramePatternPercent() const {
     uint64_t total = 0;
@@ -364,13 +320,6 @@ class SystemMicCapture {
     }
     return total > 0 ? static_cast<int32_t>(largest * kFrameSamples * 100 / total) : 0;
   }
-
-  static constexpr float kAgcTargetPeak = 12000.0f;
-  static constexpr float kAgcMaxGain = 32.0f;
-  static constexpr float kAgcMinGain = 2.0f;
-  static constexpr int32_t kAgcNoiseFloor = 350;
-  static constexpr float kAgcRelease = 0.05f;
-  static constexpr float kAgcSilenceDecay = 0.995f;
 
   static constexpr int32_t kChannels = 1;
   // Same order as Android: 48 kHz first, USB audio devices almost always
@@ -390,7 +339,7 @@ class SystemMicCapture {
   uint64_t zero_run_ = 0;
   uint64_t longest_zero_run_ = 0;
   int32_t peak_ = 0;
-  float gain_ = 8.0f;
+  PcmAgc agc_;
   std::vector<uint8_t> amplified_;
   // Samples per 1 ms at the capture rates used here (48 kHz); other rates
   // only blur the pattern measurement, which is a diagnostic.

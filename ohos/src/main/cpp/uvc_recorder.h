@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -52,6 +53,63 @@ inline constexpr int32_t kErrorRecorderMicrophoneStart = -28;
 inline constexpr int32_t kErrorRecorderNoUsbMic = -29;
 // The system audio path was started, yet delivered no PCM.
 inline constexpr int32_t kErrorRecorderMicrophoneSilent = -30;
+
+// Automatic gain control for 16-bit little-endian PCM, the one Android
+// applies to a camera microphone it reads itself (AacAudioEncoder.kt, same
+// constants). Camera microphones often run at a very low level — peaks of a
+// few hundred to a few thousand on a 32767 full scale were measured here —
+// and many expose no usable volume control. Fast attack when sound would
+// clip, slow release upward, and a slow decay toward the minimum gain while
+// the input sits at the noise floor, so that silence stays quiet.
+class PcmAgc {
+ public:
+  void Reset() { gain_ = kInitialGain; }
+
+  // Amplifies `data` in place, saturating. Android adapts once per chunk of
+  // kChunkBytes; the release and decay are scaled to the size of this call,
+  // so the gain moves at the same speed whatever the chunk size.
+  void Apply(uint8_t *data, size_t length) {
+    int32_t peak = 0;
+    for (size_t i = 0; i + 1 < length; i += 2) {
+      const int16_t sample = static_cast<int16_t>(data[i] | (data[i + 1] << 8));
+      const int32_t magnitude = sample < 0 ? -static_cast<int32_t>(sample) : sample;
+      if (magnitude > peak) {
+        peak = magnitude;
+      }
+    }
+    const float chunks = static_cast<float>(length) / kChunkBytes;
+    if (peak > kNoiseFloor) {
+      const float desired = std::min(std::max(kTargetPeak / static_cast<float>(peak), kMinGain), kMaxGain);
+      if (desired < gain_) {
+        // Attack at once: clipping sounds worse than a dip.
+        gain_ = desired;
+      } else {
+        gain_ += (desired - gain_) * (1.0f - std::pow(1.0f - kRelease, chunks));
+      }
+    } else {
+      gain_ = std::max(gain_ * std::pow(kSilenceDecay, chunks), kMinGain);
+    }
+    for (size_t i = 0; i + 1 < length; i += 2) {
+      const int16_t sample = static_cast<int16_t>(data[i] | (data[i + 1] << 8));
+      const int32_t amplified =
+          std::min(std::max(static_cast<int32_t>(static_cast<float>(sample) * gain_), -32768), 32767);
+      data[i] = static_cast<uint8_t>(amplified & 0xff);
+      data[i + 1] = static_cast<uint8_t>((amplified >> 8) & 0xff);
+    }
+  }
+
+ private:
+  static constexpr float kTargetPeak = 12000.0f;
+  static constexpr float kMaxGain = 32.0f;
+  static constexpr float kMinGain = 2.0f;
+  static constexpr int32_t kNoiseFloor = 350;
+  static constexpr float kRelease = 0.05f;
+  static constexpr float kSilenceDecay = 0.995f;
+  static constexpr float kInitialGain = 8.0f;
+  static constexpr float kChunkBytes = 4096.0f;
+
+  float gain_ = kInitialGain;
+};
 
 // PCM format of the audio track; 16-bit little-endian samples.
 struct AudioTrackConfig {

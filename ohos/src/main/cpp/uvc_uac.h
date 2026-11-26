@@ -184,6 +184,8 @@ class UacCapture : public UrbOwner {
     if (!pcm_.empty()) {
       std::lock_guard<std::mutex> lock(sink_mutex_);
       if (sink_ != nullptr) {
+        // Same as Android's own capture: recorded through the gain control.
+        agc_.Apply(pcm_.data(), pcm_.size());
         sink_->WritePcm(pcm_.data(), pcm_.size(), now_us);
       }
     }
@@ -282,6 +284,7 @@ class UacCapture : public UrbOwner {
   UacCaptureConfig config_;
   std::vector<Urb> urbs_;
   std::vector<uint8_t> pcm_;
+  PcmAgc agc_;
   std::thread thread_;
   std::atomic<bool> stop_requested_{false};
   std::mutex completed_mutex_;
