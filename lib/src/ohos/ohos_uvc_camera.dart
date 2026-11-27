@@ -19,9 +19,9 @@ import '../uvc_camera_api.dart';
 /// MJPEG mode listing, preview into a Flutter texture with frame
 /// verification, photos and video recording without audio (saved to the
 /// system gallery with the user's consent, else to the app's files
-/// directory). Camera controls, frame
-/// copies, preview transforms and stall detection are not available yet and
-/// report [UvcErrorCode.notSupported] or an empty result.
+/// directory), and stall detection with automatic restart. Camera controls,
+/// frame copies and preview transforms are not available yet and report
+/// [UvcErrorCode.notSupported] or an empty result.
 class OhosUvcCamera implements UvcCamera {
   OhosUvcCamera();
 
@@ -46,6 +46,21 @@ class OhosUvcCamera implements UvcCamera {
   String _lastError = '';
   int _sequence = 0;
   UvcStreamStats _stats = const UvcStreamStats.zero();
+
+  // Stall detection, as on Android: see [enableStallDetection].
+  UvcStallDetectionConfig? _stallConfig;
+  Timer? _stallTimer;
+  final Stopwatch _stallClock = Stopwatch()..start();
+  int _stallLastSequence = 0;
+  Duration _stallLastProgress = Duration.zero;
+  bool _inStallEpisode = false;
+  int _restartAttempts = 0;
+  bool _restartInProgress = false;
+  int _userStartInProgress = 0;
+  // Bumped by every start, stop, open and close the caller makes, so that a
+  // restart in flight notices it was superseded.
+  int _sessionEpoch = 0;
+  _OhosPreviewRequest? _lastPreviewRequest;
 
   void _ensureEvents() {
     _eventSubscription ??= _eventChannel.receiveBroadcastStream().listen(
@@ -161,6 +176,8 @@ class OhosUvcCamera implements UvcCamera {
   @override
   Future<int> openUsbDevice(int deviceId) async {
     _ensureEvents();
+    _sessionEpoch += 1;
+    _resetStallTracking();
     _previewing = false;
     _modes = const <UvcCameraMode>[];
     final Map<Object?, Object?>? reply = await _channel
@@ -183,6 +200,8 @@ class OhosUvcCamera implements UvcCamera {
 
   @override
   Future<void> closeUsbDevice() async {
+    _sessionEpoch += 1;
+    _resetStallTracking();
     _previewing = false;
     _modes = const <UvcCameraMode>[];
     await _channel.invokeMethod<void>('closeUsbDevice');
@@ -227,6 +246,35 @@ class OhosUvcCamera implements UvcCamera {
         'Must be greater than 0.',
       );
     }
+    _sessionEpoch += 1;
+    _lastPreviewRequest = _OhosPreviewRequest(
+      mode: mode,
+      policy: policy,
+      consecutiveValidFrames: consecutiveValidFrames,
+      timeout: timeout,
+    );
+    _resetStallTracking();
+    // No stall-triggered restart while a start the caller made is in flight:
+    // its verification may take longer than the stall timeout.
+    _userStartInProgress += 1;
+    try {
+      return await _startPreviewInternal(
+        mode,
+        policy: policy,
+        consecutiveValidFrames: consecutiveValidFrames,
+        timeout: timeout,
+      );
+    } finally {
+      _userStartInProgress -= 1;
+    }
+  }
+
+  Future<UvcPreviewStartResult> _startPreviewInternal(
+    UvcCameraMode mode, {
+    required UvcPreviewPolicy policy,
+    required int consecutiveValidFrames,
+    required Duration timeout,
+  }) async {
     _ensureEvents();
     _previewing = false;
     final Map<Object?, Object?>? reply = await _channel
@@ -323,6 +371,8 @@ class OhosUvcCamera implements UvcCamera {
 
   @override
   void stopPreview() {
+    _sessionEpoch += 1;
+    _resetStallTracking();
     _previewing = false;
     unawaited(
       _channel.invokeMethod<void>('stopPreview').catchError((Object error) {
@@ -335,6 +385,12 @@ class OhosUvcCamera implements UvcCamera {
   /// a start, open or close made right after this runs behind the stop.
   @override
   Future<void> stopPreviewAsync() async {
+    _sessionEpoch += 1;
+    _resetStallTracking();
+    await _stopPreviewChannel();
+  }
+
+  Future<void> _stopPreviewChannel() async {
     _previewing = false;
     try {
       await _channel.invokeMethod<void>('stopPreview');
@@ -396,19 +452,149 @@ class OhosUvcCamera implements UvcCamera {
   }
 
   // ---------------------------------------------------------------------------
-  // Not available on HarmonyOS yet
+  // Stall detection
   // ---------------------------------------------------------------------------
 
+  /// The same watchdog as on Android. The frame sequence it samples is the
+  /// one the platform side reports with its periodic statistics.
   @override
   void enableStallDetection([
     UvcStallDetectionConfig config = const UvcStallDetectionConfig(),
-  ]) {}
+  ]) {
+    _ensureEvents();
+    _stallConfig = config;
+    _resetStallTracking();
+    _stallTimer?.cancel();
+    _stallTimer = Timer.periodic(config.checkInterval, (_) => _stallTick());
+  }
 
   @override
-  void disableStallDetection() {}
+  void disableStallDetection() {
+    _stallConfig = null;
+    _stallTimer?.cancel();
+    _stallTimer = null;
+    _resetStallTracking();
+  }
 
   @override
   Stream<UvcStallEvent> get stallEvents => _stallEventController.stream;
+
+  void _resetStallTracking() {
+    _stallLastSequence = _sequence;
+    _stallLastProgress = _stallClock.elapsed;
+    _inStallEpisode = false;
+    _restartAttempts = 0;
+  }
+
+  void _stallTick() {
+    final UvcStallDetectionConfig? config = _stallConfig;
+    if (config == null || _restartInProgress || _userStartInProgress > 0) {
+      return;
+    }
+    if (!_previewing) {
+      _resetStallTracking();
+      return;
+    }
+
+    final int sequence = _sequence;
+    final Duration now = _stallClock.elapsed;
+    if (sequence != _stallLastSequence) {
+      _stallLastSequence = sequence;
+      _stallLastProgress = now;
+      _inStallEpisode = false;
+      _restartAttempts = 0;
+      return;
+    }
+
+    if (_inStallEpisode) return;
+    final Duration silence = now - _stallLastProgress;
+    if (silence < config.stallTimeout) return;
+
+    final _OhosPreviewRequest? request = _lastPreviewRequest;
+    if (request == null) return;
+    _inStallEpisode = true;
+    _stallEventController.add(
+      UvcStallEvent(
+        type: UvcStallEventType.stalled,
+        mode: request.mode,
+        silence: silence,
+      ),
+    );
+    if (config.autoRestart) {
+      unawaited(_attemptStallRestart(config, request, silence));
+    }
+  }
+
+  /// Stops and restarts the preview until frames arrive again or the caller
+  /// changes the session, with Android's pacing: the first
+  /// [UvcStallDetectionConfig.maxRestartAttempts] back to back, later ones
+  /// 2 s, 5 s and then 10 s apart. Android's stronger recovery steps
+  /// (re-claiming the interfaces, resetting the port) have no counterpart
+  /// here yet, so every attempt is a plain stop and start.
+  Future<void> _attemptStallRestart(
+    UvcStallDetectionConfig config,
+    _OhosPreviewRequest request,
+    Duration silence,
+  ) async {
+    _restartInProgress = true;
+    final int epoch = _sessionEpoch;
+    try {
+      while (true) {
+        _restartAttempts += 1;
+        final int attempt = _restartAttempts;
+        if (attempt > config.maxRestartAttempts) {
+          final int extra = attempt - config.maxRestartAttempts;
+          final int backoffMs = extra <= 1
+              ? 2000
+              : extra == 2
+                  ? 5000
+                  : 10000;
+          await Future<void>.delayed(Duration(milliseconds: backoffMs));
+          if (_sessionEpoch != epoch || _stallConfig == null) return;
+        }
+        await _stopPreviewChannel();
+        if (_sessionEpoch != epoch || _stallConfig == null) return;
+        final UvcPreviewStartResult result = await _startPreviewInternal(
+          request.mode,
+          policy: request.policy,
+          consecutiveValidFrames: request.consecutiveValidFrames,
+          timeout: request.timeout,
+        );
+        if (_sessionEpoch != epoch || _stallConfig == null) return;
+        if (result.success) {
+          _stallLastSequence = _sequence;
+          _stallLastProgress = _stallClock.elapsed;
+          _inStallEpisode = false;
+          _restartAttempts = 0;
+          _stallEventController.add(
+            UvcStallEvent(
+              type: UvcStallEventType.restartSucceeded,
+              mode: request.mode,
+              silence: silence,
+              restartAttempt: attempt,
+              restartResult: result,
+            ),
+          );
+          return;
+        }
+        _stallEventController.add(
+          UvcStallEvent(
+            type: UvcStallEventType.restartFailed,
+            mode: request.mode,
+            silence: silence,
+            restartAttempt: attempt,
+            restartResult: result,
+          ),
+        );
+      }
+    } finally {
+      _restartInProgress = false;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Not available on HarmonyOS yet
+  // ---------------------------------------------------------------------------
 
   @override
   UvcPreviewFrame? copyLatestFrame() => null;
@@ -573,4 +759,20 @@ class OhosUvcCamera implements UvcCamera {
 
   @override
   void togglePreviewFlipVertical() {}
+}
+
+/// What the last [OhosUvcCamera.startPreview] asked for; a stall restart
+/// repeats it.
+class _OhosPreviewRequest {
+  const _OhosPreviewRequest({
+    required this.mode,
+    required this.policy,
+    required this.consecutiveValidFrames,
+    required this.timeout,
+  });
+
+  final UvcCameraMode mode;
+  final UvcPreviewPolicy policy;
+  final int consecutiveValidFrames;
+  final Duration timeout;
 }

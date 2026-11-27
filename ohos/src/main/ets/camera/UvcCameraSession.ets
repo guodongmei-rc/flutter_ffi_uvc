@@ -429,6 +429,11 @@ export class UvcCameraSession {
   private negotiatedInterval: number = 0;
   /** Path of the MP4 being recorded; '' when not recording. */
   private recordingPath: string = '';
+  /**
+   * Path of a recording that a preview stop finished (a stall restart, for
+   * one); stopRecording() hands it out so that what was recorded is saved.
+   */
+  private endedRecordingPath: string = '';
 
   /** Bumped whenever the preview is started, stopped or the device is closed. */
   private epoch: number = 0;
@@ -855,7 +860,7 @@ export class UvcCameraSession {
   stopPreview(): void {
     this.epoch++;
     if (this.isRecording()) {
-      this.stopRecording();
+      this.endedRecordingPath = this.stopRecording();
     }
     if (this.streamId > 0) {
       this.lastStats = this.readStats();
@@ -926,6 +931,7 @@ export class UvcCameraSession {
       this.errorMessage = 'a recording is already running';
       return '';
     }
+    this.endedRecordingPath = '';
     // Default to the rate the device actually committed to, not the one the
     // mode asked for; the camera may have rewritten it during PROBE.
     const streamingFps = this.negotiatedInterval > 0
@@ -990,6 +996,11 @@ export class UvcCameraSession {
     const path = this.recordingPath;
     this.recordingPath = '';
     if (path.length === 0) {
+      const ended = this.endedRecordingPath;
+      this.endedRecordingPath = '';
+      if (ended.length > 0) {
+        return ended;
+      }
       this.errorMessage = 'no recording is running';
       return '';
     }

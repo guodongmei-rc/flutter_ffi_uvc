@@ -1127,6 +1127,10 @@ class IsoStream : public UrbOwner {
       }
       const struct usbdevfs_urb *request = urb->get();
       bytes_ += static_cast<uint64_t>(request->actual_length);
+      last_lengths_[last_count_ % kLastLengths] = request->actual_length;
+      last_count_++;
+      last_header_bytes_ = std::min<size_t>(sizeof(last_header_), static_cast<size_t>(std::max(request->actual_length, 0)));
+      memcpy(last_header_, urb->buffer.data(), last_header_bytes_);
       if (request->status != 0) {
         failed_urbs_++;
         last_status_ = request->status;
@@ -1183,6 +1187,28 @@ class IsoStream : public UrbOwner {
                 static_cast<unsigned long long>(failed_urbs_ - logged_failed_), last_status_,
                 static_cast<unsigned long long>(submit_failures - logged_submit_failures_), QueuedCount(),
                 urbs_.size());
+    if (urbs != logged_urbs_) {
+      silence_logged_ = false;
+    } else if (!silence_logged_ && last_count_ > 0) {
+      // The endpoint went quiet: what the last transfers looked like.
+      silence_logged_ = true;
+      char lengths[160] = {0};
+      size_t used = 0;
+      const uint64_t count = std::min<uint64_t>(last_count_, kLastLengths);
+      for (uint64_t i = last_count_ - count; i < last_count_ && used < sizeof(lengths); i++) {
+        used += static_cast<size_t>(
+            snprintf(lengths + used, sizeof(lengths) - used, "%d ", last_lengths_[i % kLastLengths]));
+      }
+      char header[64] = {0};
+      used = 0;
+      for (size_t i = 0; i < last_header_bytes_ && used < sizeof(header); i++) {
+        used += static_cast<size_t>(snprintf(header + used, sizeof(header) - used, "%02x ", last_header_[i]));
+      }
+      OH_LOG_WARN(LOG_APP,
+                  "video endpoint silent after %{public}llu transfers; last lengths: %{public}s; last transfer "
+                  "starts: %{public}s",
+                  static_cast<unsigned long long>(last_count_), lengths, header);
+    }
     logged_at_us_ = now_us;
     logged_urbs_ = urbs;
     logged_bytes_ = bytes_;
@@ -1283,6 +1309,12 @@ class IsoStream : public UrbOwner {
   uint64_t logged_bytes_ = 0;
   uint64_t logged_failed_ = 0;
   uint64_t logged_submit_failures_ = 0;
+  static constexpr size_t kLastLengths = 8;
+  int last_lengths_[kLastLengths] = {0};
+  uint64_t last_count_ = 0;
+  uint8_t last_header_[16] = {0};
+  size_t last_header_bytes_ = 0;
+  bool silence_logged_ = false;
 };
 
 // One running preview: the transfers plus the frames' way to the screen.
