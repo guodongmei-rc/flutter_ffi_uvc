@@ -5,6 +5,7 @@
 #define FLUTTER_FFI_UVC_URB_H_
 
 #include <cerrno>
+#include <mutex>
 #include <sys/ioctl.h>
 
 #include <linux/usbdevice_fs.h>
@@ -34,7 +35,12 @@ struct UrbTag {
 // Reaps every completed URB on `fd` and dispatches it. Returns false when
 // the ioctl fails for good (`*error` is the errno, ENODEV when unplugged).
 inline bool ReapAll(int fd, int *error) {
+  // Both threads reap; taking a URB and queueing it at its owner must be one
+  // step, or two URBs of one owner reaped by different threads can be queued
+  // in swapped order, which corrupts the frame they belong to.
+  static std::mutex reap_mutex;
   for (;;) {
+    std::lock_guard<std::mutex> lock(reap_mutex);
     void *reaped = nullptr;
     if (ioctl(fd, USBDEVFS_REAPURBNDELAY, &reaped) < 0) {
       if (errno == EAGAIN) {
