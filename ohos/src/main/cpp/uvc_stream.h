@@ -1126,6 +1126,11 @@ class IsoStream : public UrbOwner {
         continue;
       }
       const struct usbdevfs_urb *request = urb->get();
+      bytes_ += static_cast<uint64_t>(request->actual_length);
+      if (request->status != 0) {
+        failed_urbs_++;
+        last_status_ = request->status;
+      }
       // A cancelled or failed transfer carries nothing worth assembling.
       if (request->status == 0) {
         Process(urb);
@@ -1152,6 +1157,39 @@ class IsoStream : public UrbOwner {
     stop_errno_ = error;
   }
 
+  // Diagnostics: what the endpoint delivered over the last second.
+  void LogTransfers() {
+    const int64_t now_us = NowMicros();
+    if (logged_at_us_ == 0) {
+      logged_at_us_ = now_us;
+      return;
+    }
+    if (now_us - logged_at_us_ < 1000000) {
+      return;
+    }
+    uint64_t urbs = 0;
+    uint64_t submit_failures = 0;
+    {
+      std::lock_guard<std::mutex> lock(stats_mutex_);
+      urbs = urbs_done_;
+      submit_failures = submit_failures_;
+    }
+    OH_LOG_INFO(LOG_APP,
+                "video transfers in %{public}lld ms: %{public}llu ok, %{public}llu bytes, %{public}llu failed "
+                "(last status %{public}d), submit failures %{public}llu, queued %{public}zu of %{public}zu",
+                static_cast<long long>((now_us - logged_at_us_) / 1000),
+                static_cast<unsigned long long>(urbs - logged_urbs_),
+                static_cast<unsigned long long>(bytes_ - logged_bytes_),
+                static_cast<unsigned long long>(failed_urbs_ - logged_failed_), last_status_,
+                static_cast<unsigned long long>(submit_failures - logged_submit_failures_), QueuedCount(),
+                urbs_.size());
+    logged_at_us_ = now_us;
+    logged_urbs_ = urbs;
+    logged_bytes_ = bytes_;
+    logged_failed_ = failed_urbs_;
+    logged_submit_failures_ = submit_failures;
+  }
+
   size_t QueuedCount() const {
     size_t queued = 0;
     for (const Urb &urb : urbs_) {
@@ -1175,6 +1213,7 @@ class IsoStream : public UrbOwner {
         device_present = false;
         break;
       }
+      LogTransfers();
       // A rejected resubmit leaves its URB idle; with fewer queued the bus is
       // left unserved between transfers and frames arrive truncated.
       for (Urb &urb : urbs_) {
@@ -1234,6 +1273,16 @@ class IsoStream : public UrbOwner {
   uint64_t empty_packets_ = 0;
   uint64_t submit_failures_ = 0;
   UvcFrameAssemblerStats assembler_stats_;
+
+  // Only touched on the stream's thread.
+  uint64_t bytes_ = 0;
+  uint64_t failed_urbs_ = 0;
+  int last_status_ = 0;
+  int64_t logged_at_us_ = 0;
+  uint64_t logged_urbs_ = 0;
+  uint64_t logged_bytes_ = 0;
+  uint64_t logged_failed_ = 0;
+  uint64_t logged_submit_failures_ = 0;
 };
 
 // One running preview: the transfers plus the frames' way to the screen.
