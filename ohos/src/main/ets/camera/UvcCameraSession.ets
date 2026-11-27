@@ -1270,6 +1270,15 @@ export class UvcCameraSession {
     if (this.fd >= 0 && stream !== null && this.streamingAltSet) {
       native.usbSetInterface(this.fd, stream.interfaceNumber, 0);
     }
+    if (this.fd >= 0 && stream !== null && this.bulkStreamEndpoint !== 0) {
+      // Android stops every stream by selecting alt setting 0 (libuvc's
+      // uvc_release_if), bulk ones too. A camera that takes only that as
+      // the stop signal otherwise keeps streaming into the next start.
+      const idled = native.usbSetInterface(this.fd, stream.interfaceNumber, 0);
+      if (idled < 0) {
+        hilog.warn(DOMAIN, TAG, 'idling the bulk stream interface failed: %{public}s', errnoText(idled));
+      }
+    }
     if (this.fd >= 0 && this.bulkStreamEndpoint !== 0) {
       // A bulk camera keeps its data toggle across our restarts; clearing
       // the halt resets it (and is the stop signal Windows/Linux send).
