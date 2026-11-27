@@ -79,12 +79,6 @@ inline int UsbAttachKernelDriver(int fd, unsigned int interface_number) {
   return ioctl(fd, USBDEVFS_IOCTL, &command) < 0 ? -errno : 0;
 }
 
-// Resets the device's port: what Android's uvc_reset_device_port does for a
-// camera that stopped answering after its stream stalled.
-inline int UsbResetDevice(int fd) {
-  return ioctl(fd, USBDEVFS_RESET, nullptr) < 0 ? -errno : 0;
-}
-
 inline int UsbSetInterface(int fd, unsigned int interface_number, unsigned int alt_setting) {
   struct usbdevfs_setinterface request = {interface_number, alt_setting};
   return ioctl(fd, USBDEVFS_SETINTERFACE, &request) < 0 ? -errno : 0;
@@ -314,6 +308,14 @@ class FramePresenter : public FrameSink {
         result = DecodeFrame(jpeg.data(), jpeg.size(), false, &frame);
       }
       const uint64_t decode_ms = static_cast<uint64_t>((NowMicros() - started_us) / 1000);
+      if (result != 0 || decode_ms > 500) {
+        // Diagnostics: a frame the decoder rejected or was slow on.
+        OH_LOG_WARN(LOG_APP,
+                    "MJPEG decode result %{public}d after %{public}llu ms, %{public}zu bytes, as %{public}s, ends "
+                    "%{public}02x %{public}02x",
+                    result, static_cast<unsigned long long>(decode_ms), jpeg.size(), yuv ? "NV12" : "RGBA",
+                    jpeg.size() >= 2 ? jpeg[jpeg.size() - 2] : 0, jpeg.size() >= 1 ? jpeg[jpeg.size() - 1] : 0);
+      }
 
       std::lock_guard<std::mutex> lock(mutex_);
       if (!yuv) {
@@ -1179,11 +1181,40 @@ class IsoStream : public UrbOwner {
     }
     uint64_t urbs = 0;
     uint64_t submit_failures = 0;
+    UvcFrameAssemblerStats frames;
     {
       std::lock_guard<std::mutex> lock(stats_mutex_);
       urbs = urbs_done_;
       submit_failures = submit_failures_;
+      frames = assembler_stats_;
     }
+    if (urbs != logged_urbs_ && frames.frames == logged_frames_) {
+      // Transfers arrive but no frame comes out of them: what they look like.
+      char lengths[160] = {0};
+      size_t used = 0;
+      const uint64_t count = std::min<uint64_t>(last_count_, kLastLengths);
+      for (uint64_t i = last_count_ - count; i < last_count_ && used < sizeof(lengths); i++) {
+        used += static_cast<size_t>(
+            snprintf(lengths + used, sizeof(lengths) - used, "%d ", last_lengths_[i % kLastLengths]));
+      }
+      char header[64] = {0};
+      used = 0;
+      for (size_t i = 0; i < last_header_bytes_ && used < sizeof(header); i++) {
+        used += static_cast<size_t>(snprintf(header + used, sizeof(header) - used, "%02x ", last_header_[i]));
+      }
+      OH_LOG_WARN(LOG_APP,
+                  "video transfers without frames: lengths %{public}s; last starts %{public}s; damaged "
+                  "%{public}llu oversized %{public}llu err-bit %{public}llu bogus %{public}llu lost %{public}llu",
+                  lengths, header, static_cast<unsigned long long>(frames.damaged_frames),
+                  static_cast<unsigned long long>(frames.oversized_frames),
+                  static_cast<unsigned long long>(frames.error_bit_packets),
+                  static_cast<unsigned long long>(frames.bogus_packets),
+                  static_cast<unsigned long long>(frames.lost_packets));
+    }
+    OH_LOG_INFO(LOG_APP, "video frames assembled: %{public}llu in the last second, last %{public}llu bytes",
+                static_cast<unsigned long long>(frames.frames - logged_frames_),
+                static_cast<unsigned long long>(frames.last_frame_bytes));
+    logged_frames_ = frames.frames;
     OH_LOG_INFO(LOG_APP,
                 "video transfers in %{public}lld ms: %{public}llu ok, %{public}llu bytes, %{public}llu failed "
                 "(last status %{public}d), submit failures %{public}llu, queued %{public}zu of %{public}zu",
@@ -1315,6 +1346,7 @@ class IsoStream : public UrbOwner {
   uint64_t logged_bytes_ = 0;
   uint64_t logged_failed_ = 0;
   uint64_t logged_submit_failures_ = 0;
+  uint64_t logged_frames_ = 0;
   static constexpr size_t kLastLengths = 8;
   int last_lengths_[kLastLengths] = {0};
   uint64_t last_count_ = 0;

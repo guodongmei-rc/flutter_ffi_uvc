@@ -525,19 +525,11 @@ class OhosUvcCamera implements UvcCamera {
     }
   }
 
-  Future<void> _resetDevicePort() async {
-    try {
-      await _channel.invokeMethod<void>('resetDevicePort');
-    } catch (error) {
-      _lastError = error.toString();
-    }
-  }
-
-  /// Stops and restarts the preview until frames arrive again or the caller
-  /// changes the session, with Android's pacing: the first
-  /// [UvcStallDetectionConfig.maxRestartAttempts] back to back, later ones
-  /// 2 s, 5 s and then 10 s apart. The first attempt is a plain stop and
-  /// start; see the loop for the ones that reset the port first.
+  /// Stops and restarts the preview once. Android keeps retrying, with
+  /// stronger recovery steps and a growing delay; here a retry would only
+  /// repeat what just failed, and every attempt on a camera that stopped
+  /// answering holds the platform thread for the length of its USB timeouts.
+  /// A failed attempt is reported and the preview is left stopped.
   Future<void> _attemptStallRestart(
     UvcStallDetectionConfig config,
     _OhosPreviewRequest request,
@@ -546,64 +538,34 @@ class OhosUvcCamera implements UvcCamera {
     _restartInProgress = true;
     final int epoch = _sessionEpoch;
     try {
-      while (true) {
-        _restartAttempts += 1;
-        final int attempt = _restartAttempts;
-        if (attempt > config.maxRestartAttempts) {
-          final int extra = attempt - config.maxRestartAttempts;
-          final int backoffMs = extra <= 1
-              ? 2000
-              : extra == 2
-                  ? 5000
-                  : 10000;
-          await Future<void>.delayed(Duration(milliseconds: backoffMs));
-          if (_sessionEpoch != epoch || _stallConfig == null) return;
-        }
-        await _stopPreviewChannel();
-        // Where Android escalates (re-claiming the interfaces on some
-        // attempts, resetting the port on others) the port is reset: a
-        // camera whose stream stalled may stop answering control requests,
-        // and then a plain restart cannot bring it back.
-        if (attempt == 2 ||
-            attempt == 3 ||
-            attempt % 5 == 4 ||
-            attempt % 5 == 0) {
-          await _resetDevicePort();
-        }
-        if (_sessionEpoch != epoch || _stallConfig == null) return;
-        final UvcPreviewStartResult result = await _startPreviewInternal(
-          request.mode,
-          policy: request.policy,
-          consecutiveValidFrames: request.consecutiveValidFrames,
-          timeout: request.timeout,
-        );
-        if (_sessionEpoch != epoch || _stallConfig == null) return;
-        if (result.success) {
-          _stallLastSequence = _sequence;
-          _stallLastProgress = _stallClock.elapsed;
-          _inStallEpisode = false;
-          _restartAttempts = 0;
-          _stallEventController.add(
-            UvcStallEvent(
-              type: UvcStallEventType.restartSucceeded,
-              mode: request.mode,
-              silence: silence,
-              restartAttempt: attempt,
-              restartResult: result,
-            ),
-          );
-          return;
-        }
-        _stallEventController.add(
-          UvcStallEvent(
-            type: UvcStallEventType.restartFailed,
-            mode: request.mode,
-            silence: silence,
-            restartAttempt: attempt,
-            restartResult: result,
-          ),
-        );
+      _restartAttempts += 1;
+      final int attempt = _restartAttempts;
+      await _stopPreviewChannel();
+      if (_sessionEpoch != epoch || _stallConfig == null) return;
+      final UvcPreviewStartResult result = await _startPreviewInternal(
+        request.mode,
+        policy: request.policy,
+        consecutiveValidFrames: request.consecutiveValidFrames,
+        timeout: request.timeout,
+      );
+      if (_sessionEpoch != epoch || _stallConfig == null) return;
+      if (result.success) {
+        _stallLastSequence = _sequence;
+        _stallLastProgress = _stallClock.elapsed;
+        _inStallEpisode = false;
+        _restartAttempts = 0;
       }
+      _stallEventController.add(
+        UvcStallEvent(
+          type: result.success
+              ? UvcStallEventType.restartSucceeded
+              : UvcStallEventType.restartFailed,
+          mode: request.mode,
+          silence: silence,
+          restartAttempt: attempt,
+          restartResult: result,
+        ),
+      );
     } finally {
       _restartInProgress = false;
     }

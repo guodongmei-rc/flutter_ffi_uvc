@@ -164,12 +164,5 @@ export const systemMicPrime: (productName: string) => number;
  */
 export const usbAttachKernelDriver: (fd: number, interfaceNumber: number) => number;
 
-/**
- * Resets the device's USB port, for a camera that stopped answering. The
- * descriptor and the claimed interfaces stay valid. Returns 0 or a negative
- * errno.
- */
-export const usbResetDevice: (fd: number) => number;
-
 /** Finishes the recording. Returns the number of frames written, or a negative error code. */
 export const recordStop: (stream: number) => number;
