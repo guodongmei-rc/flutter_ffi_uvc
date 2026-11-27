@@ -79,6 +79,12 @@ inline int UsbAttachKernelDriver(int fd, unsigned int interface_number) {
   return ioctl(fd, USBDEVFS_IOCTL, &command) < 0 ? -errno : 0;
 }
 
+// Resets the device's port: what Android's uvc_reset_device_port does for a
+// camera that stopped answering after its stream stalled.
+inline int UsbResetDevice(int fd) {
+  return ioctl(fd, USBDEVFS_RESET, nullptr) < 0 ? -errno : 0;
+}
+
 inline int UsbSetInterface(int fd, unsigned int interface_number, unsigned int alt_setting) {
   struct usbdevfs_setinterface request = {interface_number, alt_setting};
   return ioctl(fd, USBDEVFS_SETINTERFACE, &request) < 0 ? -errno : 0;

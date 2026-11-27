@@ -242,6 +242,10 @@ UvcSessionListener {
         this.emitStats();
         result.success(null);
         break;
+      case 'resetDevicePort':
+        session.resetDevicePort();
+        result.success(null);
+        break;
       case 'takePicture': {
         const path = session.takePicture(this.captureDirectory);
         if (path.length === 0) {

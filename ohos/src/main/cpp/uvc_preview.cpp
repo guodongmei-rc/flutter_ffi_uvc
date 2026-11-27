@@ -471,6 +471,18 @@ napi_value SystemMicPrime(napi_env env, napi_callback_info info) {
   return Number(env, result);
 }
 
+// usbResetDevice(fd): number
+napi_value UsbResetDevice(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1] = {nullptr};
+  napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+  int32_t fd = -1;
+  napi_get_value_int32(env, args[0], &fd);
+  napi_value result = nullptr;
+  napi_create_int32(env, flutter_ffi_uvc::UsbResetDevice(static_cast<int>(fd)), &result);
+  return result;
+}
+
 // usbAttachKernelDriver(fd, interfaceNumber): number
 napi_value UsbAttachKernelDriver(napi_env env, napi_callback_info info) {
   const Arguments arguments = GetArguments(env, info);
@@ -517,6 +529,7 @@ napi_value Init(napi_env env, napi_value exports) {
       {"systemMicSampleRate", nullptr, SystemMicSampleRate, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"systemMicPrime", nullptr, SystemMicPrime, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"usbAttachKernelDriver", nullptr, UsbAttachKernelDriver, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"usbResetDevice", nullptr, UsbResetDevice, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"recordStop", nullptr, RecordStop, nullptr, nullptr, nullptr, napi_default, nullptr},
   };
   napi_define_properties(env, exports, sizeof(descriptors) / sizeof(descriptors[0]), descriptors);

@@ -525,12 +525,19 @@ class OhosUvcCamera implements UvcCamera {
     }
   }
 
+  Future<void> _resetDevicePort() async {
+    try {
+      await _channel.invokeMethod<void>('resetDevicePort');
+    } catch (error) {
+      _lastError = error.toString();
+    }
+  }
+
   /// Stops and restarts the preview until frames arrive again or the caller
   /// changes the session, with Android's pacing: the first
   /// [UvcStallDetectionConfig.maxRestartAttempts] back to back, later ones
-  /// 2 s, 5 s and then 10 s apart. Android's stronger recovery steps
-  /// (re-claiming the interfaces, resetting the port) have no counterpart
-  /// here yet, so every attempt is a plain stop and start.
+  /// 2 s, 5 s and then 10 s apart. The first attempt is a plain stop and
+  /// start; see the loop for the ones that reset the port first.
   Future<void> _attemptStallRestart(
     UvcStallDetectionConfig config,
     _OhosPreviewRequest request,
@@ -553,6 +560,16 @@ class OhosUvcCamera implements UvcCamera {
           if (_sessionEpoch != epoch || _stallConfig == null) return;
         }
         await _stopPreviewChannel();
+        // Where Android escalates (re-claiming the interfaces on some
+        // attempts, resetting the port on others) the port is reset: a
+        // camera whose stream stalled may stop answering control requests,
+        // and then a plain restart cannot bring it back.
+        if (attempt == 2 ||
+            attempt == 3 ||
+            attempt % 5 == 4 ||
+            attempt % 5 == 0) {
+          await _resetDevicePort();
+        }
         if (_sessionEpoch != epoch || _stallConfig == null) return;
         final UvcPreviewStartResult result = await _startPreviewInternal(
           request.mode,

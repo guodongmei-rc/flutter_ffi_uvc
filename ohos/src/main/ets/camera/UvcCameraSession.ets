@@ -1148,6 +1148,18 @@ export class UvcCameraSession {
   }
 
   /** Puts the microphone interface back on alt 0 and releases it. */
+  /**
+   * Resets the camera's USB port, as Android does for a camera whose stream
+   * stalled and that no longer answers. Call with the preview stopped.
+   */
+  resetDevicePort(): void {
+    if (this.fd < 0) {
+      return;
+    }
+    const result = native.usbResetDevice(this.fd);
+    hilog.warn(DOMAIN, TAG, 'usb port reset: rc=%{public}d', result);
+  }
+
   private releaseMicrophone(attachKernelDriver: boolean = false): void {
     const interfaceNumber = this.audioInterfaceClaimed;
     this.audioInterfaceClaimed = -1;
